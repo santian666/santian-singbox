@@ -5366,3 +5366,512 @@ body[data-theme="dark"] .app-update-progress-bar-bg {
   gap: 10px;
   margin-top: 16px;
 }
+
+
+/* ========================================================
+   Linear / Raycast 极客暗黑风 (Modern Geek Dark Aesthetic)
+   - 保持 100% 原始布局与功能不变
+   - 节点卡片高质感悬浮、国旗徽标、发光低延迟药丸、微发光边框
+   ======================================================== */
+
+@keyframes pulse-node-testing {
+  0%, 100% { opacity: 0.6; filter: drop-shadow(0 0 4px rgba(56, 189, 248, 0.4)); }
+  50% { opacity: 1; filter: drop-shadow(0 0 10px rgba(56, 189, 248, 0.8)); }
+}
+
+@keyframes pulse-live-green {
+  0%, 100% { transform: scale(1); opacity: 0.85; filter: drop-shadow(0 0 4px #10b981); }
+  50% { transform: scale(1.18); opacity: 1; filter: drop-shadow(0 0 10px #10b981); }
+}
+
+/* 1. 深度暗黑背景与主面板质感升级 */
+body[data-theme="dark"] {
+  --bg: #0b0d14;
+  --panel: rgba(16, 21, 33, 0.78);
+  --panel-soft: rgba(21, 28, 44, 0.72);
+  --text: #f1f5f9;
+  --muted: #8b9bb4;
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.16);
+  --blue: #38bdf8;
+  --blue-soft: rgba(56, 189, 248, 0.12);
+  --green: #34d399;
+  --red: #f87171;
+  background: radial-gradient(circle at 50% -10%, rgba(30, 42, 70, 0.45) 0%, rgba(11, 13, 20, 1) 68%), #0b0d14 !important;
+}
+
+body[data-theme="dark"] .panel {
+  background: rgba(16, 21, 33, 0.78);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+body[data-theme="dark"] .top-bar {
+  background: rgba(12, 16, 25, 0.85);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+/* 2. 顶部状态与实时流量药丸微质感 */
+body[data-theme="dark"] .traffic-monitor {
+  background: rgba(15, 23, 42, 0.65);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 3px 10px;
+}
+
+body[data-theme="dark"] #trafficUpload {
+  color: #38bdf8;
+  text-shadow: 0 0 8px rgba(56, 189, 248, 0.4);
+}
+
+body[data-theme="dark"] #trafficDownload {
+  color: #34d399;
+  text-shadow: 0 0 8px rgba(52, 211, 153, 0.4);
+}
+
+body[data-theme="dark"] .status-summary .badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 11px;
+  border-radius: 999px;
+  font-weight: 700;
+  font-size: 12px;
+  background: rgba(16, 185, 129, 0.15);
+  color: #34d399;
+  border: 1px solid rgba(16, 185, 129, 0.35);
+  box-shadow: 0 0 12px rgba(16, 185, 129, 0.25);
+}
+
+body[data-theme="dark"] .status-summary .badge::before {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #10b981;
+  animation: pulse-live-green 2s infinite ease-in-out;
+}
+
+/* 3. 核心美化：节点卡片（Node Card）超细腻悬浮质感 */
+.node-title {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.node-flag {
+  font-size: 15px;
+  line-height: 1;
+  flex: 0 0 auto;
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.3));
+}
+
+.node-title .node-name-copy {
+  color: var(--text);
+  font-weight: 650;
+  font-size: 13px;
+  letter-spacing: -0.15px;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-protocol {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  padding: 2px 7px;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #94a3b8;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+/* =========================================================================
+   SanTian-Singbox · 现代轻盈科技精修版 (严苛标尺对齐 + 双行分组 + 左下角无缝填充)
+   ========================================================================= */
+
+/* 1. 左侧面板弹性伸展，彻底消除左下角空白 */
+.grid {
+  display: flex !important;
+  flex-direction: column !important;
+  gap: 10px !important;
+  height: 100% !important;
+  max-height: 100% !important;
+  overflow: hidden !important;
+}
+
+.settings-panel,
+.import-panel {
+  flex-shrink: 0 !important;
+}
+
+.log-preview {
+  flex: 1 !important;
+  min-height: 140px !important;
+  display: flex !important;
+  flex-direction: column !important;
+  padding: 8px 10px !important;
+  border-radius: 10px !important;
+  border: 1px solid var(--line) !important;
+  background: var(--panel) !important;
+  overflow: hidden !important;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04) !important;
+}
+
+.log-preview-items {
+  flex: 1 !important;
+  min-height: 0 !important;
+  overflow-y: auto !important;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
+  font-size: 11px !important;
+  line-height: 1.5 !important;
+}
+
+/* 2. 20+ 节点分组双行平铺排布 (告别大卡片堆叠，平整优雅) */
+.groups {
+  min-height: 38px !important;
+  max-height: 82px !important;
+  display: flex !important;
+  flex-wrap: wrap !important;
+  align-items: center !important;
+  gap: 6px !important;
+  overflow-y: auto !important;
+  padding: 5px 8px !important;
+  border: 1px solid var(--line) !important;
+  border-radius: 10px !important;
+  background: rgba(255, 255, 255, 0.85) !important;
+}
+
+.group-card {
+  height: 30px !important;
+  min-height: 30px !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  padding: 0 9px !important;
+  border: 1px solid var(--line) !important;
+  border-radius: 7px !important;
+  background: #f8fafc !important;
+  color: #334155 !important;
+  cursor: pointer !important;
+  transition: all 0.16s ease !important;
+  user-select: none !important;
+}
+
+.group-card:hover {
+  border-color: #93c5fd !important;
+  background: #eff6ff !important;
+  color: #1d4ed8 !important;
+}
+
+.group-card.active {
+  background: #2563eb !important;
+  border-color: #2563eb !important;
+  color: #ffffff !important;
+  box-shadow: 0 1px 4px rgba(37, 99, 235, 0.28) !important;
+}
+
+.group-card .group-main {
+  display: flex !important;
+  align-items: center !important;
+  gap: 6px !important;
+}
+
+.group-card .group-main strong {
+  font-size: 12px !important;
+  font-weight: 600 !important;
+  color: inherit !important;
+}
+
+.group-card .group-main span:not(.traffic-pill) {
+  font-size: 10px !important;
+  font-family: ui-monospace, SFMono-Regular, monospace !important;
+  padding: 1px 5px !important;
+  border-radius: 999px !important;
+  background: rgba(0, 0, 0, 0.06) !important;
+  color: inherit !important;
+}
+
+.group-card.active .group-main span:not(.traffic-pill) {
+  background: rgba(255, 255, 255, 0.25) !important;
+  color: #ffffff !important;
+}
+
+.group-card .traffic-pill,
+.group-card .rate-pill {
+  display: none !important;
+}
+
+.group-card .group-actions {
+  display: none !important;
+}
+
+.group-card:hover .group-actions {
+  display: inline-flex !important;
+  margin-left: 4px !important;
+  gap: 2px !important;
+}
+
+.group-card .group-buttons button {
+  height: 20px !important;
+  padding: 0 4px !important;
+  font-size: 9.5px !important;
+  border-radius: 4px !important;
+}
+
+/* 3. 节点列表强迫症绝对标尺对齐系统 (Strict Grid Alignment System) */
+.node {
+  position: relative !important;
+  min-height: 42px !important;
+  height: 42px !important;
+  display: grid !important;
+  grid-template-columns: 50px minmax(0, 1fr) 180px 72px 84px 316px !important;
+  align-items: center !important;
+  gap: 8px !important;
+  padding: 4px 12px !important;
+  overflow: hidden !important;
+  border: 1px solid #e2e8f0 !important;
+  border-radius: 9px !important;
+  background: #ffffff !important;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03) !important;
+  transition: all 0.16s ease !important;
+}
+
+.node:hover {
+  border-color: #cbd5e1 !important;
+  background: #f8fafc !important;
+  box-shadow: 0 2px 6px rgba(15, 23, 42, 0.06) !important;
+}
+
+.node.selected {
+  background: #eff6ff !important;
+  border-color: #3b82f6 !important;
+  box-shadow: 0 1px 4px rgba(59, 130, 246, 0.2) !important;
+}
+
+/* 列 1: 协议标签 (严格等宽 50px) */
+.node .chip.node-protocol {
+  width: 50px !important;
+  min-width: 50px !important;
+  max-width: 50px !important;
+  height: 22px !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  font-family: ui-monospace, SFMono-Regular, monospace !important;
+  font-weight: 700 !important;
+  font-size: 10px !important;
+  text-transform: uppercase !important;
+  padding: 0 !important;
+  border-radius: 6px !important;
+  background: #eff6ff !important;
+  color: #1d4ed8 !important;
+  border: 1px solid #bfdbfe !important;
+}
+
+/* 列 2: 国旗与节点名称 (唯一弹性伸缩列，单行自动截断) */
+.node .node-title {
+  min-width: 0 !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 6px !important;
+  overflow: hidden !important;
+}
+
+.node .node-flag {
+  font-size: 16px !important;
+  line-height: 1 !important;
+  flex-shrink: 0 !important;
+}
+
+.node .node-name-copy {
+  font-size: 12.5px !important;
+  font-weight: 700 !important;
+  color: #0f172a !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+  line-height: 1.2 !important;
+}
+
+/* 列 3: IP/域名与端口 (严格固定 180px，等宽字体截断) */
+.node .node-meta {
+  width: 180px !important;
+  min-width: 180px !important;
+  max-width: 180px !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+  white-space: nowrap !important;
+  font-family: ui-monospace, SFMono-Regular, monospace !important;
+  font-size: 11px !important;
+  color: #64748b !important;
+  line-height: 1.2 !important;
+}
+
+/* 列 4: 延迟药丸 (严格固定 72px，文字居中，绝对垂直一条线！) */
+.node .node-delay {
+  width: 72px !important;
+  min-width: 72px !important;
+  max-width: 72px !important;
+  height: 22px !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  font-family: ui-monospace, SFMono-Regular, monospace !important;
+  font-size: 11px !important;
+  font-weight: 700 !important;
+  padding: 0 !important;
+  border-radius: 999px !important;
+  background: #ecfdf5 !important;
+  color: #059669 !important;
+  border: 1px solid #a7f3d0 !important;
+  box-sizing: border-box !important;
+}
+
+.node .node-delay.medium {
+  background: #fffbeb !important;
+  color: #d97706 !important;
+  border-color: #fde68a !important;
+}
+
+.node .node-delay.slow,
+.node .node-delay.bad {
+  background: #fef2f2 !important;
+  color: #dc2626 !important;
+  border-color: #fecaca !important;
+}
+
+.node .node-delay.testing {
+  background: #eff6ff !important;
+  color: #2563eb !important;
+  border-color: #bfdbfe !important;
+}
+
+/* 列 5: 流量药丸 (严格固定 84px，文字居中，绝对垂直一条线！) */
+.node .node-traffic {
+  width: 84px !important;
+  min-width: 84px !important;
+  max-width: 84px !important;
+  height: 22px !important;
+  display: inline-flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  font-family: ui-monospace, SFMono-Regular, monospace !important;
+  font-size: 10px !important;
+  color: #475569 !important;
+  background: #f1f5f9 !important;
+  border: 1px solid #e2e8f0 !important;
+  padding: 0 !important;
+  border-radius: 999px !important;
+  box-sizing: border-box !important;
+}
+
+/* 列 6: 操作按钮组 (严格固定 316px，6 个按钮等高排列，绝对对齐！) */
+.node .node-actions {
+  width: 316px !important;
+  min-width: 316px !important;
+  max-width: 316px !important;
+  display: grid !important;
+  grid-template-columns: 50px 44px 44px 44px 48px 44px !important;
+  gap: 4px !important;
+  align-items: center !important;
+  justify-content: end !important;
+}
+
+.node .node-actions button {
+  height: 26px !important;
+  min-width: 0 !important;
+  padding: 0 4px !important;
+  border-radius: 6px !important;
+  font-size: 11px !important;
+  line-height: 24px !important;
+  font-weight: 500 !important;
+  border: 1px solid #e2e8f0 !important;
+  background: #f8fafc !important;
+  color: #334155 !important;
+  text-align: center !important;
+  cursor: pointer !important;
+  transition: all 0.16s ease !important;
+}
+
+.node .node-actions button:hover:not(:disabled) {
+  border-color: #93c5fd !important;
+  color: #2563eb !important;
+  background: #eff6ff !important;
+}
+
+.node .node-actions .select {
+  font-weight: 700 !important;
+  background: #2563eb !important;
+  border-color: #2563eb !important;
+  color: #ffffff !important;
+}
+
+.node .node-actions .select.selected-action {
+  background: #059669 !important;
+  border-color: #059669 !important;
+  color: #ffffff !important;
+}
+
+.node .node-actions button[data-test] {
+  color: #166534 !important;
+  background: #f0fdf4 !important;
+  border-color: #bbf7d0 !important;
+}
+
+.node .node-actions button[data-edit-node] {
+  color: #1e293b !important;
+  background: #f8fafc !important;
+  border-color: #cbd5e1 !important;
+}
+
+.node .node-actions button[data-delete] {
+  color: #64748b !important;
+}
+
+.node .node-actions button[data-delete]:hover:not(:disabled) {
+  color: #dc2626 !important;
+  border-color: #fca5a5 !important;
+  background: #fef2f2 !important;
+}
+
+/* 4. 自动切换开关高亮突出显示 */
+.auto-failover-switch {
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 6px !important;
+  height: 28px !important;
+  padding: 0 8px !important;
+  border-radius: 8px !important;
+  border: 1px solid #bbf7d0 !important;
+  background: #f0fdf4 !important;
+  color: #166534 !important;
+  font-weight: 600 !important;
+  font-size: 11.5px !important;
+  cursor: pointer !important;
+}
+
+.auto-failover-switch input:checked + .toggle-ui {
+  background: #059669 !important;
+}
+
+/* 5. 虚拟滚动容器行高精准对齐 (42px node + 5px gap = 47px) */
+.node-virtual-window {
+  gap: 5px !important;
+}
+
