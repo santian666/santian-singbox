@@ -349,7 +349,6 @@ func locateExtractedAppDir(stageDir string, exeName string) string {
 
 func generateUpdaterScript(updaterPath string) error {
 	scriptContent := `@echo off
-chcp 65001 >nul
 setlocal EnableExtensions EnableDelayedExpansion
 
 set "APP_DIR=%~1"
@@ -361,19 +360,13 @@ if "%APP_DIR%"=="" exit /b 1
 if "%STAGE_DIR%"=="" exit /b 1
 if "%EXE_NAME%"=="" exit /b 1
 
-:: 等待旧应用进程退出
-:wait_pid_loop
+timeout /t 1 /nobreak >nul
 if not "%OLD_PID%"=="" (
-    tasklist /fi "pid eq %OLD_PID%" 2>nul | find "%OLD_PID%" >nul
-    if not errorlevel 1 (
-        timeout /t 1 /nobreak >nul
-        goto wait_pid_loop
-    )
+    taskkill /f /pid %OLD_PID% >nul 2>nul
 )
 timeout /t 1 /nobreak >nul
 
-:: 备份并安全保护数据目录
-set "BACKUP_DATA=%TEMP%\santian_data_backup_%RANDOM%"
+set "BACKUP_DATA=%TEMP%\santian_backup_%RANDOM%"
 if exist "%APP_DIR%\data\gui\state.dat" (
     mkdir "%BACKUP_DATA%" >nul 2>nul
     copy /y "%APP_DIR%\data\gui\state.dat" "%BACKUP_DATA%\" >nul 2>nul
@@ -384,10 +377,8 @@ if exist "%APP_DIR%\data\state.dat" (
     copy /y "%APP_DIR%\data\state.dat" "%BACKUP_DATA%\legacy_state.dat" >nul 2>nul
 )
 
-:: 覆盖新版本文件
 xcopy /e /i /y "%STAGE_DIR%\*" "%APP_DIR%\" >nul
 
-:: 恢复用户配置
 if exist "%BACKUP_DATA%\state.dat" (
     mkdir "%APP_DIR%\data\gui" >nul 2>nul
     copy /y "%BACKUP_DATA%\state.dat" "%APP_DIR%\data\gui\state.dat" >nul 2>nul
@@ -401,19 +392,20 @@ if exist "%BACKUP_DATA%" (
     rmdir /s /q "%BACKUP_DATA%" >nul 2>nul
 )
 
-:: 启动新版本程序
 start "" "%APP_DIR%\%EXE_NAME%"
 
-:: 清理暂存文件
 timeout /t 2 /nobreak >nul
 rmdir /s /q "%STAGE_DIR%" >nul 2>nul
 exit
 `
-	return os.WriteFile(updaterPath, []byte(scriptContent), 0755)
+	crlfContent := strings.ReplaceAll(scriptContent, "\r\n", "\n")
+	crlfContent = strings.ReplaceAll(crlfContent, "\n", "\r\n")
+	return os.WriteFile(updaterPath, []byte(crlfContent), 0755)
 }
 
 func launchDetachedUpdater(scriptPath, appDir, stageDir, exeName string, pid int) error {
-	cmd := exec.Command("cmd.exe", "/c", scriptPath, appDir, stageDir, exeName, strconv.Itoa(pid))
+	cmdLine := fmt.Sprintf("\"%s\" \"%s\" \"%s\" \"%s\" %d", scriptPath, appDir, stageDir, exeName, pid)
+	cmd := exec.Command("cmd.exe", "/c", cmdLine)
 	cmd.Dir = filepath.Dir(scriptPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP | 0x08000000, // CREATE_NO_WINDOW

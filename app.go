@@ -3382,12 +3382,12 @@ func (a *App) ApplyAppUpdate() (result *AppUpdateInfo, err error) {
 	}
 
 	go func() {
-		time.Sleep(800 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond)
 		if a.ctx != nil {
 			wailsRuntime.Quit(a.ctx)
-		} else {
-			os.Exit(0)
 		}
+		time.Sleep(500 * time.Millisecond)
+		os.Exit(0)
 	}()
 
 	return info, nil
