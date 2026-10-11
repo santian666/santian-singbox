@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	defaultAppUpdateRepo    = "santian666/SanTian-Singbox"
+	defaultAppUpdateRepo    = "santian666/santian-singbox"
 	appUpdateCheckTimeout   = 10 * time.Second
 	appUpdateDownloadLimit  = 300 * 1024 * 1024 // 300 MB limit
 )
