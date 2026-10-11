@@ -294,11 +294,14 @@ func extractZipArchive(zipPath, destDir string) error {
 	defer reader.Close()
 
 	for _, file := range reader.File {
-		path := filepath.Join(destDir, file.Name)
+		normalizedName := strings.ReplaceAll(file.Name, "\\", "/")
+		isDir := file.FileInfo().IsDir() || strings.HasSuffix(normalizedName, "/")
+
+		path := filepath.Join(destDir, filepath.FromSlash(normalizedName))
 		if !strings.HasPrefix(filepath.Clean(path), filepath.Clean(destDir)+string(os.PathSeparator)) {
 			continue // Prevent zip slip
 		}
-		if file.FileInfo().IsDir() {
+		if isDir {
 			_ = os.MkdirAll(path, 0755)
 			continue
 		}

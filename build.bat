@@ -58,6 +58,6 @@ set "OUT=dist\SanTian-Singbox-v%VERSION%"
 if exist "%OUT%" rmdir /s /q "%OUT%"
 mkdir "%OUT%"
 xcopy /e /i /y "build\bin\*" "%OUT%\" >nul
-powershell -NoProfile -Command "$zip='dist\SanTian-Singbox-v%VERSION%-windows-amd64.zip'; if(Test-Path $zip){Remove-Item $zip -Force}; Compress-Archive -Path '%OUT%\*' -DestinationPath $zip -CompressionLevel Optimal"
+python -c "import os, zipfile, sys; src, out = sys.argv[1], sys.argv[2]; (os.remove(out) if os.path.exists(out) else None); z = zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, 6); [(z.write(os.path.join(r, f), os.path.relpath(os.path.join(r, f), src).replace('\\\\', '/'))) for r, _, fs in os.walk(src) for f in fs]; z.close()" "%OUT%" "dist\SanTian-Singbox-v%VERSION%-windows-amd64.zip"
 echo Build completed: %OUT%
 echo Archive created: dist\SanTian-Singbox-v%VERSION%-windows-amd64.zip
