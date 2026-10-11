@@ -1,0 +1,48 @@
+# Binaries and build artifacts
+build/
+dist/
+output/
+.gocache2/
+*.exe
+*.dll
+*.sys
+
+# Keep required companion binaries in bin/ (sing-box and libcronet are auto-downloaded by ensure-latest-core.ps1)
+!bin/
+!bin/cygwin1.dll
+!bin/iperf3.exe
+!bin/nexttrace.exe
+!bin/speedtest.exe
+!bin/WinDivert.dll
+!bin/WinDivert64.sys
+bin/sing-box.exe
+bin/libcronet.dll
+bin/*.bak
+
+# Frontend build outputs and dependencies
+frontend/dist/
+frontend/node_modules/
+node_modules/
+
+# User runtime data and state
+data/state.dat
+data/gui/state.dat*
+data/gui/selected.dat
+data/gui/cache.db
+data/sing-box.json
+data/gui/sing-box.json
+data/gui/admin-restart.cmd
+data/*.tmp
+data/*.bak
+cache.db
+
+# Logs
+logs/
+*.log
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
