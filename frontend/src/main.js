@@ -644,16 +644,25 @@ var ln=(e,t)=>()=>(t||e((t={exports:{}}).exports,t),t.exports);var ia=ln((an,sn)
       </div>
       <div class="update-choice-actions">
         <button id="updateChoiceApp" class="update-choice-option primary" type="button">
-          <span>更新客户端软件</span>
-          <small>检查并升级软件到最新发布版</small>
+          <div class="update-choice-option-content">
+            <span>更新客户端软件</span>
+            <small>检查并升级软件到最新发布版</small>
+          </div>
+          <span class="update-choice-arrow">→</span>
         </button>
         <button id="updateChoiceCore" class="update-choice-option ghost" type="button">
-          <span>更新 sing-box 内核</span>
-          <small>自动同步最新官方核心组件</small>
+          <div class="update-choice-option-content">
+            <span>更新 sing-box 内核</span>
+            <small>自动同步最新官方核心组件</small>
+          </div>
+          <span class="update-choice-arrow">→</span>
         </button>
         <button id="updateChoiceRules" class="update-choice-option ghost" type="button">
-          <span>更新分流规则库</span>
-          <small>更新 Loyalsoldier 国内外规则</small>
+          <div class="update-choice-option-content">
+            <span>更新分流规则库</span>
+            <small>更新 Loyalsoldier 国内外规则</small>
+          </div>
+          <span class="update-choice-arrow">→</span>
         </button>
       </div>
       <div class="update-choice-footer">
