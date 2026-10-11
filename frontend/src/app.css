@@ -5280,22 +5280,7 @@ body[data-theme="dark"] .speedtest-metric-text {
 
 /* App Self-Update Modal Styles */
 .update-choice-option.update-available {
-  border-color: #dc2626 !important;
-  position: relative;
-}
-
-.update-choice-option.update-available::after {
-  content: "NEW";
-  position: absolute;
-  top: 4px;
-  right: 6px;
-  font-size: 9px;
-  font-weight: 800;
-  color: #fff;
-  background: #dc2626;
-  padding: 1px 4px;
-  border-radius: 4px;
-  line-height: 1.1;
+  border-color: #3b82f6 !important;
 }
 
 .app-update-card {
