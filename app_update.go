@@ -360,11 +360,13 @@ if "%APP_DIR%"=="" exit /b 1
 if "%STAGE_DIR%"=="" exit /b 1
 if "%EXE_NAME%"=="" exit /b 1
 
-timeout /t 1 /nobreak >nul
 if not "%OLD_PID%"=="" (
     taskkill /f /pid %OLD_PID% >nul 2>nul
 )
-timeout /t 1 /nobreak >nul
+if not "%EXE_NAME%"=="" (
+    taskkill /f /im "%EXE_NAME%" >nul 2>nul
+)
+ping 127.0.0.1 -n 2 >nul
 
 set "BACKUP_DATA=%TEMP%\santian_backup_%RANDOM%"
 if exist "%APP_DIR%\data\gui\state.dat" (
@@ -375,6 +377,18 @@ if exist "%APP_DIR%\data\gui\state.dat" (
 if exist "%APP_DIR%\data\state.dat" (
     mkdir "%BACKUP_DATA%" >nul 2>nul
     copy /y "%APP_DIR%\data\state.dat" "%BACKUP_DATA%\legacy_state.dat" >nul 2>nul
+)
+
+set RETRY=0
+:retry_copy_exe
+copy /y "%STAGE_DIR%\%EXE_NAME%" "%APP_DIR%\%EXE_NAME%" >nul 2>nul
+if errorlevel 1 (
+    set /a RETRY+=1
+    if !RETRY! leq 10 (
+        taskkill /f /im "%EXE_NAME%" >nul 2>nul
+        ping 127.0.0.1 -n 2 >nul
+        goto retry_copy_exe
+    )
 )
 
 xcopy /e /i /y "%STAGE_DIR%\*" "%APP_DIR%\" >nul
@@ -394,7 +408,7 @@ if exist "%BACKUP_DATA%" (
 
 start "" "%APP_DIR%\%EXE_NAME%"
 
-timeout /t 2 /nobreak >nul
+ping 127.0.0.1 -n 3 >nul
 rmdir /s /q "%STAGE_DIR%" >nul 2>nul
 exit
 `
@@ -404,8 +418,7 @@ exit
 }
 
 func launchDetachedUpdater(scriptPath, appDir, stageDir, exeName string, pid int) error {
-	cmdLine := fmt.Sprintf("\"%s\" \"%s\" \"%s\" \"%s\" %d", scriptPath, appDir, stageDir, exeName, pid)
-	cmd := exec.Command("cmd.exe", "/c", cmdLine)
+	cmd := exec.Command("cmd.exe", "/c", scriptPath, appDir, stageDir, exeName, strconv.Itoa(pid))
 	cmd.Dir = filepath.Dir(scriptPath)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP | 0x08000000, // CREATE_NO_WINDOW
