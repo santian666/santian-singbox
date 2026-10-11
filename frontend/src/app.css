@@ -1657,8 +1657,7 @@ body.node-batch-mode .export-group-btn {
   white-space: nowrap;
 }
 
-.core-update,
-.app-update {
+.core-update {
   min-width: 52px;
   height: 28px;
   padding: 0 6px;
@@ -1666,15 +1665,13 @@ body.node-batch-mode .export-group-btn {
   font-size: 11.5px;
 }
 
-.core-update.update-available,
-.app-update.update-available {
+.core-update.update-available {
   color: #ffffff;
   border-color: #dc2626;
   background: #dc2626;
 }
 
-.core-update.update-available:hover:not(:disabled),
-.app-update.update-available:hover:not(:disabled) {
+.core-update.update-available:hover:not(:disabled) {
   border-color: #b91c1c;
   background: #b91c1c;
 }

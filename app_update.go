@@ -376,6 +376,10 @@ if exist "%APP_DIR%\data\gui\state.dat" (
     copy /y "%APP_DIR%\data\gui\state.dat" "%BACKUP_DATA%\" >nul 2>nul
     copy /y "%APP_DIR%\data\gui\selected.dat" "%BACKUP_DATA%\" >nul 2>nul
 )
+if exist "%APP_DIR%\data\state.dat" (
+    mkdir "%BACKUP_DATA%" >nul 2>nul
+    copy /y "%APP_DIR%\data\state.dat" "%BACKUP_DATA%\legacy_state.dat" >nul 2>nul
+)
 
 :: 覆盖新版本文件
 xcopy /e /i /y "%STAGE_DIR%\*" "%APP_DIR%\" >nul
@@ -385,6 +389,12 @@ if exist "%BACKUP_DATA%\state.dat" (
     mkdir "%APP_DIR%\data\gui" >nul 2>nul
     copy /y "%BACKUP_DATA%\state.dat" "%APP_DIR%\data\gui\state.dat" >nul 2>nul
     copy /y "%BACKUP_DATA%\selected.dat" "%APP_DIR%\data\gui\selected.dat" >nul 2>nul
+)
+if exist "%BACKUP_DATA%\legacy_state.dat" (
+    mkdir "%APP_DIR%\data" >nul 2>nul
+    copy /y "%BACKUP_DATA%\legacy_state.dat" "%APP_DIR%\data\state.dat" >nul 2>nul
+)
+if exist "%BACKUP_DATA%" (
     rmdir /s /q "%BACKUP_DATA%" >nul 2>nul
 )
 
