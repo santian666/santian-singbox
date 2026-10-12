@@ -198,6 +198,7 @@ func (a *App) startup(ctx context.Context) {
 	a.startProxyHealthWatcher()
 	safeGo(a.logger, "启动自检关闭代理入口", a.restoreStartupState)
 	safeGo(a.logger, "启动检查软件更新", a.startupCheckAppUpdate)
+	safeGo(a.logger, "清理历史更新文件", func() { cleanupOldUpdateArtifacts(a.root) })
 }
 
 func (a *App) fitWindowToScreen() {
@@ -3360,33 +3361,44 @@ func (a *App) ApplyAppUpdate() (result *AppUpdateInfo, err error) {
 	exeName := filepath.Base(exePath)
 	extractedAppDir := locateExtractedAppDir(stageDir, exeName)
 
-	updaterScript := filepath.Join(updatesDir, "apply-update.bat")
-	if err := generateUpdaterScript(updaterScript); err != nil {
-		return nil, fmt.Errorf("生成更新脚本失败：%w", err)
-	}
-
 	if a.ctx != nil {
 		wailsRuntime.EventsEmit(a.ctx, "app-update-progress", AppUpdateProgress{
 			Phase:   "applying",
 			Percent: 100,
-			Message: "准备就绪，即将重启完成更新...",
+			Message: "准备就绪，正在进行原子级热替换并重启...",
 		})
 	}
 	if a.logger != nil {
-		a.logger.Info("启动更新脚本并准备重启：%s", updaterScript)
+		a.logger.Info("开始执行原子级更新文件替换...")
 	}
 
-	pid := os.Getpid()
-	if err := launchDetachedUpdater(updaterScript, a.root, extractedAppDir, exeName, pid); err != nil {
-		return nil, fmt.Errorf("启动更新程序失败：%w", err)
+	// 1. 停止 sing-box 核心内核以释放 bin/ 目录下的二进制文件句柄
+	if a.manager != nil && a.manager.Running() {
+		_ = a.Stop()
+		time.Sleep(200 * time.Millisecond)
 	}
 
+	// 2. 进程内原子级替换文件（重命名旧程序，拷贝新程序）
+	if err := performAtomicInPlaceUpdate(a.root, extractedAppDir, exePath); err != nil {
+		return nil, fmt.Errorf("原子更新失败：%w", err)
+	}
+
+	// 3. 直接通过系统标准 API 启动新程序
+	if err := launchNewAppProcess(exePath, a.root); err != nil {
+		return nil, fmt.Errorf("启动新版本程序失败：%w", err)
+	}
+
+	if a.logger != nil {
+		a.logger.Info("新版本程序已成功拉起，旧进程即将安全退出")
+	}
+
+	// 4. 旧进程安全退出
 	go func() {
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 		if a.ctx != nil {
 			wailsRuntime.Quit(a.ctx)
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 		os.Exit(0)
 	}()
 

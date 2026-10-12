@@ -347,83 +347,83 @@ func locateExtractedAppDir(stageDir string, exeName string) string {
 	return stageDir
 }
 
-func generateUpdaterScript(updaterPath string) error {
-	scriptContent := `@echo off
-set "SEE_MASK_NOZONECHECKS=1"
-setlocal EnableExtensions EnableDelayedExpansion
+func performAtomicInPlaceUpdate(appRoot, extractedAppDir, exePath string) error {
+	exeName := filepath.Base(exePath)
 
-set "APP_DIR=%~1"
-set "STAGE_DIR=%~2"
-set "EXE_NAME=%~3"
-set "OLD_PID=%~4"
+	// 1. Rename currently running SanTian-Singbox.exe -> .old (NTFS allows renaming running binaries)
+	oldExe := exePath + ".old"
+	_ = os.Remove(oldExe)
+	if err := os.Rename(exePath, oldExe); err != nil {
+		return fmt.Errorf("重命名旧主程序失败：%w", err)
+	}
 
-if "%APP_DIR%"=="" exit /b 1
-if "%STAGE_DIR%"=="" exit /b 1
-if "%EXE_NAME%"=="" exit /b 1
+	// 2. Copy new executable directly into place
+	newExeSrc := filepath.Join(extractedAppDir, exeName)
+	if err := copyFile(newExeSrc, exePath); err != nil {
+		// Rollback rename if copy fails
+		_ = os.Rename(oldExe, exePath)
+		return fmt.Errorf("复制新主程序失败：%w", err)
+	}
 
-if not "%OLD_PID%"=="" (
-    taskkill /f /pid %OLD_PID% >nul 2>nul
-)
-if not "%EXE_NAME%"=="" (
-    taskkill /f /im "%EXE_NAME%" >nul 2>nul
-)
-ping 127.0.0.1 -n 2 >nul
+	// 3. Update bin/ directory (e.g. sing-box.exe)
+	stagingBin := filepath.Join(extractedAppDir, "bin")
+	if entries, err := os.ReadDir(stagingBin); err == nil {
+		dstBinDir := filepath.Join(appRoot, "bin")
+		_ = os.MkdirAll(dstBinDir, 0755)
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			srcFile := filepath.Join(stagingBin, e.Name())
+			dstFile := filepath.Join(dstBinDir, e.Name())
+			dstOld := dstFile + ".old"
+			_ = os.Remove(dstOld)
+			_ = os.Rename(dstFile, dstOld)
+			_ = copyFile(srcFile, dstFile)
+		}
+	}
 
-set "BACKUP_DATA=%TEMP%\santian_backup_%RANDOM%"
-if exist "%APP_DIR%\data\gui\state.dat" (
-    mkdir "%BACKUP_DATA%" >nul 2>nul
-    copy /y "%APP_DIR%\data\gui\state.dat" "%BACKUP_DATA%\" >nul 2>nul
-    copy /y "%APP_DIR%\data\gui\selected.dat" "%BACKUP_DATA%\" >nul 2>nul
-)
-if exist "%APP_DIR%\data\state.dat" (
-    mkdir "%BACKUP_DATA%" >nul 2>nul
-    copy /y "%APP_DIR%\data\state.dat" "%BACKUP_DATA%\legacy_state.dat" >nul 2>nul
-)
+	// 4. Update data/gui/rules/ directory (only rules, NEVER touching state.dat or user configs)
+	stagingRules := filepath.Join(extractedAppDir, "data", "gui", "rules")
+	if entries, err := os.ReadDir(stagingRules); err == nil {
+		dstRulesDir := filepath.Join(appRoot, "data", "gui", "rules")
+		_ = os.MkdirAll(dstRulesDir, 0755)
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			srcFile := filepath.Join(stagingRules, e.Name())
+			dstFile := filepath.Join(dstRulesDir, e.Name())
+			_ = copyFile(srcFile, dstFile)
+		}
+	}
 
-set RETRY=0
-:retry_copy_exe
-copy /y "%STAGE_DIR%\%EXE_NAME%" "%APP_DIR%\%EXE_NAME%" >nul 2>nul
-if errorlevel 1 (
-    set /a RETRY+=1
-    if !RETRY! leq 10 (
-        taskkill /f /im "%EXE_NAME%" >nul 2>nul
-        ping 127.0.0.1 -n 2 >nul
-        goto retry_copy_exe
-    )
-)
-
-xcopy /e /i /y "%STAGE_DIR%\*" "%APP_DIR%\" >nul
-
-if exist "%BACKUP_DATA%\state.dat" (
-    mkdir "%APP_DIR%\data\gui" >nul 2>nul
-    copy /y "%BACKUP_DATA%\state.dat" "%APP_DIR%\data\gui\state.dat" >nul 2>nul
-    copy /y "%BACKUP_DATA%\selected.dat" "%APP_DIR%\data\gui\selected.dat" >nul 2>nul
-)
-if exist "%BACKUP_DATA%\legacy_state.dat" (
-    mkdir "%APP_DIR%\data" >nul 2>nul
-    copy /y "%BACKUP_DATA%\legacy_state.dat" "%APP_DIR%\data\state.dat" >nul 2>nul
-)
-if exist "%BACKUP_DATA%" (
-    rmdir /s /q "%BACKUP_DATA%" >nul 2>nul
-)
-
-start "" "%APP_DIR%\%EXE_NAME%"
-
-ping 127.0.0.1 -n 3 >nul
-rmdir /s /q "%STAGE_DIR%" >nul 2>nul
-exit
-`
-	crlfContent := strings.ReplaceAll(scriptContent, "\r\n", "\n")
-	crlfContent = strings.ReplaceAll(crlfContent, "\n", "\r\n")
-	return os.WriteFile(updaterPath, []byte(crlfContent), 0755)
+	return nil
 }
 
-func launchDetachedUpdater(scriptPath, appDir, stageDir, exeName string, pid int) error {
-	cmd := exec.Command("cmd.exe", "/c", scriptPath, appDir, stageDir, exeName, strconv.Itoa(pid))
-	cmd.Dir = filepath.Dir(scriptPath)
-	cmd.Env = append(os.Environ(), "SEE_MASK_NOZONECHECKS=1")
+func launchNewAppProcess(exePath, appRoot string) error {
+	cmd := exec.Command(exePath)
+	cmd.Dir = appRoot
 	cmd.SysProcAttr = &syscall.SysProcAttr{
-		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP | 0x08000000, // CREATE_NO_WINDOW
+		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
 	}
 	return cmd.Start()
+}
+
+func cleanupOldUpdateArtifacts(appRoot string) {
+	exePath, err := os.Executable()
+	if err == nil && exePath != "" {
+		_ = os.Remove(exePath + ".old")
+	}
+	binDir := filepath.Join(appRoot, "bin")
+	if entries, err := os.ReadDir(binDir); err == nil {
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), ".old") {
+				_ = os.Remove(filepath.Join(binDir, e.Name()))
+			}
+		}
+	}
+	// Clean updates staging directory
+	updatesDir := filepath.Join(appRoot, "data", "updates")
+	_ = os.RemoveAll(updatesDir)
 }

@@ -4,7 +4,6 @@ import (
 	"archive/zip"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -76,20 +75,31 @@ func TestExtractZipArchive(t *testing.T) {
 	}
 }
 
-func TestGenerateUpdaterScript(t *testing.T) {
-	tmpDir := t.TempDir()
-	scriptPath := filepath.Join(tmpDir, "apply-update.bat")
+func TestPerformAtomicInPlaceUpdate(t *testing.T) {
+	tmpAppRoot := t.TempDir()
+	tmpStaging := t.TempDir()
 
-	if err := generateUpdaterScript(scriptPath); err != nil {
-		t.Fatalf("generateUpdaterScript failed: %v", err)
+	exePath := filepath.Join(tmpAppRoot, "SanTian-Singbox.exe")
+	if err := os.WriteFile(exePath, []byte("old-exe"), 0755); err != nil {
+		t.Fatal(err)
 	}
 
-	data, err := os.ReadFile(scriptPath)
-	if err != nil {
-		t.Fatalf("read script failed: %v", err)
+	newExePath := filepath.Join(tmpStaging, "SanTian-Singbox.exe")
+	if err := os.WriteFile(newExePath, []byte("new-exe"), 0755); err != nil {
+		t.Fatal(err)
 	}
-	s := string(data)
-	if !strings.Contains(s, "xcopy") || !strings.Contains(s, "tasklist") || !strings.Contains(s, "APP_DIR") {
-		t.Fatalf("script content incomplete: %s", s)
+
+	if err := performAtomicInPlaceUpdate(tmpAppRoot, tmpStaging, exePath); err != nil {
+		t.Fatalf("performAtomicInPlaceUpdate failed: %v", err)
+	}
+
+	data, err := os.ReadFile(exePath)
+	if err != nil || string(data) != "new-exe" {
+		t.Fatalf("exe content mismatch: %v, %s", err, string(data))
+	}
+
+	oldData, err := os.ReadFile(exePath + ".old")
+	if err != nil || string(oldData) != "old-exe" {
+		t.Fatalf("old exe content mismatch: %v, %s", err, string(oldData))
 	}
 }
