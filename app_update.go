@@ -349,6 +349,7 @@ func locateExtractedAppDir(stageDir string, exeName string) string {
 
 func generateUpdaterScript(updaterPath string) error {
 	scriptContent := `@echo off
+set "SEE_MASK_NOZONECHECKS=1"
 setlocal EnableExtensions EnableDelayedExpansion
 
 set "APP_DIR=%~1"
@@ -420,6 +421,7 @@ exit
 func launchDetachedUpdater(scriptPath, appDir, stageDir, exeName string, pid int) error {
 	cmd := exec.Command("cmd.exe", "/c", scriptPath, appDir, stageDir, exeName, strconv.Itoa(pid))
 	cmd.Dir = filepath.Dir(scriptPath)
+	cmd.Env = append(os.Environ(), "SEE_MASK_NOZONECHECKS=1")
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP | 0x08000000, // CREATE_NO_WINDOW
 	}
