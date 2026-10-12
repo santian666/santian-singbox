@@ -402,7 +402,7 @@ func performAtomicInPlaceUpdate(appRoot, extractedAppDir, exePath string) error 
 }
 
 func launchNewAppProcess(exePath, appRoot string) error {
-	cmd := exec.Command(exePath)
+	cmd := exec.Command(exePath, adminRestartArg)
 	cmd.Dir = appRoot
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
