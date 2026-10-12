@@ -3313,43 +3313,69 @@ func (a *App) ApplyAppUpdate() (result *AppUpdateInfo, err error) {
 	updatesDir := filepath.Join(a.root, "data", "updates")
 	_ = os.MkdirAll(updatesDir, 0755)
 	zipPath := filepath.Join(updatesDir, "update.zip")
+	targetVersionPath := filepath.Join(updatesDir, "target_version.txt")
 	stageDir := filepath.Join(updatesDir, "staging")
-	_ = os.Remove(zipPath)
-	_ = os.RemoveAll(stageDir)
-	_ = os.MkdirAll(stageDir, 0755)
 
-	if a.logger != nil {
-		a.logger.Info("开始下载软件更新包：%s", info.DownloadURL)
-	}
-
-	onProgress := func(downloaded, total int64, speed string, percent float64) {
+	// 1. 检查本地是否已存在针对目标版本且完整有效的安装包（避免失败重试或重启软件后重复下载）
+	needDownload := true
+	savedVerBytes, _ := os.ReadFile(targetVersionPath)
+	savedVer := strings.TrimSpace(string(savedVerBytes))
+	if savedVer == info.LatestVersion && isValidUpdateZip(zipPath, info.AssetSize) {
+		needDownload = false
+		if a.logger != nil {
+			a.logger.Info("检测到已存在完整的更新包 (%s)，直接复用，免去重复下载", info.LatestVersion)
+		}
 		if a.ctx != nil {
 			wailsRuntime.EventsEmit(a.ctx, "app-update-progress", AppUpdateProgress{
 				Phase:       "downloading",
-				Percent:     percent,
-				Bytes:       downloaded,
-				Total:       total,
-				SpeedString: speed,
-				Message:     fmt.Sprintf("正在下载：%.1f%% (%s)", percent, speed),
+				Percent:     100,
+				Bytes:       info.AssetSize,
+				Total:       info.AssetSize,
+				SpeedString: "本地缓存",
+				Message:     "已检测到本地完整安装包，校验通过，直接复用安装...",
 			})
 		}
 	}
 
-	if err := downloadUpdateAsset(info.DownloadURL, zipPath, proxyPort, onProgress); err != nil {
-		return nil, fmt.Errorf("下载更新包失败：%w", err)
+	if needDownload {
+		_ = os.RemoveAll(stageDir)
+		_ = os.MkdirAll(stageDir, 0755)
+		if a.logger != nil {
+			a.logger.Info("开始下载软件更新包：%s", info.DownloadURL)
+		}
+
+		onProgress := func(downloaded, total int64, speed string, percent float64) {
+			if a.ctx != nil {
+				wailsRuntime.EventsEmit(a.ctx, "app-update-progress", AppUpdateProgress{
+					Phase:       "downloading",
+					Percent:     percent,
+					Bytes:       downloaded,
+					Total:       total,
+					SpeedString: speed,
+					Message:     fmt.Sprintf("正在下载：%.1f%% (%s)", percent, speed),
+				})
+			}
+		}
+
+		if err := downloadUpdateAsset(info.DownloadURL, zipPath, proxyPort, info.AssetSize, onProgress); err != nil {
+			return nil, fmt.Errorf("下载更新包失败：%w", err)
+		}
+		_ = os.WriteFile(targetVersionPath, []byte(info.LatestVersion), 0644)
 	}
 
 	if a.ctx != nil {
 		wailsRuntime.EventsEmit(a.ctx, "app-update-progress", AppUpdateProgress{
 			Phase:   "extracting",
 			Percent: 100,
-			Message: "下载完成，正在解压更新包...",
+			Message: "更新包就绪，正在解压更新文件...",
 		})
 	}
 	if a.logger != nil {
-		a.logger.Info("更新包下载完成，正在解压...")
+		a.logger.Info("更新包已就绪，正在解压...")
 	}
 
+	_ = os.RemoveAll(stageDir)
+	_ = os.MkdirAll(stageDir, 0755)
 	if err := extractZipArchive(zipPath, stageDir); err != nil {
 		return nil, fmt.Errorf("解压更新包失败：%w", err)
 	}
@@ -3372,10 +3398,11 @@ func (a *App) ApplyAppUpdate() (result *AppUpdateInfo, err error) {
 		a.logger.Info("开始执行原子级更新文件替换...")
 	}
 
-	// 1. 停止 sing-box 核心内核以释放 bin/ 目录下的二进制文件句柄
+	// 1. 停止运行中工具与 sing-box 核心以释放 bin/ 目录下的二进制文件句柄
+	a.stopRunningToolsForExit()
 	if a.manager != nil && a.manager.Running() {
 		_ = a.Stop()
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(300 * time.Millisecond)
 	}
 
 	// 2. 进程内原子级替换文件（重命名旧程序，拷贝新程序）

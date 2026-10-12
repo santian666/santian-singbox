@@ -33,7 +33,7 @@ def create_opener():
 def main():
     repo = "santian666/santian-singbox"
     version_file = os.path.join(os.path.dirname(__file__), "..", "data", "build-version.json")
-    with open(version_file, "r", encoding="utf-8") as f:
+    with open(version_file, "r", encoding="utf-8-sig") as f:
         ver_data = json.load(f)
     ver = ver_data.get("version", "").strip()
     if not ver:

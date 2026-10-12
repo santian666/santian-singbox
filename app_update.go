@@ -235,12 +235,49 @@ func (pw *progressWriter) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-func downloadUpdateAsset(downloadURL string, destPath string, proxyPort int, onProgress func(downloaded, total int64, speed string, percent float64)) error {
+func isValidUpdateZip(zipPath string, expectedSize int64) bool {
+	fi, err := os.Stat(zipPath)
+	if err != nil || fi.Size() == 0 {
+		return false
+	}
+	if expectedSize > 0 && fi.Size() != expectedSize {
+		return false
+	}
+	reader, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return false
+	}
+	defer reader.Close()
+
+	for _, file := range reader.File {
+		normalizedName := strings.ReplaceAll(file.Name, "\\", "/")
+		base := filepath.Base(normalizedName)
+		if strings.EqualFold(base, "SanTian-Singbox.exe") {
+			return true
+		}
+	}
+	return false
+}
+
+func downloadUpdateAsset(downloadURL string, destPath string, proxyPort int, expectedSize int64, onProgress func(downloaded, total int64, speed string, percent float64)) error {
+	var existingSize int64 = 0
+	if fi, err := os.Stat(destPath); err == nil && fi.Size() > 0 {
+		if expectedSize > 0 && fi.Size() < expectedSize {
+			existingSize = fi.Size()
+		} else if expectedSize > 0 && fi.Size() > expectedSize {
+			_ = os.Remove(destPath)
+			existingSize = 0
+		}
+	}
+
 	req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("User-Agent", "SanTian-Singbox/"+AppVersion)
+	if existingSize > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", existingSize))
+	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if proxyPort > 0 {
@@ -261,24 +298,43 @@ func downloadUpdateAsset(downloadURL string, destPath string, proxyPort int, onP
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("下载服务器返回状态码 %d", resp.StatusCode)
+	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+		_ = os.Remove(destPath)
+		return downloadUpdateAsset(downloadURL, destPath, proxyPort, expectedSize, onProgress)
 	}
 
-	total := resp.ContentLength
+	var out *os.File
+	var total int64
+	var downloadedSoFar int64
+
+	if resp.StatusCode == http.StatusPartialContent && existingSize > 0 {
+		out, err = os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			return err
+		}
+		total = existingSize + resp.ContentLength
+		downloadedSoFar = existingSize
+	} else if resp.StatusCode == http.StatusOK {
+		out, err = os.OpenFile(destPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+		if err != nil {
+			return err
+		}
+		total = resp.ContentLength
+		downloadedSoFar = 0
+	} else {
+		return fmt.Errorf("下载服务器返回状态码 %d", resp.StatusCode)
+	}
+	defer out.Close()
+
 	if total > appUpdateDownloadLimit {
 		return errors.New("更新文件大小超过安全限制")
 	}
 
-	out, err := os.OpenFile(destPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
 	pw := &progressWriter{
 		total:      total,
+		downloaded: downloadedSoFar,
 		lastEmit:   time.Now(),
+		lastBytes:  downloadedSoFar,
 		onProgress: onProgress,
 	}
 
@@ -353,8 +409,17 @@ func performAtomicInPlaceUpdate(appRoot, extractedAppDir, exePath string) error 
 	// 1. Rename currently running SanTian-Singbox.exe -> .old (NTFS allows renaming running binaries)
 	oldExe := exePath + ".old"
 	_ = os.Remove(oldExe)
-	if err := os.Rename(exePath, oldExe); err != nil {
-		return fmt.Errorf("重命名旧主程序失败：%w", err)
+
+	var renameErr error
+	for i := 0; i < 5; i++ {
+		renameErr = os.Rename(exePath, oldExe)
+		if renameErr == nil {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if renameErr != nil {
+		return fmt.Errorf("重命名旧主程序失败（可能被安全软件或系统占用）：%w", renameErr)
 	}
 
 	// 2. Copy new executable directly into place
@@ -423,7 +488,25 @@ func cleanupOldUpdateArtifacts(appRoot string) {
 			}
 		}
 	}
-	// Clean updates staging directory
+
+	// Clean updates staging directory ONLY IF the update succeeded (AppVersion >= targetVersion)
 	updatesDir := filepath.Join(appRoot, "data", "updates")
-	_ = os.RemoveAll(updatesDir)
+	targetVersionPath := filepath.Join(updatesDir, "target_version.txt")
+	targetVerBytes, err := os.ReadFile(targetVersionPath)
+	if err == nil {
+		targetVer := strings.TrimSpace(string(targetVerBytes))
+		if targetVer != "" {
+			if compareSemver(AppVersion, targetVer) >= 0 {
+				// Current version is already target version or newer: update was successful! Clean everything
+				_ = os.RemoveAll(updatesDir)
+				return
+			}
+			// Update did not succeed yet (still running older version):
+			// Keep update.zip and target_version.txt so user doesn't need to re-download!
+			// Only clean temporary staging extraction folder:
+			_ = os.RemoveAll(filepath.Join(updatesDir, "staging"))
+			return
+		}
+	}
+	_ = os.RemoveAll(filepath.Join(updatesDir, "staging"))
 }

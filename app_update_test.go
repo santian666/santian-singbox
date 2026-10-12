@@ -103,3 +103,66 @@ func TestPerformAtomicInPlaceUpdate(t *testing.T) {
 		t.Fatalf("old exe content mismatch: %v, %s", err, string(oldData))
 	}
 }
+
+func TestIsValidUpdateZip(t *testing.T) {
+	tmpDir := t.TempDir()
+	validZipPath := filepath.Join(tmpDir, "valid.zip")
+
+	// 1. Create a valid zip with SanTian-Singbox.exe
+	f, err := os.Create(validZipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	entry, err := zw.Create("SanTian-Singbox.exe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = entry.Write([]byte("binary-data"))
+	_ = zw.Close()
+	_ = f.Close()
+
+	fi, err := os.Stat(validZipPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !isValidUpdateZip(validZipPath, fi.Size()) {
+		t.Errorf("isValidUpdateZip failed for valid zip")
+	}
+	if !isValidUpdateZip(validZipPath, 0) {
+		t.Errorf("isValidUpdateZip failed for valid zip with expectedSize=0")
+	}
+	if isValidUpdateZip(validZipPath, fi.Size()+100) {
+		t.Errorf("isValidUpdateZip should fail when expected size mismatches")
+	}
+
+	// 2. Corrupt zip
+	corruptZipPath := filepath.Join(tmpDir, "corrupt.zip")
+	_ = os.WriteFile(corruptZipPath, []byte("not-a-zip"), 0644)
+	if isValidUpdateZip(corruptZipPath, 0) {
+		t.Errorf("isValidUpdateZip should fail for corrupt zip")
+	}
+}
+
+func TestCleanupOldUpdateArtifactsPreservesPendingUpdate(t *testing.T) {
+	tmpRoot := t.TempDir()
+	updatesDir := filepath.Join(tmpRoot, "data", "updates")
+	_ = os.MkdirAll(filepath.Join(updatesDir, "staging"), 0755)
+
+	zipPath := filepath.Join(updatesDir, "update.zip")
+	_ = os.WriteFile(zipPath, []byte("cached-zip-content"), 0644)
+	_ = os.WriteFile(filepath.Join(updatesDir, "staging", "temp.txt"), []byte("staging"), 0644)
+	_ = os.WriteFile(filepath.Join(updatesDir, "target_version.txt"), []byte("v99.9.9"), 0644)
+
+	// AppVersion is e.g. "0.0.1" which is < "99.9.9"
+	cleanupOldUpdateArtifacts(tmpRoot)
+
+	// update.zip and target_version.txt MUST be preserved!
+	if _, err := os.Stat(zipPath); os.IsNotExist(err) {
+		t.Errorf("cleanupOldUpdateArtifacts should NOT have deleted update.zip for pending update")
+	}
+	// staging directory MUST be cleaned!
+	if _, err := os.Stat(filepath.Join(updatesDir, "staging", "temp.txt")); !os.IsNotExist(err) {
+		t.Errorf("cleanupOldUpdateArtifacts should have cleaned temporary staging files")
+	}
+}
