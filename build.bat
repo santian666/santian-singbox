@@ -54,10 +54,10 @@ del /q "build\bin\logs\gui\*.log" >nul 2>nul
 del /q "build\bin\logs\web\*.log" >nul 2>nul
 del /q "build\bin\start.bat" >nul 2>nul
 
-set "OUT=dist\SanTian-Singbox-v%VERSION%"
+set "OUT=dist\SanTian-Singbox"
 if exist "%OUT%" rmdir /s /q "%OUT%"
 mkdir "%OUT%"
 xcopy /e /i /y "build\bin\*" "%OUT%\" >nul
-python -c "import os, zipfile, sys; src, out = sys.argv[1], sys.argv[2]; (os.remove(out) if os.path.exists(out) else None); z = zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED, 6); [(z.write(os.path.join(r, f), os.path.relpath(os.path.join(r, f), src).replace('\\\\', '/'))) for r, _, fs in os.walk(src) for f in fs]; z.close()" "%OUT%" "dist\SanTian-Singbox-v%VERSION%-windows-amd64.zip"
+python -c "import os, zipfile, sys; src, out1, out2 = sys.argv[1], sys.argv[2], sys.argv[3]; (os.remove(out1) if os.path.exists(out1) else None); (os.remove(out2) if os.path.exists(out2) else None); z1 = zipfile.ZipFile(out1, 'w', zipfile.ZIP_DEFLATED, 6); z2 = zipfile.ZipFile(out2, 'w', zipfile.ZIP_DEFLATED, 6); [(z1.write(os.path.join(r, f), os.path.relpath(os.path.join(r, f), src).replace('\\\\', '/')), z2.write(os.path.join(r, f), os.path.relpath(os.path.join(r, f), src).replace('\\\\', '/'))) for r, _, fs in os.walk(src) for f in fs]; z1.close(); z2.close()" "%OUT%" "dist\SanTian-Singbox.zip" "dist\SanTian-Singbox-windows-amd64.zip"
 echo Build completed: %OUT%
-echo Archive created: dist\SanTian-Singbox-v%VERSION%-windows-amd64.zip
+echo Archive created: dist\SanTian-Singbox.zip and dist\SanTian-Singbox-windows-amd64.zip
