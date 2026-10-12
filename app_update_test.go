@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -166,3 +167,42 @@ func TestCleanupOldUpdateArtifactsPreservesPendingUpdate(t *testing.T) {
 		t.Errorf("cleanupOldUpdateArtifacts should have cleaned temporary staging files")
 	}
 }
+
+func TestCheckUpdateRequiresProxyPort(t *testing.T) {
+	mgr := newAppUpdateManager(nil)
+	info, err := mgr.CheckUpdate(0)
+	if err == nil || err.Error() != "proxy_not_running" {
+		t.Fatalf("expected proxy_not_running error when proxyPort is 0, got info=%v, err=%v", info, err)
+	}
+}
+
+func TestDownloadUpdateAssetRequiresProxyPort(t *testing.T) {
+	err := downloadUpdateAsset("https://example.com/test.zip", "test.zip", 0, 100, nil)
+	if err == nil {
+		t.Fatalf("expected error when proxyPort is 0, got nil")
+	}
+}
+
+func TestAppUpdateRequiresRunningProxy(t *testing.T) {
+	app := &App{
+		appUpdater: newAppUpdateManager(nil),
+	}
+	// Proxy not running, force = true (manual click)
+	_, err := app.CheckAppUpdate(true)
+	if err == nil || !strings.Contains(err.Error(), "请先开启代理") {
+		t.Fatalf("expected error containing 请先开启代理, got: %v", err)
+	}
+
+	// Proxy not running, force = false (auto check)
+	_, err = app.CheckAppUpdate(false)
+	if err == nil || err.Error() != "proxy_not_running" {
+		t.Fatalf("expected proxy_not_running error, got: %v", err)
+	}
+
+	// ApplyAppUpdate requires proxy
+	_, err = app.ApplyAppUpdate()
+	if err == nil || !strings.Contains(err.Error(), "请先开启代理") {
+		t.Fatalf("expected ApplyAppUpdate to require proxy, got: %v", err)
+	}
+}
+

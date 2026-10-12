@@ -637,7 +637,7 @@ func (a *App) State() (result RuntimeState) {
 	var appLatestVersion string
 	var appUpdateAvailable bool
 	var appReleaseNotes string
-	if a.appUpdater != nil && a.appUpdater.lastInfo != nil {
+	if a.manager != nil && a.manager.Running() && a.appUpdater != nil && a.appUpdater.lastInfo != nil {
 		appLatestVersion = a.appUpdater.lastInfo.LatestVersion
 		appUpdateAvailable = a.appUpdater.lastInfo.Available
 		appReleaseNotes = a.appUpdater.lastInfo.ReleaseNotes
@@ -2618,6 +2618,7 @@ func (a *App) SaveSettings(settings Settings) (err error) {
 		a.markTunConnectivityHealthy(state.Settings)
 		a.initTrafficBaseline(state.SelectedID, state.Nodes)
 		a.logger.Info("代理入口已开启，代理已自动启动")
+		safeGo(a.logger, "代理开启后检查更新", a.onProxyStarted)
 	}
 	a.emitState()
 	return nil
@@ -3243,10 +3244,36 @@ func (a *App) UpdateRules() (result map[string]string, err error) {
 
 func (a *App) startupCheckAppUpdate() {
 	time.Sleep(2500 * time.Millisecond)
+	if a.manager == nil || !a.manager.Running() {
+		return
+	}
 	info, err := a.CheckAppUpdate(false)
 	if err != nil {
-		if a.logger != nil {
+		if a.logger != nil && err.Error() != "proxy_not_running" {
 			a.logger.Info("启动检查软件更新：%v", err)
+		}
+		return
+	}
+	if info != nil && info.Available {
+		if a.logger != nil {
+			a.logger.Info("发现软件新版本：%s（当前版本：%s）", info.LatestVersion, info.CurrentVersion)
+		}
+		if a.ctx != nil {
+			wailsRuntime.EventsEmit(a.ctx, "app-update-available", info)
+		}
+		a.emitState()
+	}
+}
+
+func (a *App) onProxyStarted() {
+	time.Sleep(2500 * time.Millisecond)
+	if a.manager == nil || !a.manager.Running() {
+		return
+	}
+	info, err := a.CheckAppUpdate(false)
+	if err != nil {
+		if a.logger != nil && err.Error() != "proxy_not_running" {
+			a.logger.Info("代理开启后检查软件更新：%v", err)
 		}
 		return
 	}
@@ -3266,9 +3293,24 @@ func (a *App) CheckAppUpdate(force bool) (result *AppUpdateInfo, err error) {
 	if a == nil || a.appUpdater == nil {
 		return nil, errors.New("软件更新管理器未初始化")
 	}
+	proxyRunning := a.manager != nil && a.manager.Running()
+	if !proxyRunning {
+		if force {
+			return nil, errors.New("请先开启代理后再检测或更新软件（开启代理后下载速度更快且更稳定）")
+		}
+		return nil, errors.New("proxy_not_running")
+	}
+
+	if !force && a.appUpdater.lastInfo != nil && time.Since(a.appUpdater.lastCheckAt) < 10*time.Minute {
+		return a.appUpdater.lastInfo, nil
+	}
+
 	proxyPort := 0
-	if a.manager != nil && a.manager.Running() && a.store != nil {
+	if a.store != nil {
 		proxyPort = a.store.Snapshot().Settings.MixedPort
+	}
+	if proxyPort <= 0 {
+		proxyPort = 20808
 	}
 	info, err := a.appUpdater.CheckUpdate(proxyPort)
 	if err != nil {
@@ -3282,6 +3324,9 @@ func (a *App) ApplyAppUpdate() (result *AppUpdateInfo, err error) {
 	defer a.recoverError("执行软件更新", &err)
 	if a == nil || a.appUpdater == nil {
 		return nil, errors.New("软件更新管理器未初始化")
+	}
+	if a.manager == nil || !a.manager.Running() {
+		return nil, errors.New("请先开启代理后再执行客户端更新（开启代理可保证下载速度与连接稳定性）")
 	}
 	a.appUpdater.mu.Lock()
 	if a.appUpdater.isUpdating {
@@ -3298,8 +3343,11 @@ func (a *App) ApplyAppUpdate() (result *AppUpdateInfo, err error) {
 	}()
 
 	proxyPort := 0
-	if a.manager != nil && a.manager.Running() && a.store != nil {
+	if a.store != nil {
 		proxyPort = a.store.Snapshot().Settings.MixedPort
+	}
+	if proxyPort <= 0 {
+		proxyPort = 20808
 	}
 
 	info, err := a.appUpdater.CheckUpdate(proxyPort)
@@ -3498,6 +3546,7 @@ func (a *App) startLocked() error {
 	a.markTunConnectivityHealthy(state.Settings)
 	a.initTrafficBaseline(state.SelectedID, state.Nodes)
 	a.emitState()
+	safeGo(a.logger, "代理开启后检查更新", a.onProxyStarted)
 	return nil
 }
 

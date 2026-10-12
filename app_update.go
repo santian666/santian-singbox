@@ -100,23 +100,18 @@ func (m *AppUpdateManager) CheckUpdate(proxyPort int) (*AppUpdateInfo, error) {
 	req.Header.Set("User-Agent", "SanTian-Singbox/"+AppVersion)
 	req.Header.Set("Accept", "application/vnd.github+json")
 
+	if proxyPort <= 0 {
+		return nil, errors.New("proxy_not_running")
+	}
+
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if proxyPort > 0 {
-		proxyParsed, _ := url.Parse(fmt.Sprintf("socks5://127.0.0.1:%d", proxyPort))
-		if proxyParsed != nil {
-			transport.Proxy = http.ProxyURL(proxyParsed)
-		}
+	proxyParsed, _ := url.Parse(fmt.Sprintf("socks5://127.0.0.1:%d", proxyPort))
+	if proxyParsed != nil {
+		transport.Proxy = http.ProxyURL(proxyParsed)
 	}
 
 	client := &http.Client{Timeout: appUpdateCheckTimeout, Transport: transport}
 	resp, err := client.Do(req)
-	if err != nil {
-		// Fallback without proxy if proxy failed
-		if proxyPort > 0 {
-			transport.Proxy = nil
-			resp, err = client.Do(req)
-		}
-	}
 	if err != nil {
 		return nil, fmt.Errorf("检查软件更新失败：%w", err)
 	}
@@ -279,20 +274,18 @@ func downloadUpdateAsset(downloadURL string, destPath string, proxyPort int, exp
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", existingSize))
 	}
 
+	if proxyPort <= 0 {
+		return errors.New("请先开启代理后再下载更新包")
+	}
+
 	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if proxyPort > 0 {
-		proxyParsed, _ := url.Parse(fmt.Sprintf("socks5://127.0.0.1:%d", proxyPort))
-		if proxyParsed != nil {
-			transport.Proxy = http.ProxyURL(proxyParsed)
-		}
+	proxyParsed, _ := url.Parse(fmt.Sprintf("socks5://127.0.0.1:%d", proxyPort))
+	if proxyParsed != nil {
+		transport.Proxy = http.ProxyURL(proxyParsed)
 	}
 
 	client := &http.Client{Timeout: 10 * time.Minute, Transport: transport}
 	resp, err := client.Do(req)
-	if err != nil && proxyPort > 0 {
-		transport.Proxy = nil
-		resp, err = client.Do(req)
-	}
 	if err != nil {
 		return fmt.Errorf("下载更新包失败：%w", err)
 	}
