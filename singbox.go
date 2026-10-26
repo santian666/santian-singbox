@@ -82,11 +82,15 @@ var tunRouteExcludeIPCIDRs = []string{
 }
 
 var tunBlockIPCIDRs = []string{
-	"0.0.0.0/8",
-	"224.0.0.0/4",
-	"240.0.0.0/4",
-	"255.255.255.255/32",
-	"ff00::/8",
+	"0.0.0.0/8",          // 广播/本网络 (Broadcast / this host)
+	"127.0.0.0/8",        // IPv4 回环 (IPv4 loopback)
+	"::1/128",            // IPv6 回环 (IPv6 loopback)
+	"169.254.0.0/16",     // IPv4 链路本地与云元数据 (Link-local & cloud metadata)
+	"fe80::/10",          // IPv6 链路本地 (IPv6 link-local)
+	"224.0.0.0/4",        // IPv4 组播 (IPv4 multicast)
+	"240.0.0.0/4",        // IPv4 保留 (IPv4 reserved)
+	"255.255.255.255/32", // IPv4 受限广播 (IPv4 limited broadcast)
+	"ff00::/8",           // IPv6 组播 (IPv6 multicast)
 }
 
 type ruleSetDef struct {
@@ -1811,6 +1815,9 @@ func buildSingBoxConfig(state PersistState, selected Node, cachePath string, inc
 	if len(endpoints) > 0 {
 		config["endpoints"] = endpoints
 	}
+	if err := validateGeneratedConfig(config, settings); err != nil {
+		return nil, err
+	}
 	return config, nil
 }
 
@@ -2833,7 +2840,142 @@ func buildRouteRules(settings Settings, nodes []Node, includeRemoteRuleSets bool
 			"weixin", "wechat", "douyin", "bytedance", "zhihu", "netease",
 		}, "clash_mode": "rule", "action": "route", "outbound": "direct"},
 	)
+	if settings.FakeDNS || effectiveTun(settings) {
+		rules = sanitizeRulesForFakeDNS(rules)
+	}
 	return rules
+}
+
+const defaultFakeIPRange = "198.18.0.0/15"
+
+var _, defaultFakeIPNet, _ = net.ParseCIDR(defaultFakeIPRange)
+
+func isFakeIPCIDROverlap(cidr string) bool {
+	cidr = strings.TrimSpace(cidr)
+	if cidr == "" || defaultFakeIPNet == nil {
+		return false
+	}
+	ip, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		parsedIP := net.ParseIP(cidr)
+		if parsedIP != nil {
+			return defaultFakeIPNet.Contains(parsedIP)
+		}
+		return false
+	}
+	if ones, _ := ipNet.Mask.Size(); ones == 0 {
+		return false
+	}
+	return defaultFakeIPNet.Contains(ip) || ipNet.Contains(defaultFakeIPNet.IP)
+}
+
+func sanitizeRulesForFakeDNS(rules []map[string]interface{}) []map[string]interface{} {
+	sanitized := make([]map[string]interface{}, 0, len(rules))
+	for _, rule := range rules {
+		action, _ := rule["action"].(string)
+		outbound, _ := rule["outbound"].(string)
+		isBlock := action == "reject" || outbound == "block"
+		if !isBlock {
+			sanitized = append(sanitized, rule)
+			continue
+		}
+
+		modifiedRule := make(map[string]interface{}, len(rule))
+		for k, v := range rule {
+			modifiedRule[k] = v
+		}
+
+		dropped := false
+		if cidrRaw, ok := modifiedRule["ip_cidr"]; ok {
+			cidrs := configStringValues(cidrRaw)
+			clean := make([]string, 0, len(cidrs))
+			for _, c := range cidrs {
+				if !isFakeIPCIDROverlap(c) {
+					clean = append(clean, c)
+				}
+			}
+			if len(clean) == 0 {
+				dropped = true
+			} else {
+				modifiedRule["ip_cidr"] = clean
+			}
+		}
+
+		if srcRaw, ok := modifiedRule["source_ip_cidr"]; ok && !dropped {
+			cidrs := configStringValues(srcRaw)
+			clean := make([]string, 0, len(cidrs))
+			for _, c := range cidrs {
+				if !isFakeIPCIDROverlap(c) {
+					clean = append(clean, c)
+				}
+			}
+			if len(clean) == 0 {
+				dropped = true
+			} else {
+				modifiedRule["source_ip_cidr"] = clean
+			}
+		}
+
+		if !dropped {
+			sanitized = append(sanitized, modifiedRule)
+		}
+	}
+	return sanitized
+}
+
+func validateGeneratedConfig(config map[string]interface{}, settings Settings) error {
+	fakeDNSEnabled := settings.FakeDNS || effectiveTun(settings) || isConfigFakeDNSEnabled(config)
+	if !fakeDNSEnabled {
+		return nil
+	}
+
+	route, ok := config["route"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	rules, ok := route["rules"].([]map[string]interface{})
+	if !ok {
+		return nil
+	}
+
+	for idx, rule := range rules {
+		action, _ := rule["action"].(string)
+		outbound, _ := rule["outbound"].(string)
+		isBlockRule := action == "reject" || outbound == "block"
+		if !isBlockRule {
+			continue
+		}
+
+		for _, cidr := range configStringValues(rule["ip_cidr"]) {
+			if isFakeIPCIDROverlap(cidr) {
+				return fmt.Errorf("配置校验失败：FakeDNS 开启时不得存在拦截 FakeIP 的 block 规则 (rule #%d, ip_cidr: %s)", idx, cidr)
+			}
+		}
+
+		for _, cidr := range configStringValues(rule["source_ip_cidr"]) {
+			if isFakeIPCIDROverlap(cidr) {
+				return fmt.Errorf("配置校验失败：FakeDNS 开启时不得存在拦截 FakeIP 源地址的 block 规则 (rule #%d, source_ip_cidr: %s)", idx, cidr)
+			}
+		}
+	}
+	return nil
+}
+
+func isConfigFakeDNSEnabled(config map[string]interface{}) bool {
+	dns, ok := config["dns"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	servers, ok := dns["servers"].([]map[string]interface{})
+	if !ok {
+		return false
+	}
+	for _, s := range servers {
+		if s["type"] == "fakeip" || s["tag"] == "fakeip" {
+			return true
+		}
+	}
+	return false
 }
 
 func buildLocalMetadataBlockRouteRule() map[string]interface{} {
@@ -2876,12 +3018,6 @@ func buildTunStabilityRouteRules() []map[string]interface{} {
 			"source_ip_cidr": append([]string(nil), tunBlockIPCIDRs...),
 			"action":         "route",
 			"outbound":       "block",
-		},
-		{
-			"inbound":  []string{"tun-in"},
-			"ip_cidr":  []string{"198.18.0.0/15"},
-			"action":   "route",
-			"outbound": "block",
 		},
 	}
 }
