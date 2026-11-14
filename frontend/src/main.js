@@ -3246,7 +3246,6 @@ var ia = ln((an, sn) => {
           i = `${n.address}:${n.port}`,
           o = aa(n, r),
           u = Boolean(n.error) || n.urlDelayMs < 0,
-          canRetest = (u || n.pingMs < 0) && !r && !s.batchTesting,
           b = s.testBusyKey === Xt(a, "speed"),
           S = Ie(n.pingMs, "ms"),
           C = Ie(n.urlDelayMs, "ms"),
@@ -3259,19 +3258,14 @@ var ia = ln((an, sn) => {
           <td><span class="chip copy-value" data-copy-value="${m(n.type)}" title="点击复制 ${m(n.type)}">${m(n.type)}</span></td>
           <td><span class="chip copy-value" data-copy-value="${m(n.country)}" title="点击复制 ${m(n.country)}">${m(n.country)}</span></td>
           <td class="test-name"><strong class="copy-value" data-copy-value="${m(n.name)}" title="点击复制 ${m(n.name)}">${m(n.name)}</strong></td>
-          <td><span class="${Ae(n.pingMs)} copy-value" data-copy-value="${m(S)}" title="点击复制 ${m(S)}">${m(S)}</span></td>
-          <td><span class="${Ae(n.urlDelayMs)} copy-value" data-copy-value="${m(C)}" title="点击复制 ${m(C)}">${m(C)}</span></td>
+          <td><span class="${Ae(n.pingMs)}" data-raw-retest="${a}" data-retest-metric="ping" title="${r || s.batchTesting ? "测试中" : "点击重新测试 Ping 延迟"}" style="cursor:${r || s.batchTesting ? "default" : "pointer"}">${m(S)}</span></td>
+          <td><span class="${Ae(n.urlDelayMs)}" data-raw-retest="${a}" data-retest-metric="url" title="${r || s.batchTesting ? "测试中" : "点击重新测试 URL 延迟"}" style="cursor:${r || s.batchTesting ? "default" : "pointer"}">${m(C)}</span></td>
           <td><span class="${ra(n.outboundIp)} copy-value" data-copy-value="${m(N)}" title="点击复制 ${m(N)}">${m(N)}</span></td>
           <td><span class="${Ae(n.downloadMbps)} copy-value" data-copy-value="${m(O)}" title="点击复制 ${m(O)}">${m(O)}</span></td>
           <td><span class="${Ae(n.uploadMbps)} copy-value" data-copy-value="${m(G)}" title="点击复制 ${m(G)}">${m(G)}</span></td>
-          <td>${
-            canRetest
-              ? `<span class="test-status bad" data-raw-retest="${a}" title="点击重新测试该节点" style="cursor:pointer;text-decoration:underline">${m(o)}（点击重测）</span>`
-              : `<span class="test-status ${u ? "bad" : ""} copy-value" data-copy-value="${m(o)}" title="点击复制 ${m(o)}">${m(o)}</span>`
-          }</td>
+          <td><span class="test-status ${u ? "bad" : ""} copy-value" data-copy-value="${m(o)}" title="点击复制 ${m(o)}">${m(o)}</span></td>
           <td>
             <div class="test-actions">
-              ${canRetest ? `<button data-raw-retest="${a}" title="重新测试该节点的延迟和出口 IP">重测</button>` : ""}
               <button class="${b ? "is-busy" : ""}" data-raw-speed="${a}" ${r || s.batchTesting ? "disabled" : ""}>${b ? "测试中" : "测试"}</button>
             </div>
           </td>
@@ -3335,7 +3329,7 @@ var ia = ln((an, sn) => {
       }
       const retestEl = target.closest("[data-raw-retest]");
       if (retestEl && e.contains(retestEl)) {
-        retestBatchNode(Number(retestEl.dataset.rawRetest));
+        retestBatchNode(Number(retestEl.dataset.rawRetest), retestEl.dataset.retestMetric);
         return;
       }
       const speedBtn = target.closest("[data-raw-speed]");
@@ -3357,31 +3351,34 @@ var ia = ln((an, sn) => {
     });
   }
 
-  // 单独重测一个失败的节点：按本次批量测试的类型（真连接延迟或 Ping）重测，成功后再查出口 IP
-  async function retestBatchNode(index) {
+  // 点击 Ping 延迟或 URL 延迟单元格：单独重测该节点的这一项（URL 延迟成功后顺带刷新出口 IP）
+  async function retestBatchNode(index, which) {
     const r = s.testNodes[index];
-    if (!r || s.batchTesting) return;
+    if (!r || s.batchTesting || s.testBusyKeys.has(Wt(index))) return;
     const raw = r.raw;
-    const metric = s.currentBatchMetric === "ping" ? "ping" : "delay";
-    const wasOk = metric === "ping" ? r.pingMs > 0 : r.urlDelayMs > 0;
+    const metric = which === "ping" ? "ping" : "delay";
+    const value = (node) => (metric === "ping" ? node.pingMs : node.urlDelayMs);
+    const wasOk = value(r) > 0;
     s.testStopRequested = !1;
     r.error = "";
     await Ue(index, metric, !0);
     const n = s.testNodes[index];
     if (!n || n.raw !== raw) return;
-    const ok = metric === "ping" ? n.pingMs > 0 : n.urlDelayMs > 0;
-    if (ok) {
-      if (!wasOk && s.batchTestCompleted > 0) s.batchTestWorking = (s.batchTestWorking || 0) + 1;
+    const ok = value(n) > 0;
+    // “可用”计数只按本次批量测试的类型统计
+    if (s.batchTestCompleted > 0 && metric === (s.currentBatchMetric === "ping" ? "ping" : "delay") && ok !== wasOk) {
+      s.batchTestWorking = Math.max(0, (s.batchTestWorking || 0) + (ok ? 1 : -1));
+    }
+    if (ok && metric === "delay") {
       await Ue(index, "ip", !0);
       const latest = s.testNodes[index];
       if (latest && latest.raw === raw) {
-        latest.status = metric === "ping" ? "Ping " + latest.pingMs + " ms" : "URL " + latest.urlDelayMs + " ms";
-        se(true);
+        latest.status = "URL " + latest.urlDelayMs + " ms";
       }
-      P("重测成功：" + (n.name || n.address || "节点"));
-    } else {
-      P("重测仍然失败：" + (n.error ? en(n.error) : "节点不可用"));
     }
+    se(true);
+    const label = metric === "ping" ? "Ping" : "URL 延迟";
+    P(ok ? `${label} 重测：${value(n)} ms` : `${label} 重测失败：${n.error ? en(n.error) : "节点不可用"}`);
   }
 
   let seTimer = null;
