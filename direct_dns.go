@@ -9,6 +9,16 @@ import (
 
 var directDNSFallbackCandidates = []string{"223.5.5.5", "119.29.29.29", "1.1.1.1", "8.8.8.8", "9.9.9.9"}
 
+type networkFingerprint struct {
+	IfIndex uint32
+	LocalIP string
+	DNS     string
+}
+
+func (fp networkFingerprint) Equal(other networkFingerprint) bool {
+	return fp.IfIndex == other.IfIndex && fp.LocalIP == other.LocalIP && fp.DNS == other.DNS
+}
+
 type directDNSProbeResult struct {
 	latency time.Duration
 	ok      bool
@@ -29,9 +39,16 @@ var (
 	getDefaultRouteIfIndexFunc = func() uint32 {
 		return getDefaultRouteIfIndex()
 	}
-	detectPhysicalDNSServersFunc = detectPhysicalDNSServers
-	probeDirectUDPDNSFunc        = probeDirectUDPDNS
+	detectPhysicalDNSServersFunc  = detectPhysicalDNSServers
+	probeDirectUDPDNSFunc         = probeDirectUDPDNS
+	currentNetworkFingerprintFunc = currentNetworkFingerprint
 )
+
+func invalidateDirectDNSCache() {
+	directDNSCacheMu.Lock()
+	directDNSCache = directDNSCacheEntry{}
+	directDNSCacheMu.Unlock()
+}
 
 func isTunSubnetIP(ip net.IP) bool {
 	ip4 := ip.To4()
@@ -261,6 +278,314 @@ func resolveDirectDNSPlan(logger *Logger) autoDNSPlan {
 			Type:   "udp",
 			Server: server,
 		},
-		Remote: remoteDNSCandidates[0],
+		Remote:       remoteDNSCandidates[0],
+		DirectSource: source,
 	}
+}
+
+type directDNSAction int
+
+const (
+	directDNSKeep directDNSAction = iota
+	directDNSRestart
+)
+
+func decideDirectDNSAction(running string, runningReachable bool, resolved string, resolvedSource string) directDNSAction {
+	if runningReachable {
+		return directDNSKeep
+	}
+	if resolvedSource == "default" {
+		return directDNSKeep
+	}
+	if resolved == running {
+		return directDNSKeep
+	}
+	return directDNSRestart
+}
+
+type directDNSHealthChecker struct {
+	mu                     sync.Mutex
+	hasRecordedFingerprint bool
+	lastFingerprint        networkFingerprint
+	directDNSCycleCount    int
+	directDNSFailCount     int
+	forceReselect          bool
+	lastNoRestartLogAt     map[string]time.Time
+	checkCycleInterval     int
+
+	// Dependencies:
+	getFingerprint  func() networkFingerprint
+	probeDNS        func(server string) (time.Duration, bool)
+	invalidateCache func()
+	resolvePlan     func() (server string, source string)
+	restart         func() error
+	runningDNS      func() string
+	now             func() time.Time
+	sleep           func(time.Duration)
+	tryLockProxyOp  func() bool
+	unlockProxyOp   func()
+	getLastRestart  func() time.Time
+	setLastRestart  func(time.Time)
+	logInfo         func(format string, args ...any)
+
+	lastRestartAt time.Time
+}
+
+func newDirectDNSHealthChecker(a *App) *directDNSHealthChecker {
+	return &directDNSHealthChecker{
+		getFingerprint:  currentNetworkFingerprintFunc,
+		probeDNS:        probeDirectUDPDNSFunc,
+		invalidateCache: invalidateDirectDNSCache,
+		resolvePlan: func() (string, string) {
+			plan := resolveDirectDNSPlanFunc(a.logger)
+			return plan.Direct.Server, plan.DirectSource
+		},
+		restart: func() error {
+			return a.restartForDirectDNS()
+		},
+		runningDNS: func() string {
+			if a == nil || a.manager == nil {
+				return ""
+			}
+			return a.manager.RunningDirectDNS()
+		},
+		now:   time.Now,
+		sleep: time.Sleep,
+		tryLockProxyOp: func() bool {
+			if a == nil {
+				return true
+			}
+			return a.proxyOpMu.TryLock()
+		},
+		unlockProxyOp: func() {
+			if a != nil {
+				a.proxyOpMu.Unlock()
+			}
+		},
+		getLastRestart: func() time.Time {
+			if a == nil {
+				return time.Time{}
+			}
+			a.healthMu.Lock()
+			defer a.healthMu.Unlock()
+			return a.lastHealthRestart
+		},
+		setLastRestart: func(t time.Time) {
+			if a != nil {
+				a.healthMu.Lock()
+				a.lastHealthRestart = t
+				a.healthMu.Unlock()
+			}
+		},
+		logInfo: func(format string, args ...any) {
+			if a != nil && a.logger != nil {
+				a.logger.Info(format, args...)
+			}
+		},
+	}
+}
+
+func (c *directDNSHealthChecker) SetForceReselect() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.forceReselect = true
+}
+
+func (c *directDNSHealthChecker) LastFingerprint() networkFingerprint {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lastFingerprint
+}
+
+func (c *directDNSHealthChecker) lastRestartTime() time.Time {
+	if c.getLastRestart != nil {
+		return c.getLastRestart()
+	}
+	return c.lastRestartAt
+}
+
+func (c *directDNSHealthChecker) updateLastRestart(t time.Time) {
+	if c.setLastRestart != nil {
+		c.setLastRestart(t)
+	} else {
+		c.lastRestartAt = t
+	}
+}
+
+func (c *directDNSHealthChecker) logNoRestartThrottled(reason string, now time.Time) {
+	c.mu.Lock()
+	if c.lastNoRestartLogAt == nil {
+		c.lastNoRestartLogAt = make(map[string]time.Time)
+	}
+	last, ok := c.lastNoRestartLogAt[reason]
+	if ok && now.Sub(last) < 5*time.Minute {
+		c.mu.Unlock()
+		return
+	}
+	c.lastNoRestartLogAt[reason] = now
+	c.mu.Unlock()
+
+	if c.logInfo != nil {
+		c.logInfo("直连 DNS 暂不切换：%s", reason)
+	}
+}
+
+func (c *directDNSHealthChecker) CheckHealth() bool {
+	c.mu.Lock()
+	now := time.Now()
+	if c.now != nil {
+		now = c.now()
+	}
+
+	force := c.forceReselect
+	c.forceReselect = false
+
+	var currentFP networkFingerprint
+	if c.getFingerprint != nil {
+		currentFP = c.getFingerprint()
+	}
+
+	shouldReselect := false
+	needStabilizeSleep := false
+	var oldFP networkFingerprint
+
+	if !c.hasRecordedFingerprint {
+		c.hasRecordedFingerprint = true
+		c.lastFingerprint = currentFP
+	} else if currentFP != c.lastFingerprint {
+		oldFP = c.lastFingerprint
+		c.lastFingerprint = currentFP
+		shouldReselect = true
+		needStabilizeSleep = true
+	}
+
+	if force {
+		shouldReselect = true
+	}
+
+	interval := c.checkCycleInterval
+	if interval <= 0 {
+		interval = 3
+	}
+	c.directDNSCycleCount++
+	runPeriodicProbe := (c.directDNSCycleCount >= interval)
+	if runPeriodicProbe {
+		c.directDNSCycleCount = 0
+	}
+	c.mu.Unlock()
+
+	if needStabilizeSleep {
+		if c.logInfo != nil {
+			c.logInfo("检测到网络变化：%d/%s → %d/%s", oldFP.IfIndex, oldFP.LocalIP, currentFP.IfIndex, currentFP.LocalIP)
+		}
+		if c.sleep != nil {
+			c.sleep(3 * time.Second)
+		}
+	}
+
+	var running string
+	if c.runningDNS != nil {
+		running = c.runningDNS()
+	}
+
+	periodicProbeRan := false
+	periodicProbeOK := false
+	if runPeriodicProbe && running != "" && c.probeDNS != nil {
+		periodicProbeRan = true
+		_, periodicProbeOK = c.probeDNS(running)
+		c.mu.Lock()
+		if periodicProbeOK {
+			c.directDNSFailCount = 0
+		} else {
+			c.directDNSFailCount++
+			if c.directDNSFailCount >= 2 {
+				c.directDNSFailCount = 0
+				shouldReselect = true
+			}
+		}
+		c.mu.Unlock()
+	}
+
+	if !shouldReselect {
+		return false
+	}
+
+	// 重新选择
+	runningReachable := false
+	if periodicProbeRan && !periodicProbeOK {
+		runningReachable = false
+	} else if running != "" && c.probeDNS != nil {
+		_, runningReachable = c.probeDNS(running)
+	}
+
+	if c.invalidateCache != nil {
+		c.invalidateCache()
+	}
+
+	var resolved string
+	var resolvedSource string
+	if c.resolvePlan != nil {
+		resolved, resolvedSource = c.resolvePlan()
+	}
+
+	action := decideDirectDNSAction(running, runningReachable, resolved, resolvedSource)
+	if action == directDNSKeep {
+		reason := "直连 DNS 保持不变"
+		if runningReachable {
+			reason = "当前直连 DNS 仍可用，暂不切换"
+		} else if resolvedSource == "default" {
+			reason = "网络可能未连通，暂不切换"
+		} else if resolved == running {
+			reason = "新解析直连 DNS 与当前运行一致，暂不切换"
+		}
+		c.logNoRestartThrottled(reason, now)
+		c.mu.Lock()
+		c.directDNSFailCount = 0
+		c.mu.Unlock()
+		return false
+	}
+
+	// 需要重启时：遵守现有的 lastHealthRestart 20 秒间隔限制
+	lastRestart := c.lastRestartTime()
+	if !lastRestart.IsZero() && now.Sub(lastRestart) < 20*time.Second {
+		c.logNoRestartThrottled("距离上次自动恢复过近，暂不切换", now)
+		return false
+	}
+
+	// 持有 proxyOpMu（使用 TryLock）
+	if c.tryLockProxyOp != nil {
+		if !c.tryLockProxyOp() {
+			c.mu.Lock()
+			c.forceReselect = true
+			c.mu.Unlock()
+			return false
+		}
+		if c.unlockProxyOp != nil {
+			defer c.unlockProxyOp()
+		}
+	}
+
+	lastRestart = c.lastRestartTime()
+	if !lastRestart.IsZero() && now.Sub(lastRestart) < 20*time.Second {
+		c.logNoRestartThrottled("距离上次自动恢复过近，暂不切换", now)
+		return false
+	}
+
+	if c.restart != nil {
+		if err := c.restart(); err != nil {
+			if c.logInfo != nil {
+				c.logInfo("直连 DNS 切换重启失败：%v", err)
+			}
+			return false
+		}
+	}
+
+	c.updateLastRestart(now)
+	c.mu.Lock()
+	c.directDNSFailCount = 0
+	c.mu.Unlock()
+	if c.logInfo != nil {
+		c.logInfo("直连 DNS 已切换：%s → %s，已重启内核", running, resolved)
+	}
+	return true
 }

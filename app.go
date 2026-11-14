@@ -87,6 +87,7 @@ type App struct {
 	mtrMu                       sync.Mutex
 	mtrCancel                   context.CancelFunc
 	appUpdater                  *AppUpdateManager
+	directDNSChecker            *directDNSHealthChecker
 }
 
 type proxyEntrySnapshot struct {
@@ -154,6 +155,7 @@ func NewApp() *App {
 		tunHandoffOnLaunch: hasArg(adminTunHandoffArg),
 		appUpdater:         newAppUpdateManager(logger),
 	}
+	app.directDNSChecker = newDirectDNSHealthChecker(app)
 	return app
 }
 
@@ -3796,7 +3798,12 @@ func (a *App) ensureProxyHealth(reason string) {
 	if !a.proxyOpMu.TryLock() {
 		return
 	}
-	defer a.proxyOpMu.Unlock()
+	locked := true
+	defer func() {
+		if locked {
+			a.proxyOpMu.Unlock()
+		}
+	}()
 	state = a.store.Snapshot()
 	normalizeSettings(&state.Settings)
 	if !shouldRunProxy(state.Settings) || !stateHasSelectedNode(state) {
@@ -3811,16 +3818,25 @@ func (a *App) ensureProxyHealth(reason string) {
 	}
 	if err := a.manager.HealthCheck(state.Settings); err == nil {
 		if err := a.ensureProxyEntrancesLocked(state); err == nil {
+			locked = false
+			a.proxyOpMu.Unlock()
+			a.ensureDirectDNSHealth()
 			return
 		}
 		time.Sleep(500 * time.Millisecond)
 		if retryErr := a.ensureProxyEntrancesLocked(state); retryErr == nil {
 			a.logger.Info("%s：代理入口瞬时异常已恢复，无需重启", reason)
+			locked = false
+			a.proxyOpMu.Unlock()
+			a.ensureDirectDNSHealth()
 			return
 		} else {
 			a.logger.Error("%s：代理入口检查连续失败：%v", reason, retryErr)
 			if errors.Is(retryErr, errSystemProxyEntrance) {
 				a.logger.Error("%s：系统代理可能被其他软件持续覆盖，保持 sing-box 运行并等待下次自检", reason)
+				locked = false
+				a.proxyOpMu.Unlock()
+				a.ensureDirectDNSHealth()
 				return
 			}
 		}
@@ -4239,6 +4255,7 @@ func (a *App) onSystemResume() {
 	if a.manager != nil && a.manager.Running() {
 		_ = a.manager.CloseConnections()
 	}
+	a.getDirectDNSChecker().SetForceReselect()
 	a.ensureProxyHealthAsync("系统恢复自检")
 	a.scheduleResumeHealthChecks()
 }
@@ -4332,4 +4349,37 @@ func hasRestartArg() bool {
 		}
 	}
 	return false
+}
+
+func (a *App) getDirectDNSChecker() *directDNSHealthChecker {
+	a.healthMu.Lock()
+	defer a.healthMu.Unlock()
+	if a.directDNSChecker == nil {
+		a.directDNSChecker = newDirectDNSHealthChecker(a)
+	}
+	return a.directDNSChecker
+}
+
+func (a *App) ensureDirectDNSHealth() {
+	if a == nil || a.manager == nil || !a.manager.Running() {
+		return
+	}
+	checker := a.getDirectDNSChecker()
+	checker.CheckHealth()
+}
+
+func (a *App) restartForDirectDNS() error {
+	state := a.store.Snapshot()
+	normalizeSettings(&state.Settings)
+	a.persistTraffic()
+	if err := a.manager.Restart(state, effectiveTun(state.Settings)); err != nil {
+		a.logger.Error("直连 DNS 重启失败：%v", err)
+		a.disableTunAfterStartFailure(state.Settings, err)
+		a.emitState()
+		return err
+	}
+	a.markTunConnectivityHealthy(state.Settings)
+	a.initTrafficBaseline(state.SelectedID, state.Nodes)
+	a.emitState()
+	return nil
 }
