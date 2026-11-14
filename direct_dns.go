@@ -303,6 +303,15 @@ func decideDirectDNSAction(running string, runningReachable bool, resolved strin
 	return directDNSRestart
 }
 
+const (
+	// 当前直连 DNS 连续探测失败多少次（每 30 秒一次）才触发重新选择。
+	// 路由器 DNS 偶尔丢一个 UDP 包是正常现象，阈值不能太低。
+	directDNSFailThreshold = 3
+	// 因直连 DNS 触发的内核重启，每小时最多次数；超过后暂停自动切换，
+	// 直到下一次网络指纹变化或系统唤醒。
+	directDNSMaxRestartsPerHour = 3
+)
+
 type directDNSHealthChecker struct {
 	mu                     sync.Mutex
 	hasRecordedFingerprint bool
@@ -312,6 +321,8 @@ type directDNSHealthChecker struct {
 	forceReselect          bool
 	lastNoRestartLogAt     map[string]time.Time
 	checkCycleInterval     int
+	restartHistory         []time.Time
+	autoSwitchPaused       bool
 
 	// Dependencies:
 	getFingerprint  func() networkFingerprint
@@ -327,6 +338,7 @@ type directDNSHealthChecker struct {
 	getLastRestart  func() time.Time
 	setLastRestart  func(time.Time)
 	logInfo         func(format string, args ...any)
+	logError        func(format string, args ...any)
 
 	lastRestartAt time.Time
 }
@@ -382,7 +394,31 @@ func newDirectDNSHealthChecker(a *App) *directDNSHealthChecker {
 				a.logger.Info(format, args...)
 			}
 		},
+		logError: func(format string, args ...any) {
+			if a != nil && a.logger != nil {
+				a.logger.Error(format, args...)
+			}
+		},
 	}
+}
+
+// AutoSwitchPaused 返回是否因频繁切换而暂停了自动切换（供测试与诊断使用）。
+func (c *directDNSHealthChecker) AutoSwitchPaused() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.autoSwitchPaused
+}
+
+// recentRestartCountLocked 清理一小时以前的重启记录并返回剩余次数。调用方必须持有 c.mu。
+func (c *directDNSHealthChecker) recentRestartCountLocked(now time.Time) int {
+	kept := c.restartHistory[:0]
+	for _, t := range c.restartHistory {
+		if now.Sub(t) < time.Hour {
+			kept = append(kept, t)
+		}
+	}
+	c.restartHistory = kept
+	return len(c.restartHistory)
 }
 
 func (c *directDNSHealthChecker) SetForceReselect() {
@@ -463,6 +499,13 @@ func (c *directDNSHealthChecker) CheckHealth() bool {
 		shouldReselect = true
 	}
 
+	// 网络变化或系统唤醒时解除“频繁切换暂停”，并清空重启记录。
+	if shouldReselect && c.autoSwitchPaused {
+		c.autoSwitchPaused = false
+		c.restartHistory = nil
+	}
+	paused := c.autoSwitchPaused
+
 	interval := c.checkCycleInterval
 	if interval <= 0 {
 		interval = 3
@@ -490,7 +533,7 @@ func (c *directDNSHealthChecker) CheckHealth() bool {
 
 	periodicProbeRan := false
 	periodicProbeOK := false
-	if runPeriodicProbe && running != "" && c.probeDNS != nil {
+	if runPeriodicProbe && !paused && running != "" && c.probeDNS != nil {
 		periodicProbeRan = true
 		_, periodicProbeOK = c.probeDNS(running)
 		c.mu.Lock()
@@ -498,7 +541,7 @@ func (c *directDNSHealthChecker) CheckHealth() bool {
 			c.directDNSFailCount = 0
 		} else {
 			c.directDNSFailCount++
-			if c.directDNSFailCount >= 2 {
+			if c.directDNSFailCount >= directDNSFailThreshold {
 				c.directDNSFailCount = 0
 				shouldReselect = true
 			}
@@ -516,6 +559,15 @@ func (c *directDNSHealthChecker) CheckHealth() bool {
 		runningReachable = false
 	} else if running != "" && c.probeDNS != nil {
 		_, runningReachable = c.probeDNS(running)
+	}
+
+	// 当前直连 DNS 仍然可用：直接保持，不重新测速、不重启。
+	if runningReachable {
+		c.logNoRestartThrottled("当前直连 DNS 仍可用，暂不切换", now)
+		c.mu.Lock()
+		c.directDNSFailCount = 0
+		c.mu.Unlock()
+		return false
 	}
 
 	if c.invalidateCache != nil {
@@ -552,6 +604,19 @@ func (c *directDNSHealthChecker) CheckHealth() bool {
 		return false
 	}
 
+	// 每小时最多 directDNSMaxRestartsPerHour 次，超过后暂停自动切换
+	c.mu.Lock()
+	if c.recentRestartCountLocked(now) >= directDNSMaxRestartsPerHour {
+		c.autoSwitchPaused = true
+		c.directDNSFailCount = 0
+		c.mu.Unlock()
+		if c.logError != nil {
+			c.logError("直连 DNS 频繁切换，已暂停自动切换，等待网络变化")
+		}
+		return false
+	}
+	c.mu.Unlock()
+
 	// 持有 proxyOpMu（使用 TryLock）
 	if c.tryLockProxyOp != nil {
 		if !c.tryLockProxyOp() {
@@ -583,6 +648,7 @@ func (c *directDNSHealthChecker) CheckHealth() bool {
 	c.updateLastRestart(now)
 	c.mu.Lock()
 	c.directDNSFailCount = 0
+	c.restartHistory = append(c.restartHistory, now)
 	c.mu.Unlock()
 	if c.logInfo != nil {
 		c.logInfo("直连 DNS 已切换：%s → %s，已重启内核", running, resolved)

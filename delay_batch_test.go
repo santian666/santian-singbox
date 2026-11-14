@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -169,7 +170,7 @@ func TestBuildBatchDelayConfigWithUpstreamDetour(t *testing.T) {
 		{ID: "node-1", Outbound: map[string]interface{}{"type": "shadowsocks", "tag": "n1"}},
 		{ID: "node-2", Outbound: map[string]interface{}{"type": "vmess", "tag": "n2"}},
 	}
-	cfg := buildBatchDelayConfigWithUpstream(nodes, []int{32001, 32002}, 20808)
+	cfg := buildBatchDelayConfigWithUpstream(nodes, []int{32001, 32002}, 20808, "119.29.29.29")
 	outbounds, ok := cfg["outbounds"].([]map[string]interface{})
 	if !ok {
 		t.Fatalf("outbounds not found in config")
@@ -237,7 +238,7 @@ func TestBuildBatchDelayConfigWithDirectNodeDetourExclusion(t *testing.T) {
 		{ID: "node-2", Outbound: map[string]interface{}{"type": "direct", "tag": "n2"}},
 		{ID: "node-3", Outbound: map[string]interface{}{"type": "block", "tag": "n3"}},
 	}
-	cfg := buildBatchDelayConfigWithUpstream(nodes, []int{32001, 32002, 32003}, 20808)
+	cfg := buildBatchDelayConfigWithUpstream(nodes, []int{32001, 32002, 32003}, 20808, "119.29.29.29")
 	outbounds, ok := cfg["outbounds"].([]map[string]interface{})
 	if !ok {
 		t.Fatalf("outbounds not found in config")
@@ -262,7 +263,7 @@ func TestBuildBatchDelayConfigOnlyDirectNodesNoUpstream(t *testing.T) {
 		{ID: "node-1", Outbound: map[string]interface{}{"type": "direct", "tag": "n1"}},
 		{ID: "node-2", Outbound: map[string]interface{}{"type": "block", "tag": "n2"}},
 	}
-	cfg := buildBatchDelayConfigWithUpstream(nodes, []int{32001, 32002}, 20808)
+	cfg := buildBatchDelayConfigWithUpstream(nodes, []int{32001, 32002}, 20808, "119.29.29.29")
 	outbounds, ok := cfg["outbounds"].([]map[string]interface{})
 	if !ok {
 		t.Fatalf("outbounds not found in config")
@@ -362,5 +363,59 @@ func TestBatchDelayPartialFailureNoRetry(t *testing.T) {
 	}
 }
 
+func TestBuildBatchDelayConfigWithOwnersMapsOutboundsAndEndpoints(t *testing.T) {
+	nodes := []Node{
+		{ID: "n0", Outbound: map[string]interface{}{"type": "vmess", "server": "1.1.1.1", "server_port": 443}},
+		{ID: "n1", Outbound: map[string]interface{}{"type": "wireguard", "server": "2.2.2.2", "server_port": 51820, "private_key": "k", "peer_public_key": "p", "local_address": []interface{}{"10.0.0.2/32"}}},
+		{ID: "n2", Outbound: map[string]interface{}{"type": "trojan", "server": "3.3.3.3", "server_port": 443}},
+		{ID: "n3", Outbound: map[string]interface{}{"type": "wireguard", "server": "4.4.4.4", "server_port": 51820, "private_key": "k", "peer_public_key": "p", "local_address": []interface{}{"10.0.0.3/32"}}},
+	}
+	cfg, owners := buildBatchDelayConfigWithOwners(nodes, []int{33001, 33002, 33003, 33004}, 20808, "192.168.1.1")
 
+	outbounds := cfg["outbounds"].([]map[string]interface{})
+	if len(owners.Outbounds) != len(outbounds) {
+		t.Fatalf("owners.Outbounds 长度 %d 与 outbounds %d 不一致", len(owners.Outbounds), len(outbounds))
+	}
+	endpoints, _ := cfg["endpoints"].([]map[string]interface{})
+	if len(owners.Endpoints) != len(endpoints) {
+		t.Fatalf("owners.Endpoints 长度 %d 与 endpoints %d 不一致", len(owners.Endpoints), len(endpoints))
+	}
+	// outbounds: [direct, upstream, n0, n2]；endpoints: [n1, n3]
+	if got := owners.Owner("outbound", 0); got != -1 {
+		t.Fatalf("outbounds[0](direct) 应不属于任何节点，实际 %d", got)
+	}
+	if got := owners.Owner("outbound", 1); got != -1 {
+		t.Fatalf("outbounds[1](upstream) 应不属于任何节点，实际 %d", got)
+	}
+	if got := owners.Owner("outbound", 2); got != 0 {
+		t.Fatalf("outbounds[2] 应属于节点 0，实际 %d", got)
+	}
+	if got := owners.Owner("outbound", 3); got != 2 {
+		t.Fatalf("outbounds[3] 应属于节点 2，实际 %d", got)
+	}
+	if got := owners.Owner("endpoint", 0); got != 1 {
+		t.Fatalf("endpoints[0] 应属于节点 1，实际 %d", got)
+	}
+	if got := owners.Owner("endpoint", 1); got != 3 {
+		t.Fatalf("endpoints[1] 应属于节点 3，实际 %d", got)
+	}
+	if got := owners.Owner("outbound", 99); got != -1 {
+		t.Fatalf("越界序号应返回 -1，实际 %d", got)
+	}
+}
 
+func TestBuildBatchDelayConfigUsesDirectDNSNotLocal(t *testing.T) {
+	nodes := []Node{{ID: "n0", Outbound: map[string]interface{}{"type": "vmess", "server": "example.com", "server_port": 443}}}
+	cfg := buildBatchDelayConfigWithUpstream(nodes, []int{33101}, 0, "192.168.1.1")
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if strings.Contains(text, `"local"`) {
+		t.Fatalf("临时内核 DNS 不应再使用 local：%s", text)
+	}
+	if !strings.Contains(text, `"server":"192.168.1.1"`) || !strings.Contains(text, `"final":"direct-dns"`) {
+		t.Fatalf("临时内核 DNS 应使用传入的直连 DNS：%s", text)
+	}
+}

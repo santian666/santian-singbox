@@ -88,6 +88,8 @@ type App struct {
 	mtrCancel                   context.CancelFunc
 	appUpdater                  *AppUpdateManager
 	directDNSChecker            *directDNSHealthChecker
+	batchTestMu                 sync.Mutex
+	currentBatchJob             *batchTestJobRunner
 }
 
 type proxyEntrySnapshot struct {
@@ -361,6 +363,7 @@ func (a *App) cleanupAllProxyEffects(reason string) {
 		}
 		a.stopResumeHealthChecks()
 		a.stopRunningToolsForExit()
+		a.cancelBatchTestJob()
 		_ = disableKillSwitch(a.root, a.logger)
 		a.proxyOpMu.Lock()
 		defer a.proxyOpMu.Unlock()
@@ -4382,4 +4385,146 @@ func (a *App) restartForDirectDNS() error {
 	a.initTrafficBaseline(state.SelectedID, state.Nodes)
 	a.emitState()
 	return nil
+}
+
+func (a *App) StartBatchTest(raws []string, options BatchTestOptions) (result BatchTestStartResult, err error) {
+	defer a.recoverError("批量测试节点", &err)
+	if len(raws) > maxBatchTestNodes {
+		return BatchTestStartResult{}, fmt.Errorf("批量测试一次最多支持 %d 个节点", maxBatchTestNodes)
+	}
+	totalBytes := 0
+	for _, raw := range raws {
+		totalBytes += len(raw)
+		if totalBytes > maxManualNodeInputBytes {
+			return BatchTestStartResult{}, fmt.Errorf("批量测试内容不能超过 %d MB", maxManualNodeInputBytes/(1024*1024))
+		}
+	}
+	if a.manager == nil {
+		return BatchTestStartResult{}, errors.New("内核管理器未初始化")
+	}
+	metric := strings.ToLower(strings.TrimSpace(options.Metric))
+	if metric != "ping" && metric != "delay" && metric != "url" {
+		return BatchTestStartResult{}, errors.New("批量节点检测类型无效")
+	}
+	if metric == "url" {
+		metric = "delay"
+	}
+	options.Metric = metric
+
+	jobID := sanitizeBatchJobID(options.JobID)
+	if jobID == "" {
+		jobID = fmt.Sprintf("job-%d", time.Now().UnixNano())
+	}
+
+	a.batchTestMu.Lock()
+	defer a.batchTestMu.Unlock()
+	if a.currentBatchJob != nil {
+		a.currentBatchJob.Cancel()
+		a.currentBatchJob = nil
+	}
+
+	items := make([]batchNodeTestItem, 0, len(raws))
+	failed := 0
+	for index, raw := range raws {
+		nodes, parseErrs := ParseNodes(raw)
+		if len(nodes) == 0 {
+			message := "没有解析到可用节点"
+			if len(parseErrs) > 0 {
+				message = parseErrs[0]
+			}
+			failed++
+			a.emitBatchTestResult(BatchTestResultEvent{
+				JobID:  jobID,
+				Index:  index,
+				Phase:  "delay",
+				Result: SpeedResult{ID: fmt.Sprintf("raw-%d", index), URLDelayMS: -1, PingMS: -1, DelayMS: -1},
+				Error:  message,
+			})
+			continue
+		}
+		node := nodes[0]
+		node.ID = fmt.Sprintf("raw-batch-%d-%s", index, node.ID)
+		items = append(items, batchNodeTestItem{
+			index:   index,
+			raw:     raw,
+			node:    node,
+			options: a.speedTestOptionsForCurrentSettings(options.SpeedTestOptions, node),
+		})
+	}
+
+	runner := newBatchTestJobRunner(a, jobID, len(raws), items, options, failed)
+	a.currentBatchJob = runner
+	if a.logger != nil {
+		a.logger.Info("批量测试开始：%d 个节点，类型 %s，出口 IP %v", len(raws), metric, options.WithIP)
+	}
+	safeGo(a.logger, "批量测试任务", func() {
+		runner.Run()
+		a.batchTestMu.Lock()
+		if a.currentBatchJob == runner {
+			a.currentBatchJob = nil
+		}
+		a.batchTestMu.Unlock()
+	})
+	return BatchTestStartResult{JobID: jobID, Total: len(raws)}, nil
+}
+
+// sanitizeBatchJobID 只接受前端传来的简单 ID（字母、数字、- 和 _，最长 64 个字符）。
+func sanitizeBatchJobID(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > 64 {
+		return ""
+	}
+	for _, ch := range value {
+		if !(ch == '-' || ch == '_' || (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z')) {
+			return ""
+		}
+	}
+	return value
+}
+
+// cancelBatchTestJob 在程序退出时取消正在进行的批量测试，避免残留临时内核。
+func (a *App) cancelBatchTestJob() {
+	if a == nil {
+		return
+	}
+	a.batchTestMu.Lock()
+	runner := a.currentBatchJob
+	a.currentBatchJob = nil
+	a.batchTestMu.Unlock()
+	if runner != nil {
+		runner.Cancel()
+	}
+}
+
+func (a *App) CancelBatchTest(jobID string) (err error) {
+	defer a.recoverError("停止批量测试", &err)
+	a.batchTestMu.Lock()
+	runner := a.currentBatchJob
+	if runner != nil && (jobID == "" || runner.jobID == jobID) {
+		a.currentBatchJob = nil
+	} else {
+		runner = nil
+	}
+	a.batchTestMu.Unlock()
+	if runner != nil {
+		runner.Cancel()
+		if a.logger != nil {
+			a.logger.Info("批量测试已停止")
+		}
+	}
+	return nil
+}
+
+func (a *App) emitBatchTestResult(event BatchTestResultEvent) {
+	if a == nil || a.ctx == nil {
+		return
+	}
+	wailsRuntime.EventsEmit(a.ctx, "batch-test-result", event)
+}
+
+func (a *App) emitBatchTestDone(event BatchTestDoneEvent) {
+	if a == nil || a.ctx == nil {
+		return
+	}
+	wailsRuntime.EventsEmit(a.ctx, "batch-test-done", event)
 }
