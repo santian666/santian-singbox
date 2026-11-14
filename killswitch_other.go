@@ -2,14 +2,18 @@
 
 package main
 
-func enableKillSwitch(logger *Logger, corePath string, appPath string) error {
+func enableKillSwitch(root string, logger *Logger, corePath string, appPath string) error {
 	return nil
 }
 
-func disableKillSwitch(logger *Logger) error {
+func disableKillSwitch(root string, logger *Logger) error {
 	return nil
 }
 
 func isKillSwitchActive() bool {
+	return false
+}
+
+func hasAnyKillSwitchRule() bool {
 	return false
 }

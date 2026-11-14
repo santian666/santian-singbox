@@ -224,34 +224,34 @@ func appProxyOnlyTun(settings Settings) bool {
 }
 
 type SingBoxManager struct {
-	mu                  sync.Mutex
-	rootDir             string
-	corePath            string
-	cachePath           string
-	coreVer             string
-	latestCoreVer       string
-	latestCoreCheckedAt time.Time
-	latestCoreCheckErr  string
-	latestCoreChecking  bool
-	ruleVersionChecker  func(string) (string, error)
-	config              string
-	cmd                 *exec.Cmd
-	processJob          uintptr
-	cancel              chan struct{}
-	done                chan error
-	tunActive           bool
-	logger              *Logger
-	traffic             trafficCache
-	socks5TestProxyPort int
-	lastMixedPort       int
-	proxyMapStartPort   int
-	proxyMapPortCount   int
-	runtimeOutboundTags map[string]struct{}
-	blockLogCount       int
-	lastBlockLogAt      time.Time
-	recentBlockedTargets map[string]time.Time
-	remoteLogCount      int
-	lastRemoteLogAt     time.Time
+	mu                     sync.Mutex
+	rootDir                string
+	corePath               string
+	cachePath              string
+	coreVer                string
+	latestCoreVer          string
+	latestCoreCheckedAt    time.Time
+	latestCoreCheckErr     string
+	latestCoreChecking     bool
+	ruleVersionChecker     func(string) (string, error)
+	config                 string
+	cmd                    *exec.Cmd
+	processJob             uintptr
+	cancel                 chan struct{}
+	done                   chan error
+	tunActive              bool
+	logger                 *Logger
+	traffic                trafficCache
+	socks5TestProxyPort    int
+	lastMixedPort          int
+	proxyMapStartPort      int
+	proxyMapPortCount      int
+	runtimeOutboundTags    map[string]struct{}
+	blockLogCount          int
+	lastBlockLogAt         time.Time
+	recentBlockedTargets   map[string]time.Time
+	remoteLogCount         int
+	lastRemoteLogAt        time.Time
 	localCloseLogCount     int
 	lastLocalCloseLogAt    time.Time
 	missingFakeIPLogCount  int
@@ -3341,7 +3341,11 @@ func buildDNSConfig(settings Settings, final string, dnsPlan autoDNSPlan, includ
 	dnsPlan = normalizeAutoDNSPlan(dnsPlan)
 	dnsFinal := "remote"
 	if !includeRemoteRuleSets {
-		dnsFinal = "local"
+		if effectiveTun(settings) {
+			dnsFinal = "china"
+		} else {
+			dnsFinal = "local"
+		}
 	}
 	strategy := "prefer_ipv4"
 	if effectiveTun(settings) {
@@ -3365,7 +3369,11 @@ func buildDNSConfig(settings Settings, final string, dnsPlan autoDNSPlan, includ
 
 	dnsRules := []map[string]interface{}{}
 
-	dnsRules = append(dnsRules, map[string]interface{}{"clash_mode": "direct", "action": "route", "server": "local"})
+	directDNSServer := "local"
+	if effectiveTun(settings) {
+		directDNSServer = "china"
+	}
+	dnsRules = append(dnsRules, map[string]interface{}{"clash_mode": "direct", "action": "route", "server": directDNSServer})
 
 	if settings.FakeDNS {
 		dnsRules = append(dnsRules, map[string]interface{}{

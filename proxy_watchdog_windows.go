@@ -145,6 +145,7 @@ func cleanupProxyAfterParentExit(options proxyWatchdogOptions) error {
 	if effectiveTun(settings) {
 		cleanupTunInterface(logger)
 	}
+	_ = disableKillSwitch(options.Root, logger)
 	if storeErr != nil {
 		result = errors.Join(result, fmt.Errorf("读取代理状态失败：%w", storeErr))
 	} else {

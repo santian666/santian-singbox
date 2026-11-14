@@ -333,6 +333,13 @@ func (a *App) cleanupStartupResiduals(settings Settings, force bool, cleanupTun 
 	if cleanupTun && (force || !effectiveTun(settings)) {
 		cleanupTunInterface(a.logger)
 	}
+	if hasKillSwitchResidual(a.root) {
+		if err := disableKillSwitch(a.root, a.logger); err != nil {
+			a.logger.Error("解除残留 Kill Switch 失败（%v），请以管理员身份运行一次以恢复网络", err)
+		} else {
+			a.logger.Info("启动自检已解除残留 Kill Switch")
+		}
+	}
 }
 
 func (a *App) shutdown(ctx context.Context) {
@@ -352,7 +359,7 @@ func (a *App) cleanupAllProxyEffects(reason string) {
 		}
 		a.stopResumeHealthChecks()
 		a.stopRunningToolsForExit()
-		_ = disableKillSwitch(a.logger)
+		_ = disableKillSwitch(a.root, a.logger)
 		a.proxyOpMu.Lock()
 		defer a.proxyOpMu.Unlock()
 		a.persistTraffic()
@@ -560,6 +567,9 @@ func (a *App) stopProxyForUser() error {
 			}
 		}
 	}
+	if !a.isCircuitBreakerActive() {
+		_ = disableKillSwitch(a.root, a.logger)
+	}
 	if err := a.disableStoredProxyEntrances("停止代理"); err != nil {
 		result = errors.Join(result, fmt.Errorf("保存代理关闭状态失败：%w", err))
 	}
@@ -644,24 +654,24 @@ func (a *App) State() (result RuntimeState) {
 		appReleaseNotes = a.appUpdater.lastInfo.ReleaseNotes
 	}
 	return RuntimeState{
-		Running:             a.manager != nil && a.manager.Running(),
-		AppVersion:          AppVersion,
-		AppLatestVersion:    appLatestVersion,
-		AppUpdateAvailable:  appUpdateAvailable,
-		AppReleaseNotes:     appReleaseNotes,
-		CoreVersion:         a.coreVersion(),
-		CoreLatestVersion:   latestCoreVersion,
-		CoreUpdateAvailable: coreUpdateAvailable,
-		ListenURL:           "127.0.0.1",
-		SelectedID:          state.SelectedID,
-		UploadRate:          traffic.UploadRate,
-		DownloadRate:        traffic.DownloadRate,
-		Settings:            state.Settings,
-		RulePresets:         RulePresets(),
-		Nodes:               nodes,
-		Groups:              groups,
-		Logs:                a.stateLogsPreview(),
-		ConfigMode:          configMode,
+		Running:              a.manager != nil && a.manager.Running(),
+		AppVersion:           AppVersion,
+		AppLatestVersion:     appLatestVersion,
+		AppUpdateAvailable:   appUpdateAvailable,
+		AppReleaseNotes:      appReleaseNotes,
+		CoreVersion:          a.coreVersion(),
+		CoreLatestVersion:    latestCoreVersion,
+		CoreUpdateAvailable:  coreUpdateAvailable,
+		ListenURL:            "127.0.0.1",
+		SelectedID:           state.SelectedID,
+		UploadRate:           traffic.UploadRate,
+		DownloadRate:         traffic.DownloadRate,
+		Settings:             state.Settings,
+		RulePresets:          RulePresets(),
+		Nodes:                nodes,
+		Groups:               groups,
+		Logs:                 a.stateLogsPreview(),
+		ConfigMode:           configMode,
 		TunActive:            tunActive,
 		TunStatus:            tunStatus,
 		CircuitBreakerActive: a.isCircuitBreakerActive(),
@@ -2516,7 +2526,7 @@ func (a *App) SaveSettings(settings Settings) (err error) {
 			if err := a.manager.StopWithoutSystemProxyCleanup(); err != nil {
 				a.logger.Error("关闭入口后停止代理失败：%v", err)
 			}
-			_ = disableKillSwitch(a.logger)
+			_ = disableKillSwitch(a.root, a.logger)
 			a.resetTrafficTracking()
 			a.logger.Info("代理入口已全部关闭，代理已停止")
 			a.emitState()
@@ -2583,14 +2593,19 @@ func (a *App) SaveSettings(settings Settings) (err error) {
 			}
 			a.logger.Info("运行中设置已保存并通过 Clash API 生效：模式=%s，系统代理=%v", settings.Mode, settings.SystemProxy)
 		}
-		if settings.KillSwitch && shouldRunProxy(settings) {
+		if shouldApplyFirewallKillSwitch(settings, a.isCircuitBreakerActive()) {
 			coreExe := ""
 			if a.manager != nil {
 				coreExe = a.manager.corePath
 			}
-			_ = enableKillSwitch(a.logger, coreExe, "")
-		} else if !settings.KillSwitch && !a.isCircuitBreakerActive() {
-			_ = disableKillSwitch(a.logger)
+			_ = enableKillSwitch(a.root, a.logger, coreExe, "")
+		} else {
+			if effectiveTun(settings) && a.logger != nil {
+				a.logger.Info("TUN 模式已由 strict_route 防泄露，跳过防火墙 Kill Switch")
+			}
+			if !a.isCircuitBreakerActive() {
+				_ = disableKillSwitch(a.root, a.logger)
+			}
 		}
 		a.markTunConnectivityHealthy(settings)
 		a.emitState()
@@ -2787,16 +2802,23 @@ func (a *App) setCircuitBreakerActive(active bool, reason string) {
 				a.logger.Info("【智能分流熔断】已解除熔断防护，代理链路恢复正常。")
 			}
 		}
+		var settings Settings
+		if a.store != nil {
+			settings = a.store.Snapshot().Settings
+		}
 		if active {
-			coreExe := ""
-			if a.manager != nil {
-				coreExe = a.manager.corePath
+			if shouldApplyFirewallKillSwitch(settings, true) {
+				coreExe := ""
+				if a.manager != nil {
+					coreExe = a.manager.corePath
+				}
+				_ = enableKillSwitch(a.root, a.logger, coreExe, "")
+			} else if effectiveTun(settings) && a.logger != nil {
+				a.logger.Info("TUN 模式已由 strict_route 防泄露，跳过防火墙 Kill Switch")
 			}
-			_ = enableKillSwitch(a.logger, coreExe, "")
 		} else {
-			state := a.store.Snapshot()
-			if !state.Settings.KillSwitch {
-				_ = disableKillSwitch(a.logger)
+			if !shouldApplyFirewallKillSwitch(settings, false) {
+				_ = disableKillSwitch(a.root, a.logger)
 			}
 		}
 		a.emitState()
@@ -3565,6 +3587,15 @@ func (a *App) startLocked() error {
 		a.disableTunAfterStartFailure(state.Settings, err)
 		a.emitState()
 		return err
+	}
+	if shouldApplyFirewallKillSwitch(state.Settings, a.isCircuitBreakerActive()) {
+		coreExe := ""
+		if a.manager != nil {
+			coreExe = a.manager.corePath
+		}
+		if err := enableKillSwitch(a.root, a.logger, coreExe, ""); err != nil {
+			a.logger.Error("开启防泄露防火墙拦截失败: %v", err)
+		}
 	}
 	a.markTunConnectivityHealthy(state.Settings)
 	a.initTrafficBaseline(state.SelectedID, state.Nodes)

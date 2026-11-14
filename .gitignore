@@ -2,6 +2,7 @@
 build/
 dist/
 output/
+review/
 .gocache2/
 *.exe
 *.dll
