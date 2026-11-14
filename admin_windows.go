@@ -186,20 +186,6 @@ foreach($adapter in $adapters){
   }
 }
 Clear-DnsClientCache -ErrorAction SilentlyContinue | Out-Null
-$devices=Get-PnpDevice -ErrorAction SilentlyContinue | Where-Object {
-  $_.Class -eq "Net" -and
-  $_.InstanceId -like "SWD\WINTUN\*" -and
-  ($_.FriendlyName -eq "sing-tun Tunnel" -or $_.FriendlyName -in $names)
-}
-foreach($device in $devices){
-  try {
-    Disable-PnpDevice -InstanceId "$($device.InstanceId)" -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-    pnputil /remove-device "$($device.InstanceId)" | Out-Null
-    Write-Output ("PNP:" + $device.InstanceId)
-  } catch {
-    Write-Output ("ERR:" + $_.Exception.Message)
-  }
-}
 `
 	out, err := runCommandOutputWithEnv(map[string]string{"GO_SINGBOX_TUN_NAME": tunInterfaceName}, "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script)
 	out = strings.TrimSpace(out)

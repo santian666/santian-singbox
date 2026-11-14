@@ -352,6 +352,7 @@ func (a *App) cleanupAllProxyEffects(reason string) {
 		}
 		a.stopResumeHealthChecks()
 		a.stopRunningToolsForExit()
+		_ = disableKillSwitch(a.logger)
 		a.proxyOpMu.Lock()
 		defer a.proxyOpMu.Unlock()
 		a.persistTraffic()
@@ -2515,6 +2516,7 @@ func (a *App) SaveSettings(settings Settings) (err error) {
 			if err := a.manager.StopWithoutSystemProxyCleanup(); err != nil {
 				a.logger.Error("关闭入口后停止代理失败：%v", err)
 			}
+			_ = disableKillSwitch(a.logger)
 			a.resetTrafficTracking()
 			a.logger.Info("代理入口已全部关闭，代理已停止")
 			a.emitState()
@@ -2580,6 +2582,15 @@ func (a *App) SaveSettings(settings Settings) (err error) {
 				}
 			}
 			a.logger.Info("运行中设置已保存并通过 Clash API 生效：模式=%s，系统代理=%v", settings.Mode, settings.SystemProxy)
+		}
+		if settings.KillSwitch && shouldRunProxy(settings) {
+			coreExe := ""
+			if a.manager != nil {
+				coreExe = a.manager.corePath
+			}
+			_ = enableKillSwitch(a.logger, coreExe, "")
+		} else if !settings.KillSwitch && !a.isCircuitBreakerActive() {
+			_ = disableKillSwitch(a.logger)
 		}
 		a.markTunConnectivityHealthy(settings)
 		a.emitState()
@@ -2771,9 +2782,21 @@ func (a *App) setCircuitBreakerActive(active bool, reason string) {
 	if changed {
 		if a.logger != nil {
 			if active {
-				a.logger.Error("【智能分流熔断】已触发安全防护：%s。国内应用（微信/百度等）保持正常畅通，海外访问已拦截以防真实 IP 泄露。", reason)
+				a.logger.Error("【智能分流熔断】已触发安全防护：%s。已激活 Windows 防火墙安全拦截，彻底阻断直连以防真实 IP 泄露。", reason)
 			} else {
 				a.logger.Info("【智能分流熔断】已解除熔断防护，代理链路恢复正常。")
+			}
+		}
+		if active {
+			coreExe := ""
+			if a.manager != nil {
+				coreExe = a.manager.corePath
+			}
+			_ = enableKillSwitch(a.logger, coreExe, "")
+		} else {
+			state := a.store.Snapshot()
+			if !state.Settings.KillSwitch {
+				_ = disableKillSwitch(a.logger)
 			}
 		}
 		a.emitState()
@@ -3808,8 +3831,21 @@ func (a *App) ensureProxyEntrancesLocked(state PersistState) error {
 	needsConnectivityCheck := (runtime.GOOS == "windows" && effectiveTun(settings)) || (settings.AutoFailover && shouldRunProxy(settings))
 	if needsConnectivityCheck {
 		if runtime.GOOS == "windows" && effectiveTun(settings) {
-			if code, ok := tunReadyState(); !ok {
-				return fmt.Errorf("TUN 未保持接管状态：%s", tunReadyMessage(code))
+			var lastCode string
+			tunOK := false
+			for attempt := 0; attempt < 3; attempt++ {
+				if code, ok := tunReadyState(); ok {
+					tunOK = true
+					break
+				} else {
+					lastCode = code
+					if attempt < 2 {
+						time.Sleep(500 * time.Millisecond)
+					}
+				}
+			}
+			if !tunOK {
+				return fmt.Errorf("TUN 未保持接管状态：%s", tunReadyMessage(lastCode))
 			}
 		}
 		if err := a.verifyTunConnectivityIfDue(settings.MixedPort); err != nil {
@@ -3834,13 +3870,46 @@ func (a *App) ensureProxyEntrancesLocked(state PersistState) error {
 	return nil
 }
 
+func detectNodeRegion(node Node) string {
+	if country := strings.TrimSpace(node.Country); country != "" {
+		return country
+	}
+	name := strings.ToUpper(node.Name)
+	switch {
+	case strings.Contains(name, "香港") || strings.Contains(name, "HK") || strings.Contains(name, "HONG KONG"):
+		return "HK"
+	case strings.Contains(name, "日本") || strings.Contains(name, "JP") || strings.Contains(name, "JAPAN") || strings.Contains(name, "东京") || strings.Contains(name, "大阪"):
+		return "JP"
+	case strings.Contains(name, "美国") || strings.Contains(name, "US") || strings.Contains(name, "USA") || strings.Contains(name, "UNITED STATES") || strings.Contains(name, "洛杉矶") || strings.Contains(name, "圣何塞") || strings.Contains(name, "西雅图") || strings.Contains(name, "纽约"):
+		return "US"
+	case strings.Contains(name, "新加坡") || strings.Contains(name, "SG") || strings.Contains(name, "SINGAPORE") || strings.Contains(name, "狮城"):
+		return "SG"
+	case strings.Contains(name, "台湾") || strings.Contains(name, "TW") || strings.Contains(name, "TAIWAN") || strings.Contains(name, "台北"):
+		return "TW"
+	case strings.Contains(name, "韩国") || strings.Contains(name, "KR") || strings.Contains(name, "KOREA") || strings.Contains(name, "首尔"):
+		return "KR"
+	case strings.Contains(name, "英国") || strings.Contains(name, "UK") || strings.Contains(name, "GB") || strings.Contains(name, "LONDON") || strings.Contains(name, "伦敦"):
+		return "UK"
+	case strings.Contains(name, "德国") || strings.Contains(name, "DE") || strings.Contains(name, "GERMANY") || strings.Contains(name, "法兰克福"):
+		return "DE"
+	case strings.Contains(name, "加拿大") || strings.Contains(name, "CA") || strings.Contains(name, "CANADA"):
+		return "CA"
+	case strings.Contains(name, "澳大利亚") || strings.Contains(name, "澳洲") || strings.Contains(name, "AU") || strings.Contains(name, "AUSTRALIA") || strings.Contains(name, "悉尼"):
+		return "AU"
+	default:
+		return ""
+	}
+}
+
 func filterAndRankCandidatesForAutoFailover(nodes []Node, groups []NodeGroup, currentID string) ([]Node, string, string, error) {
 	if len(nodes) <= 1 {
 		return nil, "", "", errors.New("没有其他备选节点可供切换")
 	}
+	var currentNode Node
 	var currentGroup string
 	for _, n := range nodes {
 		if n.ID == currentID {
+			currentNode = n
 			currentGroup = n.GroupID
 			break
 		}
@@ -3869,6 +3938,22 @@ func filterAndRankCandidatesForAutoFailover(nodes []Node, groups []NodeGroup, cu
 
 	if len(candidates) == 0 {
 		return nil, normalizedGroup, currentGroupName, fmt.Errorf("当前分组 [%s] 下没有其他备选节点可供自动切换（已限制只在同分组内切换）", currentGroupName)
+	}
+
+	// 锁定同国家/同地区：若当前节点能识别出区域，严格限制仅在同区域内自动切换，防止跨国异地登录触发封号风控
+	currentRegion := detectNodeRegion(currentNode)
+	if currentRegion != "" {
+		var sameRegionCandidates []Node
+		for _, n := range candidates {
+			if detectNodeRegion(n) == currentRegion {
+				sameRegionCandidates = append(sameRegionCandidates, n)
+			}
+		}
+		if len(sameRegionCandidates) > 0 {
+			candidates = sameRegionCandidates
+		} else {
+			return nil, normalizedGroup, currentGroupName, fmt.Errorf("当前节点所在地区 [%s] 没有其他同地区备选节点（已锁定禁止跨国自动切换以防账号风控）", currentRegion)
+		}
 	}
 
 	// 优先按历史延迟排序：
@@ -3906,6 +3991,13 @@ func filterAndRankCandidatesForAutoFailover(nodes []Node, groups []NodeGroup, cu
 func (a *App) autoFailoverLocked(state PersistState, triggerErr error) (string, error) {
 	if a == nil || a.manager == nil || a.store == nil {
 		return "", errors.New("服务未初始化")
+	}
+	if state.Settings.ProxyMap {
+		for _, n := range proxyMapNodesForSettings(state.Nodes, state.Settings) {
+			if n.ID == state.SelectedID {
+				return "", fmt.Errorf("当前节点正作为端口映射 (ProxyMap) 独占出口，禁止自动切换打断")
+			}
+		}
 	}
 	now := time.Now()
 	if !a.lastAutoFailover.IsZero() && now.Sub(a.lastAutoFailover) < 10*time.Second {

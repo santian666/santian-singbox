@@ -22,7 +22,7 @@ func syncAutoStart(enabled bool) error {
 		if strings.HasSuffix(strings.ToLower(exe), "-test.exe") {
 			return nil
 		}
-		value := fmt.Sprintf(`"%s"`, exe)
+		value := fmt.Sprintf(`"%s" %s`, exe, adminRestartArg)
 		if _, err := runCommandOutput("reg", "add", runRegistryPath, "/v", autoStartName, "/t", "REG_SZ", "/d", value, "/f"); err != nil {
 			return fmt.Errorf("设置开机自启动失败：%w", err)
 		}

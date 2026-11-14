@@ -51,6 +51,7 @@ type Settings struct {
 	FakeDNS                bool                    `json:"fakeDns"`
 	AutoStart              bool                    `json:"autoStart"`
 	CircuitBreaker         bool                    `json:"circuitBreaker"`
+	KillSwitch             bool                    `json:"killSwitch"`
 	AutoFailover           bool                    `json:"autoFailover"`
 	Theme                  string                  `json:"theme"`
 }

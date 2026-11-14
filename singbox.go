@@ -188,12 +188,9 @@ func enforceProxyEntryExclusivity(settings *Settings) {
 	}
 	if settings.Tun {
 		settings.SystemProxy = false
-		settings.AppProxy = false
-		return
 	}
 	if settings.AppProxy {
 		settings.SystemProxy = false
-		settings.Tun = false
 	}
 }
 
@@ -207,10 +204,8 @@ func enforceProxyEntryTransition(current Settings, next *Settings) {
 		next.AppProxy = false
 	case next.Tun && !current.Tun:
 		next.SystemProxy = false
-		next.AppProxy = false
 	case next.AppProxy && !current.AppProxy:
 		next.SystemProxy = false
-		next.Tun = false
 	default:
 		enforceProxyEntryExclusivity(next)
 	}
@@ -1770,7 +1765,7 @@ func buildSingBoxConfig(state PersistState, selected Node, cachePath string, inc
 	}, outbounds...)
 
 	final := "proxy"
-	defaultResolver := "local"
+	defaultResolver := "china"
 	route := map[string]interface{}{
 		"auto_detect_interface": true,
 		"default_domain_resolver": map[string]interface{}{
@@ -2834,9 +2829,12 @@ func buildRouteRules(settings Settings, nodes []Node, includeRemoteRuleSets bool
 	}
 	rules = append(rules,
 		map[string]interface{}{"ip_is_private": true, "clash_mode": "rule", "action": "route", "outbound": "direct"},
-		map[string]interface{}{"domain_suffix": []string{"cn", "localhost"}, "clash_mode": "rule", "action": "route", "outbound": "direct"},
+		map[string]interface{}{"domain_suffix": []string{
+			"cn", "localhost", "jd.com", "qq.com", "gtimg.com", "tenpay.com", "360buy.com",
+			"msftconnecttest.com", "msftncsi.com", "time.windows.com",
+		}, "clash_mode": "rule", "action": "route", "outbound": "direct"},
 		map[string]interface{}{"domain_keyword": []string{
-			"baidu", "bilibili", "qq", "taobao", "tmall", "jd", "alicdn", "aliyun",
+			"baidu", "bilibili", "taobao", "tmall", "alicdn", "aliyun",
 			"weixin", "wechat", "douyin", "bytedance", "zhihu", "netease",
 		}, "clash_mode": "rule", "action": "route", "outbound": "direct"},
 	)
@@ -3003,7 +3001,7 @@ func buildTunStabilityRouteRules() []map[string]interface{} {
 		{
 			"inbound":  []string{"tun-in"},
 			"network":  "udp",
-			"port":     []int{135, 137, 138, 139, 443, 1900, 5353},
+			"port":     []int{135, 137, 138, 139, 443, 1900, 3478, 3479, 5349, 5353, 19302, 19305},
 			"action":   "route",
 			"outbound": "block",
 		},
@@ -3067,6 +3065,7 @@ func appProxyRouteRule(settings Settings) map[string]interface{} {
 	paths := make([]string, 0, len(settings.AppProxyTargets))
 	folderRegex := make([]string, 0)
 	seen := map[string]bool{}
+	seenRegex := map[string]bool{}
 	add := func(path string) {
 		path = normalizeAppProxyPath(path)
 		if path == "" {
@@ -3079,13 +3078,30 @@ func appProxyRouteRule(settings Settings) map[string]interface{} {
 		seen[key] = true
 		paths = append(paths, path)
 	}
+	addRegex := func(pattern string) {
+		if pattern == "" {
+			return
+		}
+		key := strings.ToLower(pattern)
+		if seenRegex[key] {
+			return
+		}
+		seenRegex[key] = true
+		folderRegex = append(folderRegex, pattern)
+	}
+	for _, target := range settings.AppProxyTargets {
+		if target.Enabled && target.Type == "folder" {
+			if pattern := appProxyFolderRegex(target.Path); pattern != "" {
+				addRegex(pattern)
+			}
+		}
+	}
 	for _, target := range settings.AppProxyTargets {
 		if target.Enabled && target.Type == "app" {
 			add(target.Path)
-		}
-		if target.Enabled && target.Type == "folder" {
-			if pattern := appProxyFolderRegex(target.Path); pattern != "" {
-				folderRegex = append(folderRegex, pattern)
+			dir := filepath.Dir(target.Path)
+			if pattern := appProxyFolderRegex(dir); pattern != "" {
+				addRegex(pattern)
 			}
 		}
 	}
@@ -3407,9 +3423,12 @@ func buildDNSConfig(settings Settings, final string, dnsPlan autoDNSPlan, includ
 	}
 
 	dnsRules = append(dnsRules,
-		map[string]interface{}{"domain_suffix": []string{"cn"}, "clash_mode": "rule", "action": "route", "server": "china"},
+		map[string]interface{}{"domain_suffix": []string{
+			"cn", "jd.com", "qq.com", "gtimg.com", "tenpay.com", "360buy.com",
+			"msftconnecttest.com", "msftncsi.com", "time.windows.com",
+		}, "clash_mode": "rule", "action": "route", "server": "china"},
 		map[string]interface{}{"domain_keyword": []string{
-			"baidu", "bilibili", "qq", "taobao", "tmall", "jd", "alicdn", "aliyun",
+			"baidu", "bilibili", "taobao", "tmall", "alicdn", "aliyun",
 			"weixin", "wechat", "douyin", "bytedance", "zhihu", "netease",
 		}, "clash_mode": "rule", "action": "route", "server": "china"},
 	)
@@ -3774,6 +3793,12 @@ func terminateProcess(cmd *exec.Cmd) error {
 		return nil
 	}
 	if runtime.GOOS == "windows" {
+		if cmd.Process.Pid > 0 {
+			// 先尝试优雅终止（不带 /F 强制终止），给予 sing-box 释放网卡与连接资源的机会
+			if _, err := runCommandOutput("taskkill", "/PID", strconv.Itoa(cmd.Process.Pid), "/T"); err == nil {
+				return nil
+			}
+		}
 		if err := cmd.Process.Kill(); err == nil {
 			return nil
 		}

@@ -157,8 +157,8 @@ func TestBuildSingBoxStartupConfigSkipsRuleSets(t *testing.T) {
 		t.Fatal("启动配置不应引用规则集做远程解析，避免规则加载阻塞启动")
 	}
 	resolver := route["default_domain_resolver"].(map[string]interface{})
-	if resolver["server"] != "local" {
-		t.Fatalf("启动配置默认解析应使用本地 DNS，实际：%v", resolver)
+	if resolver["server"] != "china" {
+		t.Fatalf("启动配置默认解析应使用国内 DNS，实际：%v", resolver)
 	}
 	dns := config["dns"].(map[string]interface{})
 	if dns["final"] != "local" {
@@ -440,8 +440,8 @@ func TestBuildSingBoxConfigKreaUsesProxyDNSAndRoute(t *testing.T) {
 	}
 	route := config["route"].(map[string]interface{})
 	resolver := route["default_domain_resolver"].(map[string]interface{})
-	if resolver["server"] != "local" {
-		t.Fatalf("代理入口域名必须本地解析，避免远程 DNS 走代理形成闭环，实际：%v", resolver)
+	if resolver["server"] != "china" {
+		t.Fatalf("代理入口域名必须使用国内直连解析，避免远程 DNS 走代理形成闭环，实际：%v", resolver)
 	}
 	if hasDirectDomainRule(route["rules"].([]map[string]interface{}), "krea.ai") {
 		t.Fatalf("krea.ai 不应命中内置直连规则：%v", route["rules"])
@@ -497,8 +497,8 @@ func TestBuildSingBoxStartupConfigKreaUsesLocalDNS(t *testing.T) {
 	}
 	route := config["route"].(map[string]interface{})
 	resolver := route["default_domain_resolver"].(map[string]interface{})
-	if resolver["server"] != "local" {
-		t.Fatalf("启动阶段未知域名应先本地解析，实际：%v", resolver)
+	if resolver["server"] != "china" {
+		t.Fatalf("启动阶段未知域名应先国内解析，实际：%v", resolver)
 	}
 	dns := config["dns"].(map[string]interface{})
 	if dns["final"] != "local" {
@@ -687,8 +687,8 @@ func TestBuildSingBoxStartupConfigSystemProxyUsesLocalDNSWithoutTun(t *testing.T
 		t.Fatalf("系统代理启动配置不应初始化规则集：%v", route["rule_set"])
 	}
 	resolver := route["default_domain_resolver"].(map[string]interface{})
-	if resolver["server"] != "local" {
-		t.Fatalf("系统代理启动配置默认解析应使用本地 DNS，实际：%v", resolver)
+	if resolver["server"] != "china" {
+		t.Fatalf("系统代理启动配置默认解析应使用国内 DNS，实际：%v", resolver)
 	}
 	dns := config["dns"].(map[string]interface{})
 	if dns["final"] != "local" {

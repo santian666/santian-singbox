@@ -56,6 +56,10 @@ func (l *Logger) Info(format string, args ...interface{}) {
 	l.add("INFO", format, args...)
 }
 
+func (l *Logger) Warn(format string, args ...interface{}) {
+	l.add("WARN", format, args...)
+}
+
 func (l *Logger) Error(format string, args ...interface{}) {
 	l.add("ERROR", format, args...)
 }
