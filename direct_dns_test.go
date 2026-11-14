@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"sync/atomic"
@@ -433,7 +434,7 @@ func TestDirectDNSHealthCheckerScenarios(t *testing.T) {
 		}
 	})
 
-	// 9.2 指纹不变，探测连续失败 1 次 → 不 resolve；连续失败 2 次 → resolve
+	// 9.2 指纹不变，探测连续失败 2 次 → 不 resolve；连续失败 3 次 → resolve
 	t.Run("ProbeFailuresTriggerResolve", func(t *testing.T) {
 		fp := networkFingerprint{IfIndex: 10, LocalIP: "192.168.1.10", DNS: "192.168.1.1"}
 		var resolveCount int32
@@ -458,13 +459,14 @@ func TestDirectDNSHealthCheckerScenarios(t *testing.T) {
 		}
 
 		checker.CheckHealth()
+		checker.CheckHealth()
 		if atomic.LoadInt32(&resolveCount) != 0 {
-			t.Fatalf("连续失败 1 次不应触发 resolve，实际 resolveCount=%d", resolveCount)
+			t.Fatalf("连续失败 2 次不应触发 resolve，实际 resolveCount=%d", resolveCount)
 		}
 
 		checker.CheckHealth()
 		if atomic.LoadInt32(&resolveCount) != 1 {
-			t.Fatalf("连续失败 2 次必须触发 resolve，实际 resolveCount=%d", resolveCount)
+			t.Fatalf("连续失败 3 次必须触发 resolve，实际 resolveCount=%d", resolveCount)
 		}
 		if atomic.LoadInt32(&restartCount) != 1 {
 			t.Fatalf("resolve 返回有效 fallback 应重启 1 次，实际 restartCount=%d", restartCount)
@@ -537,35 +539,201 @@ func TestDirectDNSHealthCheckerScenarios(t *testing.T) {
 		}
 	})
 
-	// 9.5 唤醒后的第一次检查 → 即使指纹未变也会 resolve
-	t.Run("ResumeForcesResolveEvenIfFingerprintUnchanged", func(t *testing.T) {
+	// 9.5 唤醒后的第一次检查 → 即使指纹未变也会执行“重新选择”：
+	//     运行中的 DNS 可达时直接 Keep（不 resolve）；不可达时才 resolve。
+	t.Run("ResumeForcesReselectEvenIfFingerprintUnchanged", func(t *testing.T) {
 		fp := networkFingerprint{IfIndex: 10, LocalIP: "192.168.1.10", DNS: "192.168.1.1"}
-		var resolveCount int32
+		var resolveCount, probeCount, restartCount int32
+		reachable := true
 
 		checker := &directDNSHealthChecker{
 			checkCycleInterval: 3,
 			getFingerprint:     func() networkFingerprint { return fp },
 			probeDNS: func(server string) (time.Duration, bool) {
-				return 10 * time.Millisecond, true
+				atomic.AddInt32(&probeCount, 1)
+				return 10 * time.Millisecond, reachable
 			},
 			resolvePlan: func() (string, string) {
 				atomic.AddInt32(&resolveCount, 1)
-				return "192.168.1.1", "physical"
+				return "10.0.0.1", "physical"
+			},
+			restart: func() error {
+				atomic.AddInt32(&restartCount, 1)
+				return nil
 			},
 			runningDNS: func() string { return "192.168.1.1" },
 			now:        func() time.Time { return baseTime },
 		}
 
 		checker.CheckHealth()
-		if atomic.LoadInt32(&resolveCount) != 0 {
-			t.Fatalf("初始指纹不应触发 resolve，实际: %d", resolveCount)
+		if atomic.LoadInt32(&resolveCount) != 0 || atomic.LoadInt32(&probeCount) != 0 {
+			t.Fatalf("初始指纹不应触发探测或 resolve，实际 probe=%d resolve=%d", probeCount, resolveCount)
 		}
 
+		// 唤醒：运行中的 DNS 仍可达 → 只探测一次，不 resolve，不重启
 		checker.SetForceReselect()
+		checker.CheckHealth()
+		if atomic.LoadInt32(&probeCount) != 1 {
+			t.Fatalf("唤醒后应探测一次运行中的 DNS，实际 probe=%d", probeCount)
+		}
+		if atomic.LoadInt32(&resolveCount) != 0 || atomic.LoadInt32(&restartCount) != 0 {
+			t.Fatalf("运行中的 DNS 可达时不应 resolve/重启，实际 resolve=%d restart=%d", resolveCount, restartCount)
+		}
 
+		// 再次唤醒：运行中的 DNS 不可达 → resolve 并重启
+		reachable = false
+		checker.SetForceReselect()
 		checker.CheckHealth()
 		if atomic.LoadInt32(&resolveCount) != 1 {
-			t.Fatalf("唤醒后第一次检查即使指纹未变，也必须触发 resolve，实际 resolveCount=%d", resolveCount)
+			t.Fatalf("唤醒后运行中的 DNS 不可达时必须 resolve，实际 resolve=%d", resolveCount)
+		}
+		if atomic.LoadInt32(&restartCount) != 1 {
+			t.Fatalf("唤醒后运行中的 DNS 不可达且 resolve 到新地址时应重启 1 次，实际 %d", restartCount)
+		}
+	})
+
+	// 9.7 稳定网络模拟 1 小时：偶尔丢包、resolve 总能给出“更快”的地址 → 0 次 resolve、0 次重启
+	t.Run("StableNetworkOneHourZeroRestarts", func(t *testing.T) {
+		fp := networkFingerprint{IfIndex: 10, LocalIP: "192.168.1.10", DNS: "192.168.1.1"}
+		var resolveCount, restartCount, probeCount int32
+		currTime := baseTime
+
+		checker := &directDNSHealthChecker{
+			checkCycleInterval: 3,
+			getFingerprint:     func() networkFingerprint { return fp },
+			probeDNS: func(server string) (time.Duration, bool) {
+				n := atomic.AddInt32(&probeCount, 1)
+				// 每 5 次探测中有 2 次连续失败，但从不连续 3 次
+				if n%5 == 1 || n%5 == 2 {
+					return 0, false
+				}
+				return 30 * time.Millisecond, true
+			},
+			resolvePlan: func() (string, string) {
+				n := atomic.AddInt32(&resolveCount, 1)
+				return fmt.Sprintf("10.0.0.%d", n), "physical"
+			},
+			restart: func() error {
+				atomic.AddInt32(&restartCount, 1)
+				return nil
+			},
+			runningDNS: func() string { return "192.168.1.1" },
+			now:        func() time.Time { return currTime },
+			sleep:      func(time.Duration) {},
+		}
+
+		for i := 0; i < 360; i++ {
+			checker.CheckHealth()
+			currTime = currTime.Add(10 * time.Second)
+		}
+		if atomic.LoadInt32(&probeCount) == 0 {
+			t.Fatalf("1 小时内应进行周期性探测")
+		}
+		if got := atomic.LoadInt32(&resolveCount); got != 0 {
+			t.Fatalf("稳定网络下不应触发 resolve，实际 %d 次", got)
+		}
+		if got := atomic.LoadInt32(&restartCount); got != 0 {
+			t.Fatalf("稳定网络下重启次数必须为 0，实际 %d 次", got)
+		}
+	})
+
+	// 9.8 指纹变化，但运行中的 DNS 在新网络仍可达 → 不 resolve、不重启
+	t.Run("FingerprintChangedButRunningReachableKeeps", func(t *testing.T) {
+		fpA := networkFingerprint{IfIndex: 10, LocalIP: "192.168.1.10", DNS: "192.168.1.1"}
+		fpB := networkFingerprint{IfIndex: 10, LocalIP: "192.168.1.23", DNS: "192.168.1.1"}
+		currentFP := fpA
+		var resolveCount, restartCount int32
+
+		checker := &directDNSHealthChecker{
+			getFingerprint: func() networkFingerprint { return currentFP },
+			probeDNS:       func(server string) (time.Duration, bool) { return 10 * time.Millisecond, true },
+			resolvePlan: func() (string, string) {
+				atomic.AddInt32(&resolveCount, 1)
+				return "10.0.0.1", "physical"
+			},
+			restart: func() error {
+				atomic.AddInt32(&restartCount, 1)
+				return nil
+			},
+			runningDNS: func() string { return "192.168.1.1" },
+			now:        func() time.Time { return baseTime },
+			sleep:      func(time.Duration) {},
+		}
+
+		checker.CheckHealth()
+		currentFP = fpB
+		checker.CheckHealth()
+		if got := atomic.LoadInt32(&restartCount); got != 0 {
+			t.Fatalf("运行中的 DNS 仍可达时不应重启，实际 %d 次", got)
+		}
+		if got := atomic.LoadInt32(&resolveCount); got != 0 {
+			t.Fatalf("运行中的 DNS 仍可达时不应 resolve，实际 %d 次", got)
+		}
+	})
+
+	// 9.9 1 小时内第 4 次需要重启 → 不重启并暂停；之后指纹变化 → 解除暂停
+	t.Run("HourlyRestartCapPausesUntilNetworkChange", func(t *testing.T) {
+		fp := networkFingerprint{IfIndex: 10, LocalIP: "192.168.1.10", DNS: "192.168.1.1"}
+		currentFP := fp
+		var restartCount int32
+		var errorLogs int32
+		currTime := baseTime
+		running := "192.168.1.1"
+		next := 0
+
+		checker := &directDNSHealthChecker{
+			checkCycleInterval: 1,
+			getFingerprint:     func() networkFingerprint { return currentFP },
+			probeDNS:           func(server string) (time.Duration, bool) { return 0, false },
+			resolvePlan: func() (string, string) {
+				next++
+				return fmt.Sprintf("10.0.0.%d", next), "fallback"
+			},
+			restart: func() error {
+				atomic.AddInt32(&restartCount, 1)
+				return nil
+			},
+			runningDNS: func() string { return running },
+			now:        func() time.Time { return currTime },
+			sleep:      func(time.Duration) {},
+			logError: func(format string, args ...any) {
+				atomic.AddInt32(&errorLogs, 1)
+			},
+		}
+
+		checker.CheckHealth() // 记录指纹
+		for i := 0; i < 40; i++ {
+			currTime = currTime.Add(30 * time.Second)
+			checker.CheckHealth()
+		}
+		if got := atomic.LoadInt32(&restartCount); got != directDNSMaxRestartsPerHour {
+			t.Fatalf("1 小时内最多重启 %d 次，实际 %d 次", directDNSMaxRestartsPerHour, got)
+		}
+		if !checker.AutoSwitchPaused() {
+			t.Fatalf("超过上限后应进入暂停状态")
+		}
+		if got := atomic.LoadInt32(&errorLogs); got != 1 {
+			t.Fatalf("进入暂停时应记 1 条 Error 日志，实际 %d 条", got)
+		}
+
+		// 暂停期间继续检查不会重启
+		for i := 0; i < 10; i++ {
+			currTime = currTime.Add(30 * time.Second)
+			checker.CheckHealth()
+		}
+		if got := atomic.LoadInt32(&restartCount); got != directDNSMaxRestartsPerHour {
+			t.Fatalf("暂停期间不应重启，实际累计 %d 次", got)
+		}
+
+		// 网络变化 → 解除暂停并允许再次切换
+		currentFP = networkFingerprint{IfIndex: 20, LocalIP: "10.0.0.10", DNS: "10.0.0.1"}
+		currTime = currTime.Add(30 * time.Second)
+		checker.CheckHealth()
+		if checker.AutoSwitchPaused() {
+			t.Fatalf("指纹变化后应解除暂停")
+		}
+		if got := atomic.LoadInt32(&restartCount); got != directDNSMaxRestartsPerHour+1 {
+			t.Fatalf("解除暂停后应允许重启，实际累计 %d 次", got)
 		}
 	})
 
