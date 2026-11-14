@@ -333,8 +333,7 @@ func (a *App) cleanupStartupResiduals(settings Settings, force bool, cleanupTun 
 	if cleanupTun && (force || !effectiveTun(settings)) {
 		cleanupTunInterface(a.logger)
 	}
-	stateFile := killSwitchStatePath(a.root)
-	if fileExists(stateFile) {
+	if hasKillSwitchResidual(a.root) {
 		if err := disableKillSwitch(a.root, a.logger); err != nil {
 			a.logger.Error("解除残留 Kill Switch 失败（%v），请以管理员身份运行一次以恢复网络", err)
 		} else {

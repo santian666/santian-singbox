@@ -23,6 +23,10 @@ func killSwitchStatePath(root string) string {
 	return filepath.Join(root, "data", "killswitch-state.json")
 }
 
+func hasKillSwitchResidual(root string) bool {
+	return fileExists(killSwitchStatePath(root)) || hasAnyKillSwitchRule()
+}
+
 func shouldApplyFirewallKillSwitch(settings Settings, circuitBreaker bool) bool {
 	if effectiveTun(settings) {
 		return false

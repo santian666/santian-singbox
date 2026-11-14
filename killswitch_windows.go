@@ -46,29 +46,57 @@ func queryFirewallPolicy(profile string) string {
 	return policy
 }
 
-func restoreProfilePolicy(profile, policy string, logger *Logger) {
+func restoreProfilePolicy(profile, policy string, logger *Logger) error {
 	policy = strings.TrimSpace(policy)
 	if policy == "" {
 		policy = "blockinbound,allowoutbound"
 	}
 	cmd := fmt.Sprintf("netsh advfirewall set %sprofile firewallpolicy %s", profile, policy)
-	if _, err := runFirewallCommand("cmd", "/c", cmd); err != nil && logger != nil {
-		logger.Error("恢复 %s 防火墙策略失败: %v", profile, err)
+	if _, err := runFirewallCommand("cmd", "/c", cmd); err != nil {
+		if logger != nil {
+			logger.Error("恢复 %s 防火墙策略失败: %v", profile, err)
+		}
+		return fmt.Errorf("恢复 %s 防火墙策略失败: %w", profile, err)
 	}
+	return nil
+}
+
+func restorePolicies(policy KillSwitchProfilePolicy, logger *Logger) error {
+	if policy.Domain == "" && policy.Private == "" && policy.Public == "" {
+		if logger != nil {
+			logger.Warn("Kill Switch 状态文件损坏或字段缺失，回退使用默认策略 blockinbound,allowoutbound 恢复网络")
+		}
+		_, err := runFirewallCommand("cmd", "/c", "netsh advfirewall set allprofiles firewallpolicy blockinbound,allowoutbound")
+		return err
+	}
+	var firstErr error
+	for _, p := range []struct {
+		name string
+		pol  string
+	}{
+		{"domain", policy.Domain},
+		{"private", policy.Private},
+		{"public", policy.Public},
+	} {
+		if err := restoreProfilePolicy(p.name, p.pol, logger); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func hasRule(suffix string) bool {
+	cmd := fmt.Sprintf(`netsh advfirewall firewall show rule name="%s%s"`, killSwitchRulePrefix, suffix)
+	out, err := runFirewallCommand("cmd", "/c", cmd)
+	return err == nil && strings.Contains(out, killSwitchRulePrefix+suffix)
+}
+
+func hasCoreAppLANRules() bool {
+	return hasRule("Core") && hasRule("App") && hasRule("LAN")
 }
 
 func hasAnyKillSwitchRule() bool {
-	cmd := fmt.Sprintf(`netsh advfirewall firewall show rule name="%sCore"`, killSwitchRulePrefix)
-	out, err := runFirewallCommand("cmd", "/c", cmd)
-	if err == nil && strings.Contains(out, killSwitchRulePrefix) {
-		return true
-	}
-	cmdLAN := fmt.Sprintf(`netsh advfirewall firewall show rule name="%sLAN"`, killSwitchRulePrefix)
-	outLAN, errLAN := runFirewallCommand("cmd", "/c", cmdLAN)
-	if errLAN == nil && strings.Contains(outLAN, killSwitchRulePrefix) {
-		return true
-	}
-	return false
+	return hasRule("Core") || hasRule("App") || hasRule("LAN") || hasRule("DHCP")
 }
 
 func enableKillSwitch(root string, logger *Logger, corePath string, appPath string) error {
@@ -97,15 +125,35 @@ func enableKillSwitch(root string, logger *Logger, corePath string, appPath stri
 		}
 	}
 
+	// 幂等性检查：已激活（killSwitchActive == true，或者状态文件 active=true 且 Core/App/LAN 三条规则都存在）→ 直接返回 nil，不重复操作
+	if killSwitchActive || (alreadyActive && hasCoreAppLANRules()) {
+		killSwitchActive = true
+		return nil
+	}
+
 	if !alreadyActive {
+		hasOldRules := hasAnyKillSwitchRule()
+		warned := false
+		sanitize := func(policy string) string {
+			parts := strings.Split(policy, ",")
+			if len(parts) == 2 && strings.EqualFold(parts[1], "BlockOutbound") && hasOldRules {
+				if !warned && logger != nil {
+					logger.Warn("检测到旧版 Kill Switch 残留，原始出站策略按放行处理")
+					warned = true
+				}
+				return parts[0] + ",AllowOutbound"
+			}
+			return policy
+		}
+
 		state = KillSwitchState{
 			Active:    true,
 			CreatedAt: time.Now().Format(time.RFC3339),
 			PID:       os.Getpid(),
 			OriginalPolicy: KillSwitchProfilePolicy{
-				Domain:  queryFirewallPolicy("domain"),
-				Private: queryFirewallPolicy("private"),
-				Public:  queryFirewallPolicy("public"),
+				Domain:  sanitize(queryFirewallPolicy("domain")),
+				Private: sanitize(queryFirewallPolicy("private")),
+				Public:  sanitize(queryFirewallPolicy("public")),
 			},
 		}
 	} else {
@@ -127,8 +175,16 @@ func enableKillSwitch(root string, logger *Logger, corePath string, appPath stri
 	// 2. 先清理旧的规则，防止重复堆叠
 	_ = removeKillSwitchRules()
 
-	cleanupOnFailure := func() {
+	cleanupOnFailure := func(policyChanged bool) {
 		_ = removeKillSwitchRules()
+		if alreadyActive || policyChanged {
+			if rerr := restorePolicies(state.OriginalPolicy, logger); rerr != nil {
+				if logger != nil {
+					logger.Error("回滚时恢复防火墙策略失败: %v，保留状态文件以供自检恢复", rerr)
+				}
+				return
+			}
+		}
 		_ = os.Remove(stateFile)
 	}
 
@@ -137,7 +193,7 @@ func enableKillSwitch(root string, logger *Logger, corePath string, appPath stri
 	if corePath != "" {
 		cmd := fmt.Sprintf(`netsh advfirewall firewall add rule name="%sCore" dir=out action=allow program="%s" enable=yes profile=any`, killSwitchRulePrefix, corePath)
 		if _, err := runFirewallCommand("cmd", "/c", cmd); err != nil {
-			cleanupOnFailure()
+			cleanupOnFailure(false)
 			if logger != nil {
 				logger.Error("添加核心放行规则失败: %v，已回滚", err)
 			}
@@ -152,7 +208,7 @@ func enableKillSwitch(root string, logger *Logger, corePath string, appPath stri
 	if appPath != "" {
 		cmd := fmt.Sprintf(`netsh advfirewall firewall add rule name="%sApp" dir=out action=allow program="%s" enable=yes profile=any`, killSwitchRulePrefix, appPath)
 		if _, err := runFirewallCommand("cmd", "/c", cmd); err != nil {
-			cleanupOnFailure()
+			cleanupOnFailure(false)
 			if logger != nil {
 				logger.Error("添加主程序放行规则失败: %v，已回滚", err)
 			}
@@ -163,7 +219,7 @@ func enableKillSwitch(root string, logger *Logger, corePath string, appPath stri
 	// 放行局域网 & 回环
 	lanCmd := fmt.Sprintf(`netsh advfirewall firewall add rule name="%sLAN" dir=out action=allow remoteip=127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,::1,fe80::/10 enable=yes profile=any`, killSwitchRulePrefix)
 	if _, err := runFirewallCommand("cmd", "/c", lanCmd); err != nil {
-		cleanupOnFailure()
+		cleanupOnFailure(false)
 		if logger != nil {
 			logger.Error("添加局域网放行规则失败: %v，已回滚", err)
 		}
@@ -181,7 +237,7 @@ func enableKillSwitch(root string, logger *Logger, corePath string, appPath stri
 	// 4. 将防火墙默认出站策略设为阻断 (BlockOutbound)
 	policyCmd := "netsh advfirewall set allprofiles firewallpolicy blockinbound,blockoutbound"
 	if _, err := runFirewallCommand("cmd", "/c", policyCmd); err != nil {
-		cleanupOnFailure()
+		cleanupOnFailure(true)
 		if logger != nil {
 			logger.Error("设置防火墙出站阻断失败: %v，已回滚", err)
 		}
@@ -216,31 +272,34 @@ func disableKillSwitch(root string, logger *Logger) error {
 	}
 
 	// 恢复各 profile 的防火墙策略
+	var restoreErr error
 	if stateExists {
 		var state KillSwitchState
 		data, err := os.ReadFile(stateFile)
 		if err == nil {
 			err = json.Unmarshal(data, &state)
 		}
-		if err != nil || (state.OriginalPolicy.Domain == "" && state.OriginalPolicy.Private == "" && state.OriginalPolicy.Public == "") {
-			if logger != nil {
-				logger.Warn("Kill Switch 状态文件损坏或字段缺失，回退使用默认策略 blockinbound,allowoutbound 恢复网络")
-			}
-			_, _ = runFirewallCommand("cmd", "/c", "netsh advfirewall set allprofiles firewallpolicy blockinbound,allowoutbound")
+		if err != nil {
+			restoreErr = restorePolicies(KillSwitchProfilePolicy{}, logger)
 		} else {
-			restoreProfilePolicy("domain", state.OriginalPolicy.Domain, logger)
-			restoreProfilePolicy("private", state.OriginalPolicy.Private, logger)
-			restoreProfilePolicy("public", state.OriginalPolicy.Public, logger)
+			restoreErr = restorePolicies(state.OriginalPolicy, logger)
 		}
 	} else {
 		// 没有状态文件但检测到了规则，回退默认策略
 		if logger != nil {
 			logger.Warn("未检测到 Kill Switch 状态文件但存在残留规则，回退使用默认策略 blockinbound,allowoutbound 恢复网络")
 		}
-		_, _ = runFirewallCommand("cmd", "/c", "netsh advfirewall set allprofiles firewallpolicy blockinbound,allowoutbound")
+		restoreErr = restorePolicies(KillSwitchProfilePolicy{}, logger)
 	}
 
-	// 删除临时规则与状态文件
+	if restoreErr != nil {
+		if logger != nil {
+			logger.Error("解除 Kill Switch 恢复防火墙策略失败: %v，保留状态文件与放行规则以防彻底断网", restoreErr)
+		}
+		return restoreErr
+	}
+
+	// 全部恢复成功后，才删除规则和状态文件，并把 killSwitchActive 置为 false
 	_ = removeKillSwitchRules()
 	_ = os.Remove(stateFile)
 

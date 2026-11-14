@@ -13,3 +13,7 @@ func disableKillSwitch(root string, logger *Logger) error {
 func isKillSwitchActive() bool {
 	return false
 }
+
+func hasAnyKillSwitchRule() bool {
+	return false
+}
