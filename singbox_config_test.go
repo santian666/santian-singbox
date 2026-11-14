@@ -157,15 +157,15 @@ func TestBuildSingBoxStartupConfigSkipsRuleSets(t *testing.T) {
 		t.Fatal("启动配置不应引用规则集做远程解析，避免规则加载阻塞启动")
 	}
 	resolver := route["default_domain_resolver"].(map[string]interface{})
-	if resolver["server"] != "china" {
-		t.Fatalf("启动配置默认解析应使用国内 DNS，实际：%v", resolver)
+	if resolver["server"] != "direct-dns" {
+		t.Fatalf("启动配置默认解析应使用直连 DNS，实际：%v", resolver)
 	}
 	dns := config["dns"].(map[string]interface{})
 	if dns["final"] != "local" {
 		t.Fatalf("启动配置 DNS 默认应使用本地解析，实际：%v", dns["final"])
 	}
-	if !hasConfigItem(dns["servers"].([]map[string]interface{}), "tag", "china") {
-		t.Fatal("规则模式应包含国内 DNS 服务器用于中国站点解析")
+	if !hasConfigItem(dns["servers"].([]map[string]interface{}), "tag", "direct-dns") {
+		t.Fatal("规则模式应包含直连 DNS 服务器用于直连站点解析")
 	}
 	if hasConfigItem(dns["servers"].([]map[string]interface{}), "tag", "remote") {
 		t.Fatalf("启动配置不应初始化远程 DNS：%v", dns["servers"])
@@ -173,7 +173,7 @@ func TestBuildSingBoxStartupConfigSkipsRuleSets(t *testing.T) {
 	foundChinaDNS := false
 	foundRemoteDNS := false
 	for _, rule := range dns["rules"].([]map[string]interface{}) {
-		if rule["rule_set"] != nil && rule["server"] == "china" {
+		if rule["rule_set"] != nil && rule["server"] == "direct-dns" {
 			foundChinaDNS = true
 		}
 		if rule["rule_set"] != nil && rule["server"] == "remote" {
@@ -440,7 +440,7 @@ func TestBuildSingBoxConfigKreaUsesProxyDNSAndRoute(t *testing.T) {
 	}
 	route := config["route"].(map[string]interface{})
 	resolver := route["default_domain_resolver"].(map[string]interface{})
-	if resolver["server"] != "china" {
+	if resolver["server"] != "direct-dns" {
 		t.Fatalf("代理入口域名必须使用国内直连解析，避免远程 DNS 走代理形成闭环，实际：%v", resolver)
 	}
 	if hasDirectDomainRule(route["rules"].([]map[string]interface{}), "krea.ai") {
@@ -464,7 +464,7 @@ func TestBuildSingBoxConfigRuleAppliesCustomDirectDomains(t *testing.T) {
 		t.Fatalf("规则模式必须把自定义直连域名写入路由规则：%v", route["rules"])
 	}
 	dns := config["dns"].(map[string]interface{})
-	if !hasDNSRuleForDomainServer(dns["rules"].([]map[string]interface{}), "example.com", "china") {
+	if !hasDNSRuleForDomainServer(dns["rules"].([]map[string]interface{}), "example.com", "direct-dns") {
 		t.Fatalf("规则模式必须把自定义直连域名写入 DNS 直连规则：%v", dns["rules"])
 	}
 }
@@ -497,7 +497,7 @@ func TestBuildSingBoxStartupConfigKreaUsesLocalDNS(t *testing.T) {
 	}
 	route := config["route"].(map[string]interface{})
 	resolver := route["default_domain_resolver"].(map[string]interface{})
-	if resolver["server"] != "china" {
+	if resolver["server"] != "direct-dns" {
 		t.Fatalf("启动阶段未知域名应先国内解析，实际：%v", resolver)
 	}
 	dns := config["dns"].(map[string]interface{})
@@ -687,7 +687,7 @@ func TestBuildSingBoxStartupConfigSystemProxyUsesLocalDNSWithoutTun(t *testing.T
 		t.Fatalf("系统代理启动配置不应初始化规则集：%v", route["rule_set"])
 	}
 	resolver := route["default_domain_resolver"].(map[string]interface{})
-	if resolver["server"] != "china" {
+	if resolver["server"] != "direct-dns" {
 		t.Fatalf("系统代理启动配置默认解析应使用国内 DNS，实际：%v", resolver)
 	}
 	dns := config["dns"].(map[string]interface{})
@@ -3473,4 +3473,188 @@ func TestRemoteRuleSetsPriorityProxyOverGeoIPAndChina(t *testing.T) {
 	}
 }
 
+// 4. 生成的配置中存在 tag 为 direct-dns 的服务器，server 等于传入的 dnsPlan.Direct.Server；不存在 tag 为 china 的服务器
+func TestBuildSingBoxConfigDirectDNSTagAndChinaAbsent(t *testing.T) {
+	state := testConfigState("rule")
+	customPlan := autoDNSPlan{
+		Direct: dnsProbeCandidate{Type: "udp", Server: "1.2.3.4"},
+		Remote: remoteDNSCandidates[0],
+	}
+	config, err := buildSingBoxConfig(state, state.Nodes[0], "", true, customPlan)
+	if err != nil {
+		t.Fatalf("生成配置失败: %v", err)
+	}
+	dns := config["dns"].(map[string]interface{})
+	servers := dns["servers"].([]map[string]interface{})
 
+	// 存在 tag 为 direct-dns 且 server == "1.2.3.4"
+	var directServer map[string]interface{}
+	for _, s := range servers {
+		if s["tag"] == "direct-dns" {
+			directServer = s
+			break
+		}
+	}
+	if directServer == nil {
+		t.Fatalf("配置中必须存在 tag 为 direct-dns 的服务器，实际服务器列表: %v", servers)
+	}
+	if directServer["server"] != "1.2.3.4" {
+		t.Fatalf("direct-dns 的 server 必须等于传入的 dnsPlan.Direct.Server (1.2.3.4)，实际: %v", directServer["server"])
+	}
+
+	// 不存在 tag 为 china 的服务器
+	for _, s := range servers {
+		if s["tag"] == "china" {
+			t.Fatalf("配置中绝对不得存在 tag 为 china 的 DNS 服务器: %v", s)
+		}
+	}
+}
+
+// 5. 节点域名规则、route.default_domain_resolver.server 都是 direct-dns
+func TestBuildSingBoxConfigNodeDomainAndDefaultResolverUseDirectDNS(t *testing.T) {
+	state := testConfigState("rule")
+	state.Nodes[0].Address = "node1.example.com"
+	state.Nodes[0].Outbound["server"] = "node1.example.com"
+
+	config, err := BuildSingBoxConfig(state, state.Nodes[0], "")
+	if err != nil {
+		t.Fatalf("生成配置失败: %v", err)
+	}
+
+	route := config["route"].(map[string]interface{})
+	resolver := route["default_domain_resolver"].(map[string]interface{})
+	if resolver["server"] != "direct-dns" {
+		t.Fatalf("route.default_domain_resolver.server 应为 direct-dns，实际: %v", resolver["server"])
+	}
+
+	dns := config["dns"].(map[string]interface{})
+	rules := dns["rules"].([]map[string]interface{})
+	foundNodeDomainRule := false
+	for _, r := range rules {
+		if doms, ok := r["domain"].([]string); ok && stringSliceContains(doms, "node1.example.com") {
+			foundNodeDomainRule = true
+			if r["server"] != "direct-dns" {
+				t.Fatalf("节点域名解析规则的 server 必须为 direct-dns，实际: %v", r["server"])
+			}
+		}
+	}
+	if !foundNodeDomainRule {
+		t.Fatal("未找到节点域名的 DNS 解析规则")
+	}
+}
+
+// 6. TUN 模式：直连模式规则为 direct-dns；includeRemoteRuleSets=false 时 final 为 direct-dns
+func TestBuildDNSConfigTunDirectRuleAndFinalAreDirectDNS(t *testing.T) {
+	sTun := Settings{Tun: true, Mode: "rule"}
+	nodes := []Node{{ID: "n1", Name: "Node 1"}}
+
+	// 6.1 includeRemoteRuleSets = false 时 final 为 direct-dns
+	dnsConfig := buildDNSConfig(sTun, "proxy", defaultAutoDNSPlan(), false, nodes)
+	if dnsConfig["final"] != "direct-dns" {
+		t.Fatalf("TUN 模式且 includeRemoteRuleSets=false 时，dns.final 必须为 direct-dns，实际: %v", dnsConfig["final"])
+	}
+
+	// 6.2 直连模式规则 (clash_mode: direct) 为 direct-dns
+	rules := dnsConfig["rules"].([]map[string]interface{})
+	foundDirectRule := false
+	for _, r := range rules {
+		if r["clash_mode"] == "direct" {
+			foundDirectRule = true
+			if r["server"] != "direct-dns" {
+				t.Fatalf("TUN 模式下 clash_mode: direct 的 DNS server 必须为 direct-dns，实际: %v", r["server"])
+			}
+		}
+	}
+	if !foundDirectRule {
+		t.Fatal("TUN 模式下未找到 clash_mode: direct 规则")
+	}
+}
+
+// 7. 非 TUN 模式：直连模式规则和启动 final 仍为 local
+func TestBuildDNSConfigNonTunDirectRuleAndFinalAreLocal(t *testing.T) {
+	sNonTun := Settings{Tun: false, SystemProxy: true, Mode: "rule"}
+	nodes := []Node{{ID: "n1", Name: "Node 1"}}
+
+	// 7.1 includeRemoteRuleSets = false 时启动 final 为 local
+	dnsConfig := buildDNSConfig(sNonTun, "proxy", defaultAutoDNSPlan(), false, nodes)
+	if dnsConfig["final"] != "local" {
+		t.Fatalf("非 TUN 模式且 includeRemoteRuleSets=false 时，dns.final 必须为 local，实际: %v", dnsConfig["final"])
+	}
+
+	// 7.2 直连模式规则 (clash_mode: direct) 为 local
+	rules := dnsConfig["rules"].([]map[string]interface{})
+	foundDirectRule := false
+	for _, r := range rules {
+		if r["clash_mode"] == "direct" {
+			foundDirectRule = true
+			if r["server"] != "local" {
+				t.Fatalf("非 TUN 模式下 clash_mode: direct 的 DNS server 必须为 local，实际: %v", r["server"])
+			}
+		}
+	}
+	if !foundDirectRule {
+		t.Fatal("非 TUN 模式下未找到 clash_mode: direct 规则")
+	}
+}
+
+// 8. 配置中任何 DNS 规则或 resolver 引用的服务器 tag，都必须存在于 servers 列表里
+func TestBuildSingBoxConfigDNSReferencesConsistency(t *testing.T) {
+	scenarios := []struct {
+		name                  string
+		tun                   bool
+		includeRemoteRuleSets bool
+	}{
+		{"NonTun_WithRuleSets", false, true},
+		{"NonTun_NoRuleSets", false, false},
+		{"Tun_WithRuleSets", true, true},
+		{"Tun_NoRuleSets", true, false},
+	}
+
+	for _, sc := range scenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			state := testConfigState("rule")
+			state.Settings.Tun = sc.tun
+			state.Settings.SystemProxy = !sc.tun
+			state.Nodes[0].Address = "server.node.com"
+			state.Nodes[0].Outbound["server"] = "server.node.com"
+
+			config, err := buildSingBoxConfig(state, state.Nodes[0], "", sc.includeRemoteRuleSets, defaultAutoDNSPlan())
+			if err != nil {
+				t.Fatalf("生成配置失败: %v", err)
+			}
+
+			dns := config["dns"].(map[string]interface{})
+			servers := dns["servers"].([]map[string]interface{})
+			serverTags := make(map[string]bool)
+			for _, s := range servers {
+				if tag, ok := s["tag"].(string); ok {
+					serverTags[tag] = true
+				}
+			}
+
+			// 检查 route.default_domain_resolver.server
+			route := config["route"].(map[string]interface{})
+			resolver := route["default_domain_resolver"].(map[string]interface{})
+			resolverServer := resolver["server"].(string)
+			if !serverTags[resolverServer] {
+				t.Fatalf("route.default_domain_resolver 引用的服务器 %q 不存在于 dns.servers 列表 %v 中", resolverServer, serverTags)
+			}
+
+			// 检查 dns.final
+			finalServer := dns["final"].(string)
+			if !serverTags[finalServer] {
+				t.Fatalf("dns.final 引用的服务器 %q 不存在于 dns.servers 列表 %v 中", finalServer, serverTags)
+			}
+
+			// 检查 dns.rules 中引用的 server
+			rules := dns["rules"].([]map[string]interface{})
+			for idx, r := range rules {
+				if srv, ok := r["server"].(string); ok {
+					if !serverTags[srv] {
+						t.Fatalf("dns.rules[%d] 引用的服务器 %q 不存在于 dns.servers 列表 %v 中 (规则: %+v)", idx, srv, serverTags, r)
+					}
+				}
+			}
+		})
+	}
+}

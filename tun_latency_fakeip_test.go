@@ -56,7 +56,7 @@ func TestNodeServerDomainsBypassFakeIP(t *testing.T) {
 		if rule["server"] == "fakeip" && rule["query_type"] != nil {
 			fakeIPIndex = idx
 		}
-		if rule["server"] == "china" && rule["domain"] != nil {
+		if rule["server"] == "direct-dns" && rule["domain"] != nil {
 			if doms, ok := rule["domain"].([]string); ok && stringSliceContains(doms, "ss.tiktokstudio.io") {
 				nodeDomainRuleIndex = idx
 			}
@@ -178,7 +178,7 @@ func TestDNSRulesOrderPrioritizesDomesticDirectOverFakeIP(t *testing.T) {
 		if rule["server"] == "fakeip" && rule["query_type"] != nil {
 			fakeIPIndex = idx
 		}
-		if rule["server"] == "china" {
+		if rule["server"] == "direct-dns" {
 			if rule["domain"] != nil {
 				directDomainIndex = idx
 			} else if rule["rule_set"] == "loyalsoldier-china" {
@@ -296,4 +296,3 @@ func TestNodeServerIPsExcludedFromTunRoute(t *testing.T) {
 		t.Fatalf("TUN 入站 route_exclude_address 必须包含节点服务器 IP 209.248.57.144/32，以避开内核路由拦截")
 	}
 }
-
