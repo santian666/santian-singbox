@@ -192,26 +192,6 @@ func fallbackPhysicalInterfaceNet(tunIfIndex, bestIfIndex uint32) (uint32, net.I
 	return 0, nil, errors.New("未检测到可用的物理网络网卡")
 }
 
-func isTunSubnetIP(ip net.IP) bool {
-	ip4 := ip.To4()
-	if ip4 == nil {
-		return false
-	}
-	// 172.19.0.0/16 is SanTian TUN, 198.18.0.0/15 is FakeIP
-	return (ip4[0] == 172 && ip4[1] == 19) || (ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19))
-}
-
-func isFakeIPv4(ip net.IP) bool {
-	if ip == nil {
-		return false
-	}
-	ip4 := ip.To4()
-	if ip4 == nil {
-		return false
-	}
-	return ip4[0] == 198 && (ip4[1] == 18 || ip4[1] == 19)
-}
-
 // newDirectPhysicalDialerForTarget 根据目标 IP 创建连接器。若目标为回环地址，则使用标准连接器；若为外网地址，则强制绑定本地物理网卡绕过 TUN
 func newDirectPhysicalDialerForTarget(targetIP net.IP, timeout time.Duration) *net.Dialer {
 	dialer := &net.Dialer{

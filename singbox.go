@@ -111,7 +111,7 @@ type dnsProbeCandidate struct {
 }
 
 type autoDNSPlan struct {
-	China  dnsProbeCandidate
+	Direct dnsProbeCandidate
 	Remote dnsProbeCandidate
 }
 
@@ -122,12 +122,6 @@ var rulePresetDefs = map[string][]ruleSetDef{
 		{Tag: "loyalsoldier-china", URL: loyalsoldierRuleDownloadURL + "/china-list.txt", FileName: "loyalsoldier-china.json"},
 		{Tag: "geoip-cn", URL: "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/text/cn.txt", FileName: "geoip-cn.json"},
 	},
-}
-
-var chinaDNSCandidates = []dnsProbeCandidate{
-	{Type: "udp", Server: "223.5.5.5"},
-	{Type: "udp", Server: "119.29.29.29"},
-	{Type: "udp", Server: "180.76.76.76"},
 }
 
 var remoteDNSCandidates = []dnsProbeCandidate{
@@ -992,6 +986,8 @@ func (m *SingBoxManager) ApplyCoreUpdate(candidate *coreUpdateCandidate, state P
 	return nil
 }
 
+var resolveDirectDNSPlanFunc = resolveDirectDNSPlan
+
 func (m *SingBoxManager) Start(state PersistState) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1020,7 +1016,7 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 	if err := validateProxyMapPorts(state.Settings, len(proxyMapNodes)); err != nil {
 		return err
 	}
-	dnsPlan := defaultAutoDNSPlan()
+	dnsPlan := resolveDirectDNSPlanFunc(m.logger)
 	if err := m.ensureRuleSets(state.Settings); err != nil {
 		return err
 	}
@@ -1765,7 +1761,7 @@ func buildSingBoxConfig(state PersistState, selected Node, cachePath string, inc
 	}, outbounds...)
 
 	final := "proxy"
-	defaultResolver := "china"
+	defaultResolver := "direct-dns"
 	route := map[string]interface{}{
 		"auto_detect_interface": true,
 		"default_domain_resolver": map[string]interface{}{
@@ -3222,41 +3218,19 @@ func validateProxyMapPorts(settings Settings, nodeCount int) error {
 
 func defaultAutoDNSPlan() autoDNSPlan {
 	return autoDNSPlan{
-		China:  chinaDNSCandidates[0],
+		Direct: dnsProbeCandidate{Type: "udp", Server: directDNSFallbackCandidates[0]},
 		Remote: remoteDNSCandidates[0],
 	}
 }
 
 func normalizeAutoDNSPlan(plan autoDNSPlan) autoDNSPlan {
-	if plan.China.Type == "" || plan.China.Server == "" {
-		plan.China = chinaDNSCandidates[0]
+	if plan.Direct.Type == "" || plan.Direct.Server == "" {
+		plan.Direct = dnsProbeCandidate{Type: "udp", Server: directDNSFallbackCandidates[0]}
 	}
 	if plan.Remote.Type == "" || plan.Remote.Server == "" {
 		plan.Remote = remoteDNSCandidates[0]
 	}
 	return plan
-}
-
-func resolveAutoDNSPlan(logger *Logger) autoDNSPlan {
-	plan := defaultAutoDNSPlan()
-	china, chinaMS, ok := probeBestChinaDNS(chinaDNSCandidates)
-	if ok {
-		plan.China = china
-	}
-	remote, remoteMS, ok := probeBestRemoteDNS(remoteDNSCandidates)
-	if ok {
-		plan.Remote = remote
-	}
-	if logger != nil {
-		logger.Info("自动 DNS：国内=%s(%dms)，海外=%s(%dms)", plan.China.Server, chinaMS, plan.Remote.Server, remoteMS)
-	}
-	return plan
-}
-
-func probeBestChinaDNS(candidates []dnsProbeCandidate) (dnsProbeCandidate, int64, bool) {
-	return probeBestDNS(candidates, func(candidate dnsProbeCandidate) bool {
-		return probeUDPDNS(candidate.Server, "www.baidu.com") == nil
-	})
 }
 
 func probeBestRemoteDNS(candidates []dnsProbeCandidate) (dnsProbeCandidate, int64, bool) {
@@ -3266,83 +3240,12 @@ func probeBestRemoteDNS(candidates []dnsProbeCandidate) (dnsProbeCandidate, int6
 	return candidates[0], 0, true
 }
 
-func probeBestDNS(candidates []dnsProbeCandidate, probe func(dnsProbeCandidate) bool) (dnsProbeCandidate, int64, bool) {
-	type result struct {
-		candidate dnsProbeCandidate
-		elapsedMS int64
-		ok        bool
-	}
-	results := make(chan result, len(candidates))
-	for _, candidate := range candidates {
-		candidate := candidate
-		go func() {
-			start := time.Now()
-			ok := probe(candidate)
-			elapsed := time.Since(start).Milliseconds()
-			if elapsed < 1 {
-				elapsed = 1
-			}
-			results <- result{candidate: candidate, elapsedMS: elapsed, ok: ok}
-		}()
-	}
-	var best dnsProbeCandidate
-	var bestMS int64
-	for range candidates {
-		result := <-results
-		if !result.ok {
-			continue
-		}
-		if best.Server == "" || result.elapsedMS < bestMS {
-			best = result.candidate
-			bestMS = result.elapsedMS
-		}
-	}
-	return best, bestMS, best.Server != ""
-}
-
-func probeUDPDNS(server string, domain string) error {
-	resolver := net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			dialer := net.Dialer{Timeout: 700 * time.Millisecond}
-			return dialer.DialContext(ctx, "udp", net.JoinHostPort(server, "53"))
-		},
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 900*time.Millisecond)
-	defer cancel()
-	_, err := resolver.LookupHost(ctx, domain)
-	return err
-}
-
-func probeHTTPSDNS(server string, domain string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 1800*time.Millisecond)
-	defer cancel()
-	url := fmt.Sprintf("https://%s/dns-query?name=%s&type=A", server, domain)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "application/dns-json")
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = nil
-	defer transport.CloseIdleConnections()
-	resp, err := (&http.Client{Timeout: 1800 * time.Millisecond, Transport: transport}).Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("DoH 返回状态：%d", resp.StatusCode)
-	}
-	return nil
-}
-
 func buildDNSConfig(settings Settings, final string, dnsPlan autoDNSPlan, includeRemoteRuleSets bool, nodes []Node) map[string]interface{} {
 	dnsPlan = normalizeAutoDNSPlan(dnsPlan)
 	dnsFinal := "remote"
 	if !includeRemoteRuleSets {
 		if effectiveTun(settings) {
-			dnsFinal = "china"
+			dnsFinal = "direct-dns"
 		} else {
 			dnsFinal = "local"
 		}
@@ -3354,7 +3257,7 @@ func buildDNSConfig(settings Settings, final string, dnsPlan autoDNSPlan, includ
 	}
 	servers := []map[string]interface{}{
 		{"tag": "local", "type": "local"},
-		{"tag": "china", "type": dnsPlan.China.Type, "server": dnsPlan.China.Server},
+		{"tag": "direct-dns", "type": dnsPlan.Direct.Type, "server": dnsPlan.Direct.Server},
 	}
 	if dnsFinal == "remote" {
 		servers = append(servers, map[string]interface{}{"tag": "remote", "type": dnsPlan.Remote.Type, "server": dnsPlan.Remote.Server, "detour": final})
@@ -3371,7 +3274,7 @@ func buildDNSConfig(settings Settings, final string, dnsPlan autoDNSPlan, includ
 
 	directDNSServer := "local"
 	if effectiveTun(settings) {
-		directDNSServer = "china"
+		directDNSServer = "direct-dns"
 	}
 	dnsRules = append(dnsRules, map[string]interface{}{"clash_mode": "direct", "action": "route", "server": directDNSServer})
 
@@ -3387,7 +3290,7 @@ func buildDNSConfig(settings Settings, final string, dnsPlan autoDNSPlan, includ
 			"domain":        nodeDomains,
 			"domain_suffix": nodeDomains,
 			"action":        "route",
-			"server":        "china",
+			"server":        "direct-dns",
 		})
 	}
 
@@ -3397,7 +3300,7 @@ func buildDNSConfig(settings Settings, final string, dnsPlan autoDNSPlan, includ
 			"domain_suffix": directDomains,
 			"clash_mode":    "rule",
 			"action":        "route",
-			"server":        "china",
+			"server":        "direct-dns",
 		})
 	}
 
@@ -3424,8 +3327,8 @@ func buildDNSConfig(settings Settings, final string, dnsPlan autoDNSPlan, includ
 				dnsRules = append(dnsRules, map[string]interface{}{"rule_set": "loyalsoldier-proxy", "clash_mode": "rule", "action": "route", "server": "remote"})
 			}
 			dnsRules = append(dnsRules,
-				map[string]interface{}{"rule_set": "loyalsoldier-direct", "clash_mode": "rule", "action": "route", "server": "china"},
-				map[string]interface{}{"rule_set": "loyalsoldier-china", "clash_mode": "rule", "action": "route", "server": "china"},
+				map[string]interface{}{"rule_set": "loyalsoldier-direct", "clash_mode": "rule", "action": "route", "server": "direct-dns"},
+				map[string]interface{}{"rule_set": "loyalsoldier-china", "clash_mode": "rule", "action": "route", "server": "direct-dns"},
 			)
 		}
 	}
@@ -3434,11 +3337,11 @@ func buildDNSConfig(settings Settings, final string, dnsPlan autoDNSPlan, includ
 		map[string]interface{}{"domain_suffix": []string{
 			"cn", "jd.com", "qq.com", "gtimg.com", "tenpay.com", "360buy.com",
 			"msftconnecttest.com", "msftncsi.com", "time.windows.com",
-		}, "clash_mode": "rule", "action": "route", "server": "china"},
+		}, "clash_mode": "rule", "action": "route", "server": "direct-dns"},
 		map[string]interface{}{"domain_keyword": []string{
 			"baidu", "bilibili", "taobao", "tmall", "alicdn", "aliyun",
 			"weixin", "wechat", "douyin", "bytedance", "zhihu", "netease",
-		}, "clash_mode": "rule", "action": "route", "server": "china"},
+		}, "clash_mode": "rule", "action": "route", "server": "direct-dns"},
 	)
 
 	if settings.FakeDNS {

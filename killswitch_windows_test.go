@@ -330,7 +330,7 @@ func TestShouldApplyFirewallKillSwitchConditions(t *testing.T) {
 	}
 }
 
-// 8. buildDNSConfig：TUN + 直连规则 server == "china"；TUN + includeRemoteRuleSets=false 时 final == "china"；非 TUN 时两者仍为 "local"
+// 8. buildDNSConfig：TUN + 直连规则 server == "direct-dns"；TUN + includeRemoteRuleSets=false 时 final == "direct-dns"；非 TUN 时两者仍为 "local"
 func TestBuildDNSConfigTunUsesChinaAndNonTunUsesLocal(t *testing.T) {
 	// A: TUN 开启时
 	sTun := Settings{Tun: true, Mode: "rule"}
@@ -338,8 +338,8 @@ func TestBuildDNSConfigTunUsesChinaAndNonTunUsesLocal(t *testing.T) {
 
 	// 8.1 TUN + includeRemoteRuleSets=false
 	dnsConfigTunStartup := buildDNSConfig(sTun, "proxy", defaultAutoDNSPlan(), false, nodes)
-	if dnsConfigTunStartup["final"] != "china" {
-		t.Fatalf("TUN 开启且 includeRemoteRuleSets=false 时，dns.final 应为 china，实际：%v", dnsConfigTunStartup["final"])
+	if dnsConfigTunStartup["final"] != "direct-dns" {
+		t.Fatalf("TUN 开启且 includeRemoteRuleSets=false 时，dns.final 应为 direct-dns，实际：%v", dnsConfigTunStartup["final"])
 	}
 
 	// 8.2 TUN + clash_mode: direct 规则
@@ -351,8 +351,8 @@ func TestBuildDNSConfigTunUsesChinaAndNonTunUsesLocal(t *testing.T) {
 			break
 		}
 	}
-	if directRuleServerTun != "china" {
-		t.Fatalf("TUN 模式下 clash_mode: direct 的 DNS server 应为 china，实际：%v", directRuleServerTun)
+	if directRuleServerTun != "direct-dns" {
+		t.Fatalf("TUN 模式下 clash_mode: direct 的 DNS server 应为 direct-dns，实际：%v", directRuleServerTun)
 	}
 
 	// B: 非 TUN 模式（系统代理）
