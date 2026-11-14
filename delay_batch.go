@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -250,7 +251,11 @@ func (m *SingBoxManager) testNodesDelayWithTemporaryCoreConcurrency(nodes []Node
 	if options.UseSystemProxy {
 		upstreamPort = m.getSOCKS5TestProxyPort()
 	}
-	if err := encoder.Encode(buildBatchDelayConfigWithUpstream(nodes, ports, upstreamPort)); err != nil {
+	directDNSServer := ""
+	if resolveDirectDNSPlanFunc != nil {
+		directDNSServer = resolveDirectDNSPlanFunc(m.logger).Direct.Server
+	}
+	if err := encoder.Encode(buildBatchDelayConfigWithUpstream(nodes, ports, upstreamPort, directDNSServer)); err != nil {
 		_ = configFile.Close()
 		return nil, err
 	}
@@ -461,10 +466,42 @@ func reserveDelayTestPorts(count int) ([]int, func(), error) {
 }
 
 func buildBatchDelayConfig(nodes []Node, ports []int) map[string]interface{} {
-	return buildBatchDelayConfigWithUpstream(nodes, ports, 0)
+	return buildBatchDelayConfigWithUpstream(nodes, ports, 0, "")
 }
 
-func buildBatchDelayConfigWithUpstream(nodes []Node, ports []int, upstreamPort int) map[string]interface{} {
+func buildBatchDelayConfigWithUpstream(nodes []Node, ports []int, upstreamPort int, directDNSServer string) map[string]interface{} {
+	config, _ := buildBatchDelayConfigWithOwners(nodes, ports, upstreamPort, directDNSServer)
+	return config
+}
+
+// batchConfigOwners 记录临时内核配置中每个 outbound / endpoint 属于第几个节点（-1 表示非节点条目，
+// 例如 direct、upstream）。sing-box 报错时给出的是 outbounds[N] / endpoints[N]，用它反查出错节点。
+type batchConfigOwners struct {
+	Outbounds []int
+	Endpoints []int
+}
+
+// Owner 返回 kind（"outbound" 或 "endpoint"）第 index 个条目对应的节点序号；找不到时返回 -1。
+func (o batchConfigOwners) Owner(kind string, index int) int {
+	var list []int
+	switch kind {
+	case "outbound":
+		list = o.Outbounds
+	case "endpoint":
+		list = o.Endpoints
+	}
+	if index < 0 || index >= len(list) {
+		return -1
+	}
+	return list[index]
+}
+
+func buildBatchDelayConfigWithOwners(nodes []Node, ports []int, upstreamPort int, directDNSServer string) (map[string]interface{}, batchConfigOwners) {
+	owners := batchConfigOwners{Outbounds: []int{-1}}
+	directDNSServer = strings.TrimSpace(directDNSServer)
+	if directDNSServer == "" {
+		directDNSServer = defaultAutoDNSPlan().Direct.Server
+	}
 	inbounds := make([]map[string]interface{}, 0, len(nodes))
 	outbounds := []map[string]interface{}{{"type": "direct", "tag": "direct"}}
 	hasDetourOutbound := false
@@ -481,6 +518,7 @@ func buildBatchDelayConfigWithUpstream(nodes []Node, ports []int, upstreamPort i
 			"server":      "127.0.0.1",
 			"server_port": upstreamPort,
 		})
+		owners.Outbounds = append(owners.Outbounds, -1)
 	}
 	endpoints := make([]map[string]interface{}, 0)
 	rules := make([]map[string]interface{}, 0, len(nodes))
@@ -500,8 +538,10 @@ func buildBatchDelayConfigWithUpstream(nodes []Node, ports []int, upstreamPort i
 		}
 		if endpoint := wireGuardEndpointFromOutbound(outbound); endpoint != nil {
 			endpoints = append(endpoints, endpoint)
+			owners.Endpoints = append(owners.Endpoints, index)
 		} else {
 			outbounds = append(outbounds, outbound)
+			owners.Outbounds = append(owners.Outbounds, index)
 		}
 		rules = append(rules, map[string]interface{}{
 			"inbound":  []string{inboundTag},
@@ -515,15 +555,15 @@ func buildBatchDelayConfigWithUpstream(nodes []Node, ports []int, upstreamPort i
 			"timestamp": true,
 		},
 		"dns": map[string]interface{}{
-			"servers": []map[string]interface{}{{"tag": "local", "type": "local"}},
-			"final":   "local",
+			"servers": []map[string]interface{}{{"tag": "direct-dns", "type": "udp", "server": directDNSServer}},
+			"final":   "direct-dns",
 		},
 		"inbounds":  inbounds,
 		"outbounds": outbounds,
 		"route": map[string]interface{}{
 			"auto_detect_interface": true,
 			"default_domain_resolver": map[string]interface{}{
-				"server":   "local",
+				"server":   "direct-dns",
 				"strategy": "prefer_ipv4",
 			},
 			"rules": rules,
@@ -533,5 +573,5 @@ func buildBatchDelayConfigWithUpstream(nodes []Node, ports []int, upstreamPort i
 	if len(endpoints) > 0 {
 		config["endpoints"] = endpoints
 	}
-	return config
+	return config, owners
 }

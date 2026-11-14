@@ -1367,6 +1367,12 @@ var ia = ln((an, sn) => {
   function RunNetworkToolApi(e) {
     return window.go.main.App.RunNetworkTool(e);
   }
+  function StartBatchTestApi(e, t) {
+    return window.go.main.App.StartBatchTest(e, t);
+  }
+  function CancelBatchTestApi(e) {
+    return window.go.main.App.CancelBatchTest(e);
+  }
   function In(e, t, n) {
     return window.runtime.EventsOnMultiple(e, t, n);
   }
@@ -3218,9 +3224,17 @@ var ia = ln((an, sn) => {
     }),
       se());
   }
-  function se() {
-    c("testNodeCount").textContent = `${s.testNodes.length} 个节点`;
+  function renderTestNodesNow() {
+    if (s.batchTesting || (s.batchTestCompleted && s.batchTestCompleted > 0)) {
+      const completed = s.batchTestCompleted || 0;
+      const total = s.batchTestTotal || s.testNodes.length;
+      const working = s.batchTestWorking || 0;
+      c("testNodeCount").textContent = `\u5DF2\u5B8C\u6210 ${completed} / \u603B\u6570 ${total}\uFF0C\u53EF\u7528 ${working}`;
+    } else {
+      c("testNodeCount").textContent = `${s.testNodes.length} \u4E2A\u8282\u70B9`;
+    }
     const e = c("testNodes");
+    bindTestNodesDelegation(e);
     if (!s.testNodes.length) {
       ((e.className = "test-nodes empty"), (e.textContent = "暂无测试节点"));
       return;
@@ -3265,10 +3279,7 @@ var ia = ln((an, sn) => {
           ? ' <span class="sort-indicator active">▲</span>'
           : ' <span class="sort-indicator active">▼</span>'
         : ' <span class="sort-indicator">⇅</span>';
-    ((e.innerHTML = `
-    <div class="test-table-wrap">
-      <table class="test-table">
-        <thead>
+    const headRow = `
           <tr>
             <th>地址</th>
             <th class="sortable-th" data-sort-key="type" title="点击排序">类型${sortIcon("type")}</th>
@@ -3281,32 +3292,97 @@ var ia = ln((an, sn) => {
             <th class="sortable-th" data-sort-key="uploadMbps" title="点击按上传速度排序">上传${sortIcon("uploadMbps")}</th>
             <th>状态</th>
             <th>操作</th>
-          </tr>
-        </thead>
-        <tbody>${t}</tbody>
+          </tr>`;
+    // 只替换表头和表体，保留滚动容器 .test-table-wrap，测试过程中滚动位置不会被重置
+    let wrap = e.querySelector(":scope > .test-table-wrap");
+    if (!wrap) {
+      e.innerHTML = `
+    <div class="test-table-wrap">
+      <table class="test-table">
+        <thead></thead>
+        <tbody></tbody>
       </table>
     </div>
-  `),
-      e.querySelectorAll("[data-sort-key]").forEach((th) => {
-        th.addEventListener("click", () => sortBatchNodes(th.dataset.sortKey));
-      }),
-      e.querySelectorAll("[data-raw-speed]").forEach((n) => {
-        n.addEventListener("click", () => {
-          ((s.testStopRequested = !1), Ue(Number(n.dataset.rawSpeed), "speed"));
-        });
-      }),
-      e.querySelectorAll("[data-copy-value]").forEach((n) => {
-        n.addEventListener("click", async () => {
-          const a = String(n.dataset.copyValue || "").trim();
-          if (!!a)
-            try {
-              (await Le(a), P("已复制"));
-            } catch (r) {
-              P(J(r));
-            }
-        });
-      }),
-      te());
+  `;
+      wrap = e.querySelector(":scope > .test-table-wrap");
+    }
+    const thead = wrap.querySelector("thead");
+    const tbody = wrap.querySelector("tbody");
+    if (thead.__sanTianHead !== headRow) {
+      thead.innerHTML = headRow;
+      thead.__sanTianHead = headRow;
+    }
+    tbody.innerHTML = t;
+    te();
+  }
+  // 测试表格的点击事件只在容器上绑定一次（事件委托），不再每次渲染给每一行重新绑定
+  function bindTestNodesDelegation(e) {
+    if (!e || e.__sanTianDelegated) return;
+    e.__sanTianDelegated = true;
+    e.addEventListener("click", async (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target || !e.contains(target)) return;
+      const sortTh = target.closest("[data-sort-key]");
+      if (sortTh && e.contains(sortTh)) {
+        sortBatchNodes(sortTh.dataset.sortKey);
+        return;
+      }
+      const speedBtn = target.closest("[data-raw-speed]");
+      if (speedBtn && e.contains(speedBtn)) {
+        if (speedBtn.disabled) return;
+        ((s.testStopRequested = !1), Ue(Number(speedBtn.dataset.rawSpeed), "speed"));
+        return;
+      }
+      const copyEl = target.closest("[data-copy-value]");
+      if (copyEl && e.contains(copyEl)) {
+        const a = String(copyEl.dataset.copyValue || "").trim();
+        if (!a) return;
+        try {
+          (await Le(a), P("已复制"));
+        } catch (r) {
+          P(J(r));
+        }
+      }
+    });
+  }
+
+  let seTimer = null;
+  let sePending = false;
+  let seLastRun = 0;
+  function se(immediate = false) {
+    if (immediate) {
+      if (seTimer) {
+        clearTimeout(seTimer);
+        seTimer = null;
+      }
+      sePending = false;
+      seLastRun = Date.now();
+      renderTestNodesNow();
+      return;
+    }
+    const now = Date.now();
+    const remaining = 150 - (now - seLastRun);
+    if (remaining <= 0) {
+      if (seTimer) {
+        clearTimeout(seTimer);
+        seTimer = null;
+      }
+      sePending = false;
+      seLastRun = now;
+      renderTestNodesNow();
+    } else if (!seTimer) {
+      sePending = true;
+      seTimer = setTimeout(() => {
+        seTimer = null;
+        seLastRun = Date.now();
+        if (sePending) {
+          sePending = false;
+          renderTestNodesNow();
+        }
+      }, remaining);
+    } else {
+      sePending = true;
+    }
   }
   function We() {
     const e = s.toolStatus.nexttrace || {},
@@ -3804,7 +3880,7 @@ var ia = ln((an, sn) => {
           : s.mtrRunning
             ? "MTR 运行中"
             : s.batchTesting
-              ? "完成后显示输出"
+              ? `批量测试中 ${s.batchTestCompleted || 0}/${s.batchTestTotal || s.testNodes.length}`
               : s.ipBackfilling
                 ? "未知 IP"
                 : dt(s.testBusyKey.split(":")[2] || ""));
@@ -6434,6 +6510,8 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
       Te("speed-progress", Hr),
       Te("iperf-output", jt),
       Te("mtr-output", Ht),
+      Te("batch-test-result", onBatchTestResult),
+      Te("batch-test-done", onBatchTestDone),
       Te("auto-failover-switched", (e) => {
         (e &&
           e.to &&
@@ -6586,6 +6664,9 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
       (s.ipBackfillRunId = 0),
       (s.testBusyKey = ""),
       s.testBusyKeys.clear(),
+      (s.batchTestCompleted = 0),
+      (s.batchTestWorking = 0),
+      (s.batchTestTotal = 0),
       (s.testNodes = (t.nodes || []).map((n) => ({
         ...n,
         pingAddress: n.address || "",
@@ -6610,70 +6691,139 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
         ((s.batchTesting = !1), (s.ipBackfilling = !1), ne(), se(), P(J(e)));
       }));
   }
+  // 当前批量测试任务 ID（前端生成并传给后端）；只处理这个任务的事件
+  let currentBatchJobID = "";
+
+  function handleResultEvent(evt) {
+    if (!evt || typeof evt.index !== "number" || evt.index < 0 || evt.index >= s.testNodes.length) return;
+    const r = s.testNodes[evt.index];
+    if (!r) return;
+
+    if (evt.phase === "delay") {
+      if (evt.error) {
+        r.error = evt.error;
+        if (s.currentBatchMetric === "ping") {
+          r.pingMs = -1;
+        } else {
+          r.urlDelayMs = -1;
+        }
+        r.status = en(evt.error);
+      } else {
+        r.error = "";
+        const O = evt.result || {};
+        if (s.currentBatchMetric === "ping") {
+          r.pingAddress = O.pingAddress || r.address || "";
+          r.pingMs = O.pingMs || O.delayMs || 0;
+          r.status = "Ping " + r.pingMs + " ms";
+        } else {
+          r.urlDelayMs = O.urlDelayMs || O.delayMs || 0;
+          r.status = "URL " + r.urlDelayMs + " ms";
+        }
+        s.batchTestWorking = (s.batchTestWorking || 0) + 1;
+      }
+      s.batchTestCompleted = (s.batchTestCompleted || 0) + 1;
+      ne();
+    } else if (evt.phase === "ip") {
+      if (evt.error) {
+        r.outboundIp = "\u672A\u77E5";
+        r.status = "\u51FA\u53E3 IP \u5931\u8D25";
+      } else {
+        const O = evt.result || {};
+        r.outboundIp = O.outboundIp || "";
+        r.country = O.country || tn({ ...r, address: r.outboundIp }) || r.country;
+        r.status = r.outboundIp ? "\u51FA\u53E3 IP " + r.outboundIp : "\u51FA\u53E3 IP \u672A\u77E5";
+      }
+    }
+    se();
+  }
+
+  function handleDoneEvent(evt) {
+    currentBatchJobID = "";
+    s.batchTesting = false;
+    ne();
+    se(true);
+    if (evt.cancelled) {
+      Yt();
+      P("\u8282\u70B9\u6D4B\u8BD5\u5DF2\u505C\u6B62");
+    } else {
+      const ok = typeof evt.ok === "number" ? evt.ok : s.batchTestWorking || 0;
+      const total = typeof evt.total === "number" ? evt.total : s.testNodes.length;
+      P(`\u8282\u70B9\u6D4B\u8BD5\u5B8C\u6210\uFF1A\u53EF\u7528 ${ok} / \u603B\u6570 ${total}`);
+    }
+  }
+
+  function onBatchTestResult(evt) {
+    if (!evt || !currentBatchJobID || evt.jobId !== currentBatchJobID) return;
+    handleResultEvent(evt);
+  }
+
+  function onBatchTestDone(evt) {
+    if (!evt || !currentBatchJobID || evt.jobId !== currentBatchJobID) return;
+    handleDoneEvent(evt);
+  }
+
   async function Qt() {
     if (!(await Vt()) || !s.testNodes.length) return;
     const testOptions = await prepareBatchRawTest(s.testNodes);
     if (!testOptions) return;
     const delayMetric = await showDelayMetricDialog({
-      title: "选择批量测试方式",
-      message: "请选择本次批量测试的延迟类型。",
+      title: "\u9009\u62E9\u6D4B\u8BD5\u65B9\u5F0F",
+      message: "\u8BF7\u9009\u62E9\u672C\u6B21\u6D4B\u8BD5\u7684\u5EF6\u8FDF\u7C7B\u578B\u3002",
     });
     if (!delayMetric) return;
     testOptions.delayMetric = delayMetric;
-    const t = s.testRunId;
-    ((s.currentRawTestOptions = testOptions), (s.batchTesting = !0), s.testBusyKeys.clear(), ne(), se());
-    let n = 0;
-    const a = async () => {
-        const i = testOptions.delayMetric === "real" ? "url" : "ping";
-        for (; !qe(t) && n < s.testNodes.length;) {
-          const o = n;
-          ((n += 1), await Ue(o, i, !0, t));
-        }
-      },
-      r = Math.min(Et, s.testNodes.length);
-    if ((await Promise.all(Array.from({ length: r }, a)), !!ye(t))) {
-      if (((s.batchTesting = !1), ne(), se(), s.testStopRequested)) {
-        (Yt(), P("\u8282\u70B9\u6D4B\u8BD5\u5DF2\u505C\u6B62"));
+    const t = ++s.testRunId;
+    s.currentRawTestOptions = testOptions;
+    s.batchTesting = true;
+    s.testStopRequested = false;
+    s.testBusyKeys.clear();
+    s.testBusyKey = "";
+    s.currentBatchMetric = delayMetric === "real" ? "delay" : "ping";
+    s.batchTestCompleted = 0;
+    s.batchTestWorking = 0;
+    s.batchTestTotal = s.testNodes.length;
+    // 任务 ID 由前端生成并传给后端，这样第一条事件到达时就能识别，不必等调用返回
+    const jobId = `web-${Date.now()}-${t}`;
+    currentBatchJobID = jobId;
+
+    s.testNodes.forEach((node) => {
+      node.error = "";
+      node.status = "\u7B49\u5F85\u6D4B\u8BD5";
+      node.pingMs = 0;
+      node.urlDelayMs = 0;
+      node.outboundIp = "";
+    });
+
+    ne();
+    se(true);
+
+    const metric = delayMetric === "real" ? "delay" : "ping";
+    const raws = s.testNodes.map((n) => n.raw);
+
+    try {
+      const res = await StartBatchTestApi(raws, {
+        ...testOptions,
+        jobId: jobId,
+        metric: metric,
+        withIP: true,
+      });
+      if (!ye(t) || s.testStopRequested) {
+        // 调用返回前用户已点击停止或开始了新的测试
+        CancelBatchTestApi((res && res.jobId) || jobId).catch(() => {});
         return;
       }
-      const i = s.testNodes.some((o) => o.urlDelayMs > 0 || o.pingMs > 0);
-      if (!i) {
-        P("节点测试已完成，失败节点已跳过出站 IP 回填");
-        return;
+      if (res && res.total && currentBatchJobID === jobId) {
+        s.batchTestTotal = res.total;
       }
-      (P((testOptions.delayMetric === "real" ? "真连接延迟" : "TCP延迟") + "完成，出站 IP 后台回填"), Yr(t));
+    } catch (err) {
+      if (ye(t)) {
+        s.batchTesting = false;
+        currentBatchJobID = "";
+        ne();
+        se(true);
+        P(J(err));
+      }
     }
-  }
-  function Yr(e) {
-    ((s.ipBackfilling = !0),
-      (s.ipBackfillRunId = e),
-      ne(),
-      se(),
-      zr(e)
-        .catch((t) => {
-          ye(e) && !s.testStopRequested && P(J(t));
-        })
-        .finally(() => {
-          !ye(e) ||
-            s.ipBackfillRunId !== e ||
-            ((s.ipBackfilling = !1), (s.ipBackfillRunId = 0), (s.testBusyKey = ""), ne(), se());
-        }));
-  }
-  async function zr(e) {
-    let t = 0;
-    const n = async () => {
-        for (; !qe(e) && t < s.testNodes.length;) {
-          const r = t;
-          t += 1;
-          const i = s.testNodes[r];
-          if (!i || (i.urlDelayMs <= 0 && i.pingMs <= 0)) {
-            continue;
-          }
-          await Ue(r, "ip", !0, e);
-        }
-      },
-      a = Math.min(Et, s.testNodes.length);
-    await Promise.all(Array.from({ length: a }, n));
   }
   async function Ue(e, t, n = !1, a = s.testRunId) {
     var C, N;
@@ -6740,18 +6890,23 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
     return Boolean(s.batchTesting || s.ipBackfilling || s.testBusyKey || s.testBusyKeys.size);
   }
   function ea() {
-    !Jt() ||
-      ((s.testRunId += 1),
-      (s.testStopRequested = !0),
-      (s.batchTesting = !1),
-      (s.ipBackfilling = !1),
-      (s.ipBackfillRunId = 0),
-      (s.testBusyKey = ""),
-      s.testBusyKeys.clear(),
-      Yt(),
-      ne(),
-      se(),
-      P("\u5DF2\u505C\u6B62\u6392\u961F\u4EFB\u52A1"));
+    if (!Jt()) return;
+    const jobIdToCancel = currentBatchJobID;
+    currentBatchJobID = "";
+    s.testRunId += 1;
+    s.testStopRequested = true;
+    s.batchTesting = false;
+    s.ipBackfilling = false;
+    s.ipBackfillRunId = 0;
+    s.testBusyKey = "";
+    s.testBusyKeys.clear();
+    if (jobIdToCancel) {
+      CancelBatchTestApi(jobIdToCancel).catch(() => {});
+    }
+    Yt();
+    ne();
+    se(true);
+    P("\u5DF2\u505C\u6B62\u6392\u961F\u4EFB\u52A1");
   }
   function Yt() {
     s.testNodes.forEach((e) => {
@@ -6852,11 +7007,11 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
       ? "\u6D4B\u8BD5\u4E2D"
       : e.error
         ? e.status || en(e.error)
-        : e.urlDelayMs > 0
-          ? "正常"
-          : e.urlDelayMs < 0
-            ? "异常"
-            : "未测";
+        : e.urlDelayMs > 0 || e.pingMs > 0
+          ? "\u53EF\u7528"
+          : e.urlDelayMs < 0 || e.pingMs < 0
+            ? "\u5F02\u5E38"
+            : e.status || "\u672A\u6D4B";
   }
   function en(e) {
     const t = String(e || "测试失败")
