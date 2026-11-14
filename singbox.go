@@ -1219,6 +1219,7 @@ func (m *SingBoxManager) CleanupStale() error {
 		}
 		waitProcessPathGone(m.corePath, 3*time.Second)
 	}
+	m.cleanupForeignSanTianCores()
 	remaining, err := staleSingBoxPIDsByPath(m.corePath)
 	if err != nil {
 		return fmt.Errorf("复查残留 sing-box 失败：%w", err)
@@ -1231,6 +1232,72 @@ func (m *SingBoxManager) CleanupStale() error {
 		return fmt.Errorf("仍有 sing-box 进程未退出：%s", strings.Join(ids, ","))
 	}
 	return nil
+}
+
+// cleanupForeignSanTianCores 结束其他 SanTian 副本（例如另一个目录里的旧版本）遗留的 sing-box 内核。
+// 这类残留内核会一直占用名为 SanTian 的 TUN 网卡，导致本程序开启 TUN 时报
+// “create adapter: Cannot create a file when that file already exists”。
+func (m *SingBoxManager) cleanupForeignSanTianCores() {
+	processes, err := listProcesses()
+	if err != nil {
+		return
+	}
+	for _, item := range orphanedForeignSanTianCores(m.corePath, processes, sanTianAppExeExists) {
+		killed := false
+		if process, err := os.FindProcess(item.PID); err == nil && process.Kill() == nil {
+			killed = true
+		} else if _, err := runCommandOutput("taskkill", "/PID", strconv.Itoa(item.PID), "/T", "/F"); err == nil {
+			killed = true
+		}
+		if m.logger == nil {
+			continue
+		}
+		if killed {
+			m.logger.Info("已结束其他 SanTian 副本遗留的 sing-box 内核：PID %d，%s", item.PID, item.Path)
+		} else {
+			m.logger.Error("无法结束其他 SanTian 副本遗留的 sing-box 内核：PID %d，%s，请在任务管理器中手动结束", item.PID, item.Path)
+		}
+	}
+}
+
+func sanTianAppExeExists(dir string) bool {
+	return fileExists(filepath.Join(dir, "SanTian-Singbox.exe"))
+}
+
+// orphanedForeignSanTianCores 找出可以安全结束的“其他 SanTian 副本遗留的内核”，条件全部满足才算：
+//   - 进程名是 sing-box.exe，路径可读，且与当前内核路径不同；
+//   - 位于某个目录的 bin 子目录下，且该目录里有 SanTian-Singbox.exe（即另一份 SanTian）；
+//   - 父进程不是正在运行的 SanTian-Singbox.exe（避免打断另一个仍在使用的实例）。
+func orphanedForeignSanTianCores(corePath string, processes []processInfo, isSanTianDir func(dir string) bool) []processInfo {
+	target := normalizeAppProxyPath(corePath)
+	liveApps := make(map[int]bool)
+	for _, item := range processes {
+		if strings.EqualFold(item.Name, "SanTian-Singbox.exe") {
+			liveApps[item.PID] = true
+		}
+	}
+	result := make([]processInfo, 0)
+	for _, item := range processes {
+		if item.PID <= 0 || !strings.EqualFold(item.Name, "sing-box.exe") || strings.TrimSpace(item.Path) == "" {
+			continue
+		}
+		path := normalizeAppProxyPath(item.Path)
+		if target != "" && strings.EqualFold(path, target) {
+			continue
+		}
+		binDir := filepath.Dir(path)
+		if !strings.EqualFold(filepath.Base(binDir), "bin") {
+			continue
+		}
+		if isSanTianDir == nil || !isSanTianDir(filepath.Dir(binDir)) {
+			continue
+		}
+		if liveApps[item.ParentPID] {
+			continue
+		}
+		result = append(result, item)
+	}
+	return result
 }
 
 func staleSingBoxPIDsByPath(corePath string) ([]int, error) {
