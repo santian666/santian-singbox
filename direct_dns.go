@@ -10,7 +10,6 @@ import (
 var directDNSFallbackCandidates = []string{"223.5.5.5", "119.29.29.29", "1.1.1.1", "8.8.8.8", "9.9.9.9"}
 
 type directDNSProbeResult struct {
-	server  string
 	latency time.Duration
 	ok      bool
 }
@@ -100,45 +99,92 @@ func filterDirectDNSServers(ips []string) []string {
 	return result
 }
 
-func probeBest(candidates []string, probe func(server string) (time.Duration, bool)) (string, bool) {
-	if len(candidates) == 0 {
-		return "", false
-	}
-	ch := make(chan directDNSProbeResult, len(candidates))
-	for _, c := range candidates {
-		go func(srv string) {
-			lat, ok := probe(srv)
-			ch <- directDNSProbeResult{server: srv, latency: lat, ok: ok}
-		}(c)
+func chooseDirectDNS(
+	primary []string,
+	secondary []string,
+	fallbacks []string,
+	probe func(server string) (time.Duration, bool),
+	totalTimeout time.Duration,
+) (server string, source string) {
+	if totalTimeout <= 0 {
+		totalTimeout = 1200 * time.Millisecond
 	}
 
-	var bestServer string
-	var bestLatency time.Duration = 1<<63 - 1
-	found := false
-
-	for i := 0; i < len(candidates); i++ {
-		res := <-ch
-		if res.ok {
-			if !found || res.latency < bestLatency {
-				bestLatency = res.latency
-				bestServer = res.server
-				found = true
+	// 收集所有需要探测的非重复 IP
+	var allServers []string
+	seen := make(map[string]bool)
+	for _, list := range [][]string{primary, secondary, fallbacks} {
+		for _, s := range list {
+			if s != "" && !seen[s] {
+				seen[s] = true
+				allServers = append(allServers, s)
 			}
 		}
 	}
-	return bestServer, found
-}
 
-func chooseDirectDNS(physical []string, fallbacks []string, probe func(server string) (time.Duration, bool)) (server string, source string) {
-	if len(physical) > 0 {
-		if best, ok := probeBest(physical, probe); ok {
-			return best, "physical"
+	if len(allServers) == 0 {
+		if len(fallbacks) > 0 {
+			return fallbacks[0], "default"
+		}
+		return "223.5.5.5", "default"
+	}
+
+	type probeItem struct {
+		server  string
+		latency time.Duration
+		ok      bool
+	}
+
+	resCh := make(chan probeItem, len(allServers))
+	for _, srv := range allServers {
+		srv := srv
+		go func() {
+			lat, ok := probe(srv)
+			resCh <- probeItem{server: srv, latency: lat, ok: ok}
+		}()
+	}
+
+	results := make(map[string]directDNSProbeResult, len(allServers))
+	timer := time.NewTimer(totalTimeout)
+	defer timer.Stop()
+
+	remaining := len(allServers)
+	for remaining > 0 {
+		select {
+		case item := <-resCh:
+			results[item.server] = directDNSProbeResult{latency: item.latency, ok: item.ok}
+			remaining--
+		case <-timer.C:
+			remaining = 0
 		}
 	}
-	if len(fallbacks) > 0 {
-		if best, ok := probeBest(fallbacks, probe); ok {
-			return best, "fallback"
+
+	findBestIn := func(list []string) (string, bool) {
+		var bestSrv string
+		var bestLat time.Duration = 1<<63 - 1
+		found := false
+		for _, s := range list {
+			if res, ok := results[s]; ok && res.ok {
+				if !found || res.latency < bestLat {
+					bestLat = res.latency
+					bestSrv = s
+					found = true
+				}
+			}
 		}
+		return bestSrv, found
+	}
+
+	if best, ok := findBestIn(primary); ok {
+		return best, "physical"
+	}
+	if best, ok := findBestIn(secondary); ok {
+		return best, "physical-secondary"
+	}
+	if best, ok := findBestIn(fallbacks); ok {
+		return best, "fallback"
+	}
+	if len(fallbacks) > 0 {
 		return fallbacks[0], "default"
 	}
 	return "223.5.5.5", "default"
@@ -147,9 +193,10 @@ func chooseDirectDNS(physical []string, fallbacks []string, probe func(server st
 func resolveDirectDNSWithConfig(
 	nowFunc func() time.Time,
 	getIfIndex func() uint32,
-	detectDNS func() []string,
+	detectDNS func() (primary, secondary []string),
 	probe func(server string) (time.Duration, bool),
 	fallbacks []string,
+	totalTimeout time.Duration,
 ) (string, string) {
 	now := nowFunc()
 	currentIfIndex := getIfIndex()
@@ -162,20 +209,22 @@ func resolveDirectDNSWithConfig(
 	}
 	directDNSCacheMu.Unlock()
 
-	var physical []string
+	var primary, secondary []string
 	if detectDNS != nil {
-		physical = detectDNS()
+		primary, secondary = detectDNS()
 	}
-	srv, src := chooseDirectDNS(physical, fallbacks, probe)
+	srv, src := chooseDirectDNS(primary, secondary, fallbacks, probe, totalTimeout)
 
-	directDNSCacheMu.Lock()
-	directDNSCache = directDNSCacheEntry{
-		ifIndex:   currentIfIndex,
-		server:    srv,
-		source:    src,
-		expiresAt: now.Add(60 * time.Second),
+	if src != "default" {
+		directDNSCacheMu.Lock()
+		directDNSCache = directDNSCacheEntry{
+			ifIndex:   currentIfIndex,
+			server:    srv,
+			source:    src,
+			expiresAt: now.Add(60 * time.Second),
+		}
+		directDNSCacheMu.Unlock()
 	}
-	directDNSCacheMu.Unlock()
 
 	return srv, src
 }
@@ -187,6 +236,7 @@ func resolveDirectDNS(logger *Logger) (string, string) {
 		detectPhysicalDNSServersFunc,
 		probeDirectUDPDNSFunc,
 		directDNSFallbackCandidates,
+		1200*time.Millisecond,
 	)
 }
 
@@ -196,6 +246,8 @@ func resolveDirectDNSPlan(logger *Logger) autoDNSPlan {
 	switch source {
 	case "physical":
 		sourceDesc = "网卡"
+	case "physical-secondary":
+		sourceDesc = "其他网卡"
 	case "fallback":
 		sourceDesc = "公共候选测速"
 	case "default":

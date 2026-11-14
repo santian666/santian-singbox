@@ -18,7 +18,7 @@ func getDefaultRouteIfIndex() uint32 {
 	return ifIndex
 }
 
-func detectPhysicalDNSServers() []string {
+func detectPhysicalDNSServers() (primary, secondary []string) {
 	bestIfIndex, _, _ := findPhysicalNetworkInterface()
 
 	var tunIfIndex uint32
@@ -29,13 +29,13 @@ func detectPhysicalDNSServers() []string {
 	var size uint32
 	err := windows.GetAdaptersAddresses(windows.AF_INET, windows.GAA_FLAG_INCLUDE_ALL_INTERFACES, 0, nil, &size)
 	if err != windows.ERROR_BUFFER_OVERFLOW || size == 0 {
-		return nil
+		return nil, nil
 	}
 
 	buffer := make([]byte, size)
 	first := (*windows.IpAdapterAddresses)(unsafe.Pointer(&buffer[0]))
 	if err := windows.GetAdaptersAddresses(windows.AF_INET, windows.GAA_FLAG_INCLUDE_ALL_INTERFACES, 0, first, &size); err != nil {
-		return nil
+		return nil, nil
 	}
 
 	var primaryDNS []string
@@ -74,8 +74,7 @@ func detectPhysicalDNSServers() []string {
 		}
 	}
 
-	allDNS := append(primaryDNS, secondaryDNS...)
-	return filterDirectDNSServers(allDNS)
+	return filterDirectDNSServers(primaryDNS), filterDirectDNSServers(secondaryDNS)
 }
 
 func newDirectPhysicalUDPDialerForTarget(targetIP net.IP, timeout time.Duration) *net.Dialer {

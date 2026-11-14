@@ -12,8 +12,8 @@ func getDefaultRouteIfIndex() uint32 {
 	return 0
 }
 
-func detectPhysicalDNSServers() []string {
-	return nil
+func detectPhysicalDNSServers() (primary, secondary []string) {
+	return nil, nil
 }
 
 func probeDirectUDPDNS(server string) (time.Duration, bool) {
