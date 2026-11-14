@@ -111,8 +111,9 @@ type dnsProbeCandidate struct {
 }
 
 type autoDNSPlan struct {
-	Direct dnsProbeCandidate
-	Remote dnsProbeCandidate
+	Direct       dnsProbeCandidate
+	Remote       dnsProbeCandidate
+	DirectSource string
 }
 
 var rulePresetDefs = map[string][]ruleSetDef{
@@ -250,6 +251,7 @@ type SingBoxManager struct {
 	lastLocalCloseLogAt    time.Time
 	missingFakeIPLogCount  int
 	lastMissingFakeIPLogAt time.Time
+	runningDirectDNS       string
 }
 
 type TrafficSnapshot struct {
@@ -290,6 +292,15 @@ func (m *SingBoxManager) Running() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.cmd != nil && m.cmd.Process != nil
+}
+
+func (m *SingBoxManager) RunningDirectDNS() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.runningDirectDNS
 }
 
 func (m *SingBoxManager) CurrentPID() int {
@@ -1143,6 +1154,7 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 	}
 	m.tunActive = effectiveTun(state.Settings)
 	m.runtimeOutboundTags = runtimeOutboundTagSet(state.Nodes)
+	m.runningDirectDNS = dnsPlan.Direct.Server
 	m.logger.Info("sing-box 已启动，本地混合代理端口：%d", state.Settings.MixedPort)
 	return nil
 }
@@ -1247,6 +1259,7 @@ func (m *SingBoxManager) stopLocked(disableSystemProxy bool, cleanupTun bool, wa
 	m.proxyMapPortCount = 0
 	m.runtimeOutboundTags = nil
 	m.tunActive = false
+	m.runningDirectDNS = ""
 	if m.cancel != nil {
 		defer close(m.cancel)
 		m.cancel = nil
@@ -3218,17 +3231,24 @@ func validateProxyMapPorts(settings Settings, nodeCount int) error {
 
 func defaultAutoDNSPlan() autoDNSPlan {
 	return autoDNSPlan{
-		Direct: dnsProbeCandidate{Type: "udp", Server: directDNSFallbackCandidates[0]},
-		Remote: remoteDNSCandidates[0],
+		Direct:       dnsProbeCandidate{Type: "udp", Server: directDNSFallbackCandidates[0]},
+		Remote:       remoteDNSCandidates[0],
+		DirectSource: "default",
 	}
 }
 
 func normalizeAutoDNSPlan(plan autoDNSPlan) autoDNSPlan {
 	if plan.Direct.Type == "" || plan.Direct.Server == "" {
 		plan.Direct = dnsProbeCandidate{Type: "udp", Server: directDNSFallbackCandidates[0]}
+		if plan.DirectSource == "" {
+			plan.DirectSource = "default"
+		}
 	}
 	if plan.Remote.Type == "" || plan.Remote.Server == "" {
 		plan.Remote = remoteDNSCandidates[0]
+	}
+	if plan.DirectSource == "" {
+		plan.DirectSource = "default"
 	}
 	return plan
 }

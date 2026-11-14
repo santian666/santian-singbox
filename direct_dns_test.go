@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path/filepath"
 	"reflect"
 	"sync/atomic"
 	"testing"
@@ -276,5 +277,354 @@ func TestChooseDirectDNSTimeoutEnforced(t *testing.T) {
 	// primary 卡住未在 100ms 内返回，结果应落入 fallback
 	if srv != "223.5.5.5" || src != "fallback" {
 		t.Fatalf("超时后未及时返回的 primary 应被放弃并降级到 fallback，实际: %s, %s", srv, src)
+	}
+}
+
+// 6. T03-3 决策函数单测
+func TestDecideDirectDNSAction(t *testing.T) {
+	// 6.1 runningReachable == true → Keep (即使有新解析的更优物理网卡 DNS，也绝不重启)
+	if act := decideDirectDNSAction("192.168.1.1", true, "10.0.0.1", "physical"); act != directDNSKeep {
+		t.Fatalf("runningReachable 为 true 时必须为 Keep，实际: %v", act)
+	}
+
+	// 6.2 resolvedSource == "default" → Keep (断网时不重启)
+	if act := decideDirectDNSAction("192.168.1.1", false, "223.5.5.5", "default"); act != directDNSKeep {
+		t.Fatalf("resolvedSource 为 default 时必须为 Keep，实际: %v", act)
+	}
+
+	// 6.3 resolved == running → Keep (解析相同不重启)
+	if act := decideDirectDNSAction("192.168.1.1", false, "192.168.1.1", "physical"); act != directDNSKeep {
+		t.Fatalf("resolved 与 running 相同时必须为 Keep，实际: %v", act)
+	}
+
+	// 6.4 running 不可用且 source 为 physical → Restart
+	if act := decideDirectDNSAction("192.168.1.1", false, "10.0.0.1", "physical"); act != directDNSRestart {
+		t.Fatalf("running 不可用且 source 为 physical 时必须为 Restart，实际: %v", act)
+	}
+
+	// 6.5 running 不可用且 source 为 physical-secondary → Restart
+	if act := decideDirectDNSAction("192.168.1.1", false, "10.0.0.2", "physical-secondary"); act != directDNSRestart {
+		t.Fatalf("running 不可用且 source 为 physical-secondary 时必须为 Restart，实际: %v", act)
+	}
+
+	// 6.6 running 不可用且 source 为 fallback → Restart
+	if act := decideDirectDNSAction("192.168.1.1", false, "119.29.29.29", "fallback"); act != directDNSRestart {
+		t.Fatalf("running 不可用且 source 为 fallback 时必须为 Restart，实际: %v", act)
+	}
+
+	// 6.7 running 为空且 resolved 可用 → Restart
+	if act := decideDirectDNSAction("", false, "192.168.1.1", "physical"); act != directDNSRestart {
+		t.Fatalf("running 为空且 resolved 可用时必须为 Restart，实际: %v", act)
+	}
+}
+
+// 7. T03-2 指纹比较单测
+func TestNetworkFingerprintComparison(t *testing.T) {
+	fpBase := networkFingerprint{
+		IfIndex: 12,
+		LocalIP: "192.168.1.100",
+		DNS:     "192.168.1.1,192.168.1.2",
+	}
+
+	// 完全相同
+	fpSame := networkFingerprint{
+		IfIndex: 12,
+		LocalIP: "192.168.1.100",
+		DNS:     "192.168.1.1,192.168.1.2",
+	}
+	if !fpBase.Equal(fpSame) || fpBase != fpSame {
+		t.Fatal("完全相同的指纹判定为变化")
+	}
+
+	// IfIndex 改变
+	fpDiffIfIndex := fpBase
+	fpDiffIfIndex.IfIndex = 15
+	if fpBase.Equal(fpDiffIfIndex) || fpBase == fpDiffIfIndex {
+		t.Fatal("IfIndex 改变应判定为变化")
+	}
+
+	// LocalIP 改变
+	fpDiffIP := fpBase
+	fpDiffIP.LocalIP = "192.168.1.101"
+	if fpBase.Equal(fpDiffIP) || fpBase == fpDiffIP {
+		t.Fatal("LocalIP 改变应判定为变化")
+	}
+
+	// DNS 改变
+	fpDiffDNS := fpBase
+	fpDiffDNS.DNS = "192.168.1.1,8.8.8.8"
+	if fpBase.Equal(fpDiffDNS) || fpBase == fpDiffDNS {
+		t.Fatal("DNS 改变应判定为变化")
+	}
+}
+
+// 8. T03-2 缓存清空单测
+func TestInvalidateDirectDNSCache(t *testing.T) {
+	now := time.Now()
+	directDNSCacheMu.Lock()
+	directDNSCache = directDNSCacheEntry{
+		ifIndex:   10,
+		server:    "192.168.1.1",
+		source:    "physical",
+		expiresAt: now.Add(60 * time.Second),
+	}
+	directDNSCacheMu.Unlock()
+
+	invalidateDirectDNSCache()
+
+	directDNSCacheMu.Lock()
+	clearedServer := directDNSCache.server
+	directDNSCacheMu.Unlock()
+
+	if clearedServer != "" {
+		t.Fatalf("invalidateDirectDNSCache 后缓存 server 应为空，实际: %s", clearedServer)
+	}
+}
+
+// 9. T03-4 健康检查接入逻辑单测
+func TestDirectDNSHealthCheckerScenarios(t *testing.T) {
+	baseTime := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
+
+	// 9.1 指纹从 A 变为 B，resolve 返回新地址 → restart 被调用 1 次
+	t.Run("FingerprintChangedRestartsOnce", func(t *testing.T) {
+		fpA := networkFingerprint{IfIndex: 10, LocalIP: "192.168.1.10", DNS: "192.168.1.1"}
+		fpB := networkFingerprint{IfIndex: 20, LocalIP: "10.0.0.10", DNS: "10.0.0.1"}
+
+		currentFP := fpA
+		var restartCount int32
+		var sleptDuration time.Duration
+
+		checker := &directDNSHealthChecker{
+			getFingerprint: func() networkFingerprint { return currentFP },
+			probeDNS: func(server string) (time.Duration, bool) {
+				if server == "192.168.1.1" {
+					return 0, false
+				}
+				return 10 * time.Millisecond, true
+			},
+			resolvePlan: func() (string, string) {
+				return "10.0.0.1", "physical"
+			},
+			restart: func() error {
+				atomic.AddInt32(&restartCount, 1)
+				return nil
+			},
+			runningDNS: func() string { return "192.168.1.1" },
+			now:        func() time.Time { return baseTime },
+			sleep: func(d time.Duration) {
+				sleptDuration = d
+			},
+		}
+
+		// 第一次执行：只记录指纹，不动作
+		restarted := checker.CheckHealth()
+		if restarted || atomic.LoadInt32(&restartCount) != 0 {
+			t.Fatalf("第一次记录指纹不应重启，实际: restarted=%v, count=%d", restarted, restartCount)
+		}
+
+		// 网络切换为 B
+		currentFP = fpB
+		restarted = checker.CheckHealth()
+		if !restarted || atomic.LoadInt32(&restartCount) != 1 {
+			t.Fatalf("指纹从 A 变 B 且 resolve 新地址时应重启 1 次，实际: restarted=%v, count=%d", restarted, restartCount)
+		}
+		if sleptDuration != 3*time.Second {
+			t.Fatalf("指纹变化后应等待 3 秒稳定，实际: %v", sleptDuration)
+		}
+	})
+
+	// 9.2 指纹不变，探测连续失败 1 次 → 不 resolve；连续失败 2 次 → resolve
+	t.Run("ProbeFailuresTriggerResolve", func(t *testing.T) {
+		fp := networkFingerprint{IfIndex: 10, LocalIP: "192.168.1.10", DNS: "192.168.1.1"}
+		var resolveCount int32
+		var restartCount int32
+
+		checker := &directDNSHealthChecker{
+			checkCycleInterval: 1,
+			getFingerprint:     func() networkFingerprint { return fp },
+			probeDNS: func(server string) (time.Duration, bool) {
+				return 0, false
+			},
+			resolvePlan: func() (string, string) {
+				atomic.AddInt32(&resolveCount, 1)
+				return "119.29.29.29", "fallback"
+			},
+			restart: func() error {
+				atomic.AddInt32(&restartCount, 1)
+				return nil
+			},
+			runningDNS: func() string { return "192.168.1.1" },
+			now:        func() time.Time { return baseTime },
+		}
+
+		checker.CheckHealth()
+		if atomic.LoadInt32(&resolveCount) != 0 {
+			t.Fatalf("连续失败 1 次不应触发 resolve，实际 resolveCount=%d", resolveCount)
+		}
+
+		checker.CheckHealth()
+		if atomic.LoadInt32(&resolveCount) != 1 {
+			t.Fatalf("连续失败 2 次必须触发 resolve，实际 resolveCount=%d", resolveCount)
+		}
+		if atomic.LoadInt32(&restartCount) != 1 {
+			t.Fatalf("resolve 返回有效 fallback 应重启 1 次，实际 restartCount=%d", restartCount)
+		}
+	})
+
+	// 9.3 resolve 返回 default → 不 restart
+	t.Run("ResolveDefaultDoesNotRestart", func(t *testing.T) {
+		fpA := networkFingerprint{IfIndex: 10, LocalIP: "192.168.1.10", DNS: "192.168.1.1"}
+		fpB := networkFingerprint{IfIndex: 20, LocalIP: "10.0.0.10", DNS: "10.0.0.1"}
+
+		currentFP := fpA
+		var restartCount int32
+
+		checker := &directDNSHealthChecker{
+			getFingerprint: func() networkFingerprint { return currentFP },
+			probeDNS: func(server string) (time.Duration, bool) {
+				return 0, false
+			},
+			resolvePlan: func() (string, string) {
+				return "223.5.5.5", "default"
+			},
+			restart: func() error {
+				atomic.AddInt32(&restartCount, 1)
+				return nil
+			},
+			runningDNS: func() string { return "192.168.1.1" },
+			now:        func() time.Time { return baseTime },
+		}
+
+		checker.CheckHealth()
+		currentFP = fpB
+		restarted := checker.CheckHealth()
+		if restarted || atomic.LoadInt32(&restartCount) != 0 {
+			t.Fatalf("resolve 返回 default 时断网，绝不应重启内核，实际: restarted=%v, restartCount=%d", restarted, restartCount)
+		}
+	})
+
+	// 9.4 距离上次重启不足 20 秒 → 不 restart
+	t.Run("ThrottledUnder20Seconds", func(t *testing.T) {
+		fpA := networkFingerprint{IfIndex: 10, LocalIP: "192.168.1.10", DNS: "192.168.1.1"}
+		fpB := networkFingerprint{IfIndex: 20, LocalIP: "10.0.0.10", DNS: "10.0.0.1"}
+
+		currentFP := fpA
+		var restartCount int32
+		lastRestart := baseTime.Add(-10 * time.Second)
+
+		checker := &directDNSHealthChecker{
+			getFingerprint: func() networkFingerprint { return currentFP },
+			probeDNS: func(server string) (time.Duration, bool) {
+				return 0, false
+			},
+			resolvePlan: func() (string, string) {
+				return "10.0.0.1", "physical"
+			},
+			restart: func() error {
+				atomic.AddInt32(&restartCount, 1)
+				return nil
+			},
+			runningDNS:     func() string { return "192.168.1.1" },
+			now:            func() time.Time { return baseTime },
+			getLastRestart: func() time.Time { return lastRestart },
+		}
+
+		checker.CheckHealth()
+		currentFP = fpB
+		restarted := checker.CheckHealth()
+		if restarted || atomic.LoadInt32(&restartCount) != 0 {
+			t.Fatalf("距离上次重启不足 20 秒时不应重启，实际: restarted=%v, restartCount=%d", restarted, restartCount)
+		}
+	})
+
+	// 9.5 唤醒后的第一次检查 → 即使指纹未变也会 resolve
+	t.Run("ResumeForcesResolveEvenIfFingerprintUnchanged", func(t *testing.T) {
+		fp := networkFingerprint{IfIndex: 10, LocalIP: "192.168.1.10", DNS: "192.168.1.1"}
+		var resolveCount int32
+
+		checker := &directDNSHealthChecker{
+			checkCycleInterval: 3,
+			getFingerprint:     func() networkFingerprint { return fp },
+			probeDNS: func(server string) (time.Duration, bool) {
+				return 10 * time.Millisecond, true
+			},
+			resolvePlan: func() (string, string) {
+				atomic.AddInt32(&resolveCount, 1)
+				return "192.168.1.1", "physical"
+			},
+			runningDNS: func() string { return "192.168.1.1" },
+			now:        func() time.Time { return baseTime },
+		}
+
+		checker.CheckHealth()
+		if atomic.LoadInt32(&resolveCount) != 0 {
+			t.Fatalf("初始指纹不应触发 resolve，实际: %d", resolveCount)
+		}
+
+		checker.SetForceReselect()
+
+		checker.CheckHealth()
+		if atomic.LoadInt32(&resolveCount) != 1 {
+			t.Fatalf("唤醒后第一次检查即使指纹未变，也必须触发 resolve，实际 resolveCount=%d", resolveCount)
+		}
+	})
+
+	// 9.6 同一未重启原因 5 分钟内只记一次
+	t.Run("NoRestartLoggingThrottled5Minutes", func(t *testing.T) {
+		var loggedReasons []string
+		currTime := baseTime
+
+		checker := &directDNSHealthChecker{
+			now: func() time.Time { return currTime },
+			logInfo: func(format string, args ...any) {
+				loggedReasons = append(loggedReasons, format)
+			},
+		}
+
+		reason := "网络可能未连通，暂不切换"
+		checker.logNoRestartThrottled(reason, currTime)
+		if len(loggedReasons) != 1 {
+			t.Fatalf("第一次应记录日志，实际条数: %d", len(loggedReasons))
+		}
+
+		currTime = currTime.Add(1 * time.Minute)
+		checker.logNoRestartThrottled(reason, currTime)
+		if len(loggedReasons) != 1 {
+			t.Fatalf("5 分钟内相同原因不应重复记录，实际条数: %d", len(loggedReasons))
+		}
+
+		currTime = currTime.Add(5 * time.Minute)
+		checker.logNoRestartThrottled(reason, currTime)
+		if len(loggedReasons) != 2 {
+			t.Fatalf("5 分钟后应允许记录相同原因，实际条数: %d", len(loggedReasons))
+		}
+	})
+}
+
+// 10. T03-1 / Section 3-4 RunningDirectDNS() 测试
+func TestSingBoxManagerRunningDirectDNS(t *testing.T) {
+	manager := NewSingBoxManager(t.TempDir(), "sing-box.exe", "sing-box.json", filepath.Join(t.TempDir(), "cache.db"), nil)
+
+	// 初始状态为空
+	if got := manager.RunningDirectDNS(); got != "" {
+		t.Fatalf("初始 RunningDirectDNS 必须为空，实际: %s", got)
+	}
+
+	// 模拟启动成功赋值
+	manager.mu.Lock()
+	manager.runningDirectDNS = "192.168.1.1"
+	manager.mu.Unlock()
+
+	if got := manager.RunningDirectDNS(); got != "192.168.1.1" {
+		t.Fatalf("启动后 RunningDirectDNS 必须返回本次使用的 plan，实际: %s", got)
+	}
+
+	// 模拟停止清空
+	manager.mu.Lock()
+	manager.stopLocked(false, false, false)
+	manager.mu.Unlock()
+
+	if got := manager.RunningDirectDNS(); got != "" {
+		t.Fatalf("停止后 RunningDirectDNS 必须清空为空字符串，实际: %s", got)
 	}
 }

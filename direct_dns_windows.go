@@ -118,3 +118,20 @@ func probeDirectUDPDNS(server string) (time.Duration, bool) {
 	}
 	return time.Since(start), true
 }
+
+func currentNetworkFingerprint() networkFingerprint {
+	ifIndex, localIP, _ := findPhysicalNetworkInterface()
+	localIPStr := ""
+	if localIP != nil {
+		localIPStr = localIP.String()
+	}
+	primary, secondary := detectPhysicalDNSServers()
+	var allDNS []string
+	allDNS = append(allDNS, primary...)
+	allDNS = append(allDNS, secondary...)
+	return networkFingerprint{
+		IfIndex: ifIndex,
+		LocalIP: localIPStr,
+		DNS:     strings.Join(allDNS, ","),
+	}
+}

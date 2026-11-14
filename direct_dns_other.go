@@ -33,3 +33,7 @@ func probeDirectUDPDNS(server string) (time.Duration, bool) {
 	}
 	return time.Since(start), true
 }
+
+func currentNetworkFingerprint() networkFingerprint {
+	return networkFingerprint{}
+}
