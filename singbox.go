@@ -440,6 +440,9 @@ func (m *SingBoxManager) SelectOutboundVerified(tag string) error {
 		return errors.New("节点出站标识为空")
 	}
 	fastErr := m.selectOutbound(tag, true)
+	if fastErr == nil && outboundSelectionMatches(tag, m.currentOutbound, 0, true) {
+		return nil
+	}
 	if outboundSelectionMatches(tag, m.currentOutbound, 80*time.Millisecond, true) {
 		return nil
 	}
@@ -637,6 +640,12 @@ func doClashAPIBytesFast(req *http.Request) ([]byte, error) {
 	return doClashAPIBytesWithRetry(req, 1200*time.Millisecond, 500*time.Millisecond, 60*time.Millisecond)
 }
 
+var clashAPIHTTPTransport = &http.Transport{
+	MaxIdleConns:        16,
+	MaxIdleConnsPerHost: 8,
+	IdleConnTimeout:     30 * time.Second,
+}
+
 func doClashAPIOnce(req *http.Request, timeout time.Duration) error {
 	_, err := doClashAPIBytesOnce(req, timeout)
 	return err
@@ -654,7 +663,7 @@ func doClashAPIBytesOnce(req *http.Request, timeout time.Duration) ([]byte, erro
 		}
 		tryReq.Body = body
 	}
-	resp, err := (&http.Client{Timeout: timeout}).Do(tryReq)
+	resp, err := (&http.Client{Transport: clashAPIHTTPTransport, Timeout: timeout}).Do(tryReq)
 	if err != nil {
 		return nil, err
 	}
@@ -2206,7 +2215,7 @@ func routeRuleLabel(rule map[string]interface{}) string {
 }
 
 func (m *SingBoxManager) fetchTrafficTotal() (TrafficSnapshot, error) {
-	client := http.Client{Timeout: 1200 * time.Millisecond}
+	client := http.Client{Transport: clashAPIHTTPTransport, Timeout: 1200 * time.Millisecond}
 	req, err := http.NewRequest(http.MethodGet, "http://"+clashAPIAddress+"/connections", nil)
 	if err != nil {
 		return TrafficSnapshot{}, err

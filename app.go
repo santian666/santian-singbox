@@ -823,6 +823,21 @@ func (a *App) recordTrafficDelta(selectedID string, selectedGroupID string, traf
 	return uploadDelta, downloadDelta
 }
 
+func (a *App) recordTrafficInMemory() (TrafficSnapshot, bool) {
+	if a.store == nil || a.manager == nil || !a.manager.Running() {
+		return TrafficSnapshot{}, false
+	}
+	traffic, err := a.manager.TrafficSnapshot()
+	if err != nil {
+		return TrafficSnapshot{}, false
+	}
+	selectedID, selectedGroupID := a.store.TrafficTarget()
+	if selectedID != "" {
+		a.recordTrafficDelta(selectedID, selectedGroupID, traffic)
+	}
+	return traffic, true
+}
+
 func (a *App) persistTraffic() {
 	if a.store == nil {
 		return
@@ -1509,8 +1524,10 @@ func (a *App) selectNodeLocked(id string) error {
 		return errors.New("所选节点缺少出站标识")
 	}
 
-	a.persistTraffic()
+	trafficSnap, hasTraffic := a.recordTrafficInMemory()
+	reloaded := false
 	if !a.manager.RuntimeHasOutbound(selectedTag) {
+		reloaded = true
 		if err := a.reloadRuntimeForSelectedNode(state, id, selectedTag); err != nil {
 			a.logger.Error("节点切换失败，继续使用原节点：%v", err)
 			return err
@@ -1526,7 +1543,18 @@ func (a *App) selectNodeLocked(id string) error {
 	}
 	a.resetTrafficTracking()
 	state = a.store.Snapshot()
-	a.initTrafficBaseline(id, state.Nodes)
+	if !reloaded && hasTraffic {
+		a.initTrafficBaselineWithSnapshot(id, state.Nodes, trafficSnap)
+	} else {
+		a.initTrafficBaseline(id, state.Nodes)
+	}
+	if a.store != nil {
+		safeGo(a.logger, "保存流量统计", func() {
+			if err := a.store.FlushTraffic(); err != nil && a.logger != nil {
+				a.logger.Error("保存流量统计失败：%v", err)
+			}
+		})
+	}
 	a.setCircuitBreakerActive(false, "")
 	a.logger.Info("节点切换已确认：%s", selectedNodeLogName(state.Nodes, id))
 	a.emitState()
@@ -4204,6 +4232,14 @@ func (a *App) initTrafficBaseline(selectedID string, nodes []Node) {
 	}
 	traffic, err := a.manager.TrafficSnapshot()
 	if err != nil {
+		a.resetTrafficTracking()
+		return
+	}
+	a.initTrafficBaselineWithSnapshot(selectedID, nodes, traffic)
+}
+
+func (a *App) initTrafficBaselineWithSnapshot(selectedID string, nodes []Node, traffic TrafficSnapshot) {
+	if selectedID == "" {
 		a.resetTrafficTracking()
 		return
 	}
