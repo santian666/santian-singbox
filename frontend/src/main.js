@@ -1,5 +1,6 @@
 import "./style.css";
 import "./app.css";
+import "./tech-theme.css";
 import "./local-speedtest.js";
 var ln = (e, t) => () => (t || e((t = { exports: {} }).exports, t), t.exports);
 var ia = ln((an, sn) => {
