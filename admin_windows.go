@@ -15,6 +15,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
 
 var (
@@ -159,12 +160,124 @@ exit /b %%ERRORLEVEL%%
 	return script, nil
 }
 
+var tunLegacyAdapterNames = []string{"SanTianTun", "GoSingBoxTun"}
+
+func isSingTunPnPDeviceMatch(friendlyName, deviceDesc string) bool {
+	combined := strings.ToLower(strings.TrimSpace(friendlyName + " " + deviceDesc))
+	if combined == "" {
+		return false
+	}
+	return strings.Contains(combined, "sing-tun") ||
+		strings.Contains(combined, "santian") ||
+		strings.Contains(combined, "gosingbox")
+}
+
+func hasOrphanedSingTunPnPDevice() bool {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Enum\SWD\Wintun`, registry.ENUMERATE_SUB_KEYS|registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer k.Close()
+	subkeys, err := k.ReadSubKeyNames(-1)
+	if err != nil {
+		return false
+	}
+	for _, id := range subkeys {
+		sub, err := registry.OpenKey(k, id, registry.QUERY_VALUE)
+		if err != nil {
+			continue
+		}
+		fn, _, _ := sub.GetStringValue("FriendlyName")
+		dd, _, _ := sub.GetStringValue("DeviceDesc")
+		_ = sub.Close()
+		if isSingTunPnPDeviceMatch(fn, dd) {
+			return true
+		}
+	}
+	return false
+}
+
+func removeOrphanedSingTunPnPDevices(logger *Logger) []string {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SYSTEM\CurrentControlSet\Enum\SWD\Wintun`, registry.ENUMERATE_SUB_KEYS|registry.QUERY_VALUE)
+	if err != nil {
+		return nil
+	}
+	defer k.Close()
+	subkeys, err := k.ReadSubKeyNames(-1)
+	if err != nil {
+		return nil
+	}
+	var removed []string
+	for _, id := range subkeys {
+		sub, err := registry.OpenKey(k, id, registry.QUERY_VALUE)
+		if err != nil {
+			continue
+		}
+		fn, _, _ := sub.GetStringValue("FriendlyName")
+		dd, _, _ := sub.GetStringValue("DeviceDesc")
+		_ = sub.Close()
+		if !isSingTunPnPDeviceMatch(fn, dd) {
+			continue
+		}
+		instanceID := `SWD\Wintun\` + id
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cmd := exec.CommandContext(ctx, "pnputil.exe", "/remove-device", instanceID)
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		out, rmErr := cmd.CombinedOutput()
+		cancel()
+		if rmErr != nil {
+			if logger != nil {
+				logger.Error("移除残留 PnP 虚拟网卡 (%s) 失败：%v %s", instanceID, rmErr, strings.TrimSpace(string(out)))
+			}
+			continue
+		}
+		removed = append(removed, "PNP:"+instanceID)
+	}
+	return removed
+}
+
+func waitWindowsAdapterGone(name string, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if adapter, err := findWindowsAdapter(name); err == nil && adapter == nil {
+			return
+		}
+		time.Sleep(60 * time.Millisecond)
+	}
+}
+
+func hasAnyTunAdapterResidual() bool {
+	if adapter, err := findWindowsAdapter(tunInterfaceName); err == nil && adapter != nil {
+		return true
+	}
+	for _, legacy := range tunLegacyAdapterNames {
+		if adapter, err := findWindowsAdapter(legacy); err == nil && adapter != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func ensureCleanTunBeforeStart(logger *Logger) {
+	if !hasAnyTunAdapterResidual() && !hasOrphanedSingTunPnPDevice() {
+		return
+	}
+	if logger != nil {
+		logger.Info("检测到残留 TUN 虚拟网卡设备，启动前正在彻底移除...")
+	}
+	cleanupTunInterface(logger)
+}
+
 func cleanupTunInterface(logger *Logger) {
 	_ = cleanupTunInterfaceWithSummary(logger)
 }
 
 func cleanupTunInterfaceWithSummary(logger *Logger) string {
-	script := `
+	pnpItems := removeOrphanedSingTunPnPDevices(logger)
+	var outputs []string
+	outputs = append(outputs, pnpItems...)
+	if hasAnyTunAdapterResidual() {
+		script := `
 $name=$env:GO_SINGBOX_TUN_NAME
 $oldName="SanTianTun"
 $legacyName="GoSingBoxTun"
@@ -179,7 +292,13 @@ foreach($adapter in $adapters){
     Get-NetRoute -InterfaceIndex $adapter.ifIndex -PolicyStore PersistentStore -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
     Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -ResetServerAddresses -ErrorAction SilentlyContinue | Out-Null
     Set-DnsClientServerAddress -InterfaceIndex $adapter.ifIndex -AddressFamily IPv6 -ResetServerAddresses -ErrorAction SilentlyContinue | Out-Null
-    Disable-NetAdapter -Name $adapter.Name -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+    if ($adapter.PnPDeviceID) {
+      & pnputil.exe /remove-device "$($adapter.PnPDeviceID)" 2>&1 | Out-Null
+    }
+    $still = Get-NetAdapter -Name $adapter.Name -IncludeHidden -ErrorAction SilentlyContinue
+    if ($still -and $still.Status -eq "Disabled") {
+      Enable-NetAdapter -Name $adapter.Name -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+    }
     Write-Output ("ADAPTER:" + $adapter.Name)
   } catch {
     Write-Output ("ERR:" + $_.Exception.Message)
@@ -187,16 +306,20 @@ foreach($adapter in $adapters){
 }
 Clear-DnsClientCache -ErrorAction SilentlyContinue | Out-Null
 `
-	out, err := runCommandOutputWithEnv(map[string]string{"GO_SINGBOX_TUN_NAME": tunInterfaceName}, "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script)
-	out = strings.TrimSpace(out)
-	if err != nil {
-		if out != "" && logger != nil {
-			logger.Error("清理 TUN 网卡失败：%s", out)
+		out, err := runCommandOutputWithEnv(map[string]string{"GO_SINGBOX_TUN_NAME": tunInterfaceName}, "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script)
+		out = strings.TrimSpace(out)
+		if err != nil {
+			if out != "" && logger != nil {
+				logger.Error("清理 TUN 网卡失败：%s", out)
+			}
+		} else if out != "" {
+			outputs = append(outputs, strings.Fields(out)...)
 		}
-		return ""
 	}
-	summary := cleanupTunSummary(out)
-	if out != "" && logger != nil {
+	waitWindowsAdapterGone(tunInterfaceName, 1500*time.Millisecond)
+	combinedOut := strings.TrimSpace(strings.Join(outputs, " "))
+	summary := cleanupTunSummary(combinedOut)
+	if summary != "" && logger != nil {
 		logger.Info("已清理 TUN 残留：%s", summary)
 	}
 	return summary
@@ -222,15 +345,49 @@ func cleanupTunSummary(out string) string {
 }
 
 func waitTunReady(timeout time.Duration) error {
+	return waitTunReadyOrProcessExit(timeout, nil)
+}
+
+func waitTunReadyOrProcessExit(timeout time.Duration, done <-chan error) error {
 	deadline := time.Now().Add(timeout)
 	var last string
 	for time.Now().Before(deadline) {
+		if done != nil {
+			select {
+			case err, ok := <-done:
+				if !ok || err == nil {
+					return errors.New("sing-box 启动后已退出")
+				}
+				return fmt.Errorf("sing-box 启动后已退出：%w", err)
+			default:
+			}
+		}
 		code, ok := tunReadyState()
 		if ok {
 			return nil
 		}
 		last = code
-		time.Sleep(tunReadyPollInterval(time.Until(deadline)))
+		wait := tunReadyPollInterval(time.Until(deadline))
+		if rem := time.Until(deadline); rem < wait {
+			wait = rem
+		}
+		if wait <= 0 {
+			break
+		}
+		if done != nil {
+			timer := time.NewTimer(wait)
+			select {
+			case err, ok := <-done:
+				timer.Stop()
+				if !ok || err == nil {
+					return errors.New("sing-box 启动后已退出")
+				}
+				return fmt.Errorf("sing-box 启动后已退出：%w", err)
+			case <-timer.C:
+			}
+		} else {
+			time.Sleep(wait)
+		}
 	}
 	return fmt.Errorf(tunReadyMessage(last))
 }

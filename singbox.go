@@ -1020,6 +1020,19 @@ var resolveDirectDNSPlanFunc = resolveDirectDNSPlan
 func (m *SingBoxManager) Start(state PersistState) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.startWithTunRetryLocked(state)
+}
+
+func (m *SingBoxManager) startWithTunRetryLocked(state PersistState) error {
+	err := m.startLocked(state)
+	if err == nil || !effectiveTun(state.Settings) || runtime.GOOS != "windows" {
+		return err
+	}
+	if m.logger != nil {
+		m.logger.Info("TUN 首次启动未就绪，正在彻底清理残留虚拟网卡并自动重试一次：%v", err)
+	}
+	cleanupTunInterface(m.logger)
+	time.Sleep(600 * time.Millisecond)
 	return m.startLocked(state)
 }
 
@@ -1097,6 +1110,9 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 	if !isTCPPortFree("127.0.0.1", clashAPIPort) {
 		return fmt.Errorf("内核控制端口 %d 已被占用，请停止残留 sing-box 后重试", clashAPIPort)
 	}
+	if effectiveTun(state.Settings) && runtime.GOOS == "windows" {
+		ensureCleanTunBeforeStart(m.logger)
+	}
 
 	cmd := exec.Command(m.corePath, "run", "-c", m.config)
 	cmd.Dir = m.rootDir
@@ -1136,8 +1152,11 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 		return fmt.Errorf("sing-box 未能监听本地代理端口 %d，请检查端口是否被占用、节点配置是否可用或内核初始化是否超时：%w", state.Settings.MixedPort, err)
 	}
 	if effectiveTun(state.Settings) && runtime.GOOS == "windows" {
-		if err := waitTunReady(15 * time.Second); err != nil {
-			_ = m.stopLocked(true, true, true)
+		if err := waitTunReadyOrProcessExit(20*time.Second, done); err != nil {
+			reason := m.stopLocked(true, true, true)
+			if reason != nil {
+				return fmt.Errorf("TUN 未能真实接管系统网络：%v；停止残留进程：%w", err, reason)
+			}
 			return fmt.Errorf("TUN 未能真实接管系统网络：%w", err)
 		}
 		closeStaleFakeIPTCPConnections(m.logger)
@@ -1203,7 +1222,7 @@ func (m *SingBoxManager) Restart(state PersistState, cleanupTun bool) error {
 	}
 	waitTCPPortFree("127.0.0.1", state.Settings.MixedPort, 3*time.Second)
 	waitTCPPortFree("127.0.0.1", clashAPIPort, 3*time.Second)
-	return m.startLocked(state)
+	return m.startWithTunRetryLocked(state)
 }
 
 func (m *SingBoxManager) CleanupStale() error {

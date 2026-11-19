@@ -18,9 +18,14 @@ func restartAsAdmin(_ string) error {
 
 func cleanupTunInterface(logger *Logger) {}
 func cleanupTunInterfaceWithSummary(logger *Logger) string { return "" }
+func ensureCleanTunBeforeStart(_ *Logger) {}
 
 func waitTunReady(timeout time.Duration) error {
 	return nil
+}
+
+func waitTunReadyOrProcessExit(timeout time.Duration, _ <-chan error) error {
+	return waitTunReady(timeout)
 }
 
 func flushWindowsDNSCache(_ *Logger) {}

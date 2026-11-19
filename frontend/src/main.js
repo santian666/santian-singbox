@@ -1497,7 +1497,6 @@ var ia = ln((an, sn) => {
         <span id="runBadge" class="badge">未运行</span>
         <button id="restartProxy" class="status-restart" type="button">重启</button>
         <span id="statusDetail" class="status-detail">代理未启用</span>
-        <button id="themeToggle" class="theme-toggle status-theme-toggle" type="button" title="切换黑色主题">黑色</button>
       </div>
       <div class="top-node-area">
         <div id="trafficMonitor" class="traffic-monitor" title="实时流量：上传 0 B/s / 下载 0 B/s">
@@ -1518,7 +1517,8 @@ var ia = ln((an, sn) => {
           <div class="panel-head">
             <h2>运行设置</h2>
             <div class="version-tools">
-              <span id="coreVersion" class="muted">版本检测中</span>
+              <span id="coreVersion" class="muted hidden">版本检测中</span>
+              <button id="themeToggle" class="theme-toggle panel-theme-toggle" type="button" title="切换黑色主题">黑色</button>
               <button id="updateCore" class="ghost small core-update" type="button" title="检查并更新软件、内核与规则">更新</button>
             </div>
           </div>

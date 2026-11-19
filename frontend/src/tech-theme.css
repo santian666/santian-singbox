@@ -49,7 +49,7 @@ body {
 
 @media (min-width: 901px) {
   .top-bar {
-    grid-template-columns: minmax(390px, 430px) minmax(352px, 1fr) 468px !important;
+    grid-template-columns: minmax(390px, 430px) minmax(300px, 1fr) 468px !important;
     gap: 10px !important;
   }
   .top-menu {
@@ -64,9 +64,9 @@ body {
   }
   .status-summary {
     justify-self: center !important;
-    width: 344px !important;
-    min-width: 344px !important;
-    max-width: 344px !important;
+    width: 292px !important;
+    min-width: 292px !important;
+    max-width: 292px !important;
     height: 34px !important;
     justify-content: space-between !important;
     padding: 0 10px !important;
@@ -132,6 +132,29 @@ body {
     font-size: 12px !important;
     transition: background-color 0.15s ease, border-color 0.15s ease !important;
   }
+}
+
+#coreVersion {
+  display: none !important;
+}
+
+.version-tools {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: flex-end !important;
+  gap: 8px !important;
+}
+
+.version-tools .panel-theme-toggle,
+.version-tools .core-update {
+  min-width: 56px !important;
+  width: auto !important;
+  height: 28px !important;
+  padding: 0 10px !important;
+  border-radius: 8px !important;
+  font-size: 12px !important;
+  font-weight: 500 !important;
+  flex: 0 0 auto !important;
 }
 
 /* ---------- 代理映射设置栏：四列等高均衡科技风排版 ---------- */
