@@ -5,42 +5,46 @@
    - 无重度 backdrop-filter 模糊，确保滚动、点击与页面切换 60fps 零卡顿
    ========================================================================== */
 
-/* 用 Flex 列布局彻底消除固定标题栏与缩放计算导致的上下边距偏移 */
+/* 使用绝对固定的标题栏与独立内容容器，彻底杜绝缩放与 Flex 导致的页头下方异常留白 */
+html,
 body {
-  display: flex !important;
-  flex-direction: column !important;
-  align-items: stretch !important;
-  justify-content: flex-start !important;
-  gap: 0 !important;
-  height: 100vh !important;
+  display: block !important;
+  width: 100% !important;
+  height: 100% !important;
   margin: 0 !important;
   padding: 0 !important;
   overflow: hidden !important;
 }
 
 .window-titlebar {
-  position: relative !important;
-  top: auto !important;
-  left: auto !important;
-  right: auto !important;
-  flex: 0 0 30px !important;
+  position: fixed !important;
+  top: 0 !important;
+  left: 0 !important;
+  right: 0 !important;
   height: 30px !important;
+  z-index: 5000 !important;
 }
 
 #app {
-  flex: 1 1 0 !important;
-  min-height: 0 !important;
-  width: var(--ui-viewport-width) !important;
-  height: calc((100vh - 30px) / var(--ui-scale, 1)) !important;
-  zoom: var(--ui-scale, 1) !important;
+  position: fixed !important;
+  top: 30px !important;
+  left: 0 !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  width: 100% !important;
+  height: calc(100vh - 30px) !important;
+  margin: 0 !important;
+  padding: 6px 12px 10px !important;
+  zoom: 1 !important;
   overflow: hidden !important;
 }
 
 .app-shell {
-  width: calc(100% - 24px) !important;
-  height: calc(100% - 12px) !important;
-  margin: 2px auto 10px !important;
+  width: calc((100vw - 24px) / var(--ui-scale, 1)) !important;
+  height: calc((100vh - 46px) / var(--ui-scale, 1)) !important;
+  margin: 0 !important;
   padding: 0 !important;
+  zoom: var(--ui-scale, 1) !important;
 }
 
 @media (min-width: 901px) {
