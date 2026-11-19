@@ -2849,6 +2849,43 @@ func buildRuleSets(settings Settings, cachePath string) []map[string]interface{}
 	return ruleSets
 }
 
+var aiAntiDetectProxyDomainSuffixes = []string{
+	// Anthropic / Claude 全系及配套校验、遥测域名（避免 IP/DNS 割裂触发代理识别）
+	"anthropic.com",
+	"claude.ai",
+	"claude.com",
+	"clau.de",
+	"claudeusercontent.com",
+	// OpenAI / ChatGPT
+	"openai.com",
+	"chatgpt.com",
+	"oaistatic.com",
+	"oaiusercontent.com",
+	"sora.com",
+	// Google Gemini / AI Studio / DeepMind
+	"gemini.google.com",
+	"generativelanguage.googleapis.com",
+	"aistudio.google.com",
+	"makersuite.google.com",
+	"deepmind.com",
+	"deepmind.google",
+	// 其他主流 AI 工具
+	"x.ai",
+	"grok.com",
+	"perplexity.ai",
+	"cursor.sh",
+	"cursor.com",
+	// 人机校验、风控与支付接口（必须与 AI 主站保持同一出口 IP，防止风控封号）
+	"challenges.cloudflare.com",
+	"turnstile.cloudflare.com",
+	"hcaptcha.com",
+	"arkoselabs.com",
+	"funcaptcha.com",
+	"intercom.io",
+	"intercomcdn.com",
+	"stripe.com",
+}
+
 func buildRouteRules(settings Settings, nodes []Node, includeRemoteRuleSets bool) []map[string]interface{} {
 	rules := []map[string]interface{}{
 		{"action": "sniff"},
@@ -2885,6 +2922,12 @@ func buildRouteRules(settings Settings, nodes []Node, includeRemoteRuleSets bool
 	rules = append(rules,
 		map[string]interface{}{"clash_mode": "global", "action": "route", "outbound": "proxy"},
 		map[string]interface{}{"clash_mode": "direct", "action": "route", "outbound": "direct"},
+		map[string]interface{}{
+			"domain_suffix": append([]string(nil), aiAntiDetectProxyDomainSuffixes...),
+			"clash_mode":    "rule",
+			"action":        "route",
+			"outbound":      "proxy",
+		},
 	)
 	domains, ipCIDRs := parseDirectEntries(settings.DirectDomains)
 	if len(domains) > 0 {
@@ -3086,7 +3129,13 @@ func buildTunStabilityRouteRules() []map[string]interface{} {
 		{
 			"inbound":  []string{"tun-in"},
 			"network":  "udp",
-			"port":     []int{135, 137, 138, 139, 443, 1900, 3478, 3479, 5349, 5353, 19302, 19305},
+			"port":     []int{135, 137, 138, 139, 443, 1900, 3478, 3479, 5349, 5353, 19302, 19303, 19304, 19305, 19306, 19307, 19308, 19309},
+			"action":   "route",
+			"outbound": "block",
+		},
+		{
+			"inbound":  []string{"tun-in"},
+			"protocol": "stun",
 			"action":   "route",
 			"outbound": "block",
 		},
@@ -3397,6 +3446,27 @@ func buildDNSConfig(settings Settings, final string, dnsPlan autoDNSPlan, includ
 			"clash_mode":    "rule",
 			"action":        "route",
 			"server":        "direct-dns",
+		})
+	}
+
+	if settings.FakeDNS {
+		fakeAIRule := map[string]interface{}{
+			"domain_suffix": append([]string(nil), aiAntiDetectProxyDomainSuffixes...),
+			"clash_mode":    "rule",
+			"action":        "route",
+			"server":        "fakeip",
+		}
+		if effectiveTun(settings) {
+			fakeAIRule["inbound"] = []string{"tun-in"}
+		}
+		dnsRules = append(dnsRules, fakeAIRule)
+	}
+	if dnsFinal == "remote" {
+		dnsRules = append(dnsRules, map[string]interface{}{
+			"domain_suffix": append([]string(nil), aiAntiDetectProxyDomainSuffixes...),
+			"clash_mode":    "rule",
+			"action":        "route",
+			"server":        "remote",
 		})
 	}
 
@@ -3876,8 +3946,8 @@ func verifyLocalProxyConnectivityURLs(port int, timeout time.Duration, probeURLs
 	defer cancel()
 	proxyURL := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(port))}
 	dialTimeout := timeout
-	if dialTimeout > 3*time.Second {
-		dialTimeout = 3 * time.Second
+	if dialTimeout > 4*time.Second {
+		dialTimeout = 4 * time.Second
 	}
 	transport := &http.Transport{
 		Proxy:               http.ProxyURL(proxyURL),

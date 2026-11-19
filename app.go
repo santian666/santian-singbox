@@ -54,10 +54,11 @@ type App struct {
 	healthChecking              bool
 	startupReady                bool
 	lastHealthRestart           time.Time
-	lastTunConnectivityCheck    time.Time
-	lastTunConnectivityFailure  time.Time
-	lastTunConnectivityError    string
-	lastAutoFailover            time.Time
+	lastTunConnectivityCheck        time.Time
+	lastTunConnectivityFailure      time.Time
+	lastTunConnectivityError        string
+	tunConnectivityConsecutiveFails int
+	lastAutoFailover                time.Time
 	circuitBreakerMu            sync.Mutex
 	circuitBreakerActive        bool
 	circuitBreakerText          string
@@ -1555,7 +1556,7 @@ func (a *App) selectNodeLocked(id string) error {
 			}
 		})
 	}
-	a.setCircuitBreakerActive(false, "")
+	a.markTunConnectivityHealthy(state.Settings)
 	a.logger.Info("节点切换已确认：%s", selectedNodeLogName(state.Nodes, id))
 	a.emitState()
 	return nil
@@ -2626,20 +2627,7 @@ func (a *App) SaveSettings(settings Settings) (err error) {
 			}
 			a.logger.Info("运行中设置已保存并通过 Clash API 生效：模式=%s，系统代理=%v", settings.Mode, settings.SystemProxy)
 		}
-		if shouldApplyFirewallKillSwitch(settings, a.isCircuitBreakerActive()) {
-			coreExe := ""
-			if a.manager != nil {
-				coreExe = a.manager.corePath
-			}
-			_ = enableKillSwitch(a.root, a.logger, coreExe, "")
-		} else {
-			if effectiveTun(settings) && a.logger != nil {
-				a.logger.Info("TUN 模式已由 strict_route 防泄露，跳过防火墙 Kill Switch")
-			}
-			if !a.isCircuitBreakerActive() {
-				_ = disableKillSwitch(a.root, a.logger)
-			}
-		}
+		_ = disableKillSwitch(a.root, a.logger)
 		a.markTunConnectivityHealthy(settings)
 		a.emitState()
 		return nil
@@ -2789,28 +2777,14 @@ func (a *App) disableTunAfterStartFailure(settings Settings, startErr error) {
 	if !effectiveTun(settings) {
 		return
 	}
-	if settings.CircuitBreaker {
-		a.setCircuitBreakerActive(true, fmt.Sprintf("代理出网异常，智能熔断保持防护：%v", startErr))
-		if a.logger != nil {
-			a.logger.Error("TUN 代理出网异常，已触发智能分流熔断保护：保留代理接管，国内直连正常，阻断海外流量以防直连泄露：%v", startErr)
-		}
-		return
-	}
-	settings.Tun = false
-	settings.SystemProxy = false
-	if err := a.store.UpdateSettings(settings); err != nil {
-		if a.logger != nil {
-			a.logger.Error("TUN 启动失败后保存关闭状态失败：%v", err)
-		}
-		return
-	}
 	a.healthMu.Lock()
 	a.lastTunConnectivityCheck = time.Time{}
 	a.lastTunConnectivityFailure = time.Time{}
 	a.lastTunConnectivityError = ""
+	a.tunConnectivityConsecutiveFails = 0
 	a.healthMu.Unlock()
 	if a.logger != nil {
-		a.logger.Error("TUN 启动失败，已自动关闭 TUN 防止反复中断网络：%v", startErr)
+		a.logger.Error("TUN 代理启动或出网异常，保持当前代理配置不自动回退直连，请切换可用节点：%v", startErr)
 	}
 }
 
@@ -2819,43 +2793,10 @@ func (a *App) setCircuitBreakerActive(active bool, reason string) {
 		return
 	}
 	a.circuitBreakerMu.Lock()
-	changed := a.circuitBreakerActive != active || (active && a.circuitBreakerText != reason)
-	a.circuitBreakerActive = active
-	if active {
-		a.circuitBreakerText = reason
-	} else {
-		a.circuitBreakerText = ""
-	}
+	a.circuitBreakerActive = false
+	a.circuitBreakerText = ""
 	a.circuitBreakerMu.Unlock()
-	if changed {
-		if a.logger != nil {
-			if active {
-				a.logger.Error("【智能分流熔断】已触发安全防护：%s。已激活 Windows 防火墙安全拦截，彻底阻断直连以防真实 IP 泄露。", reason)
-			} else {
-				a.logger.Info("【智能分流熔断】已解除熔断防护，代理链路恢复正常。")
-			}
-		}
-		var settings Settings
-		if a.store != nil {
-			settings = a.store.Snapshot().Settings
-		}
-		if active {
-			if shouldApplyFirewallKillSwitch(settings, true) {
-				coreExe := ""
-				if a.manager != nil {
-					coreExe = a.manager.corePath
-				}
-				_ = enableKillSwitch(a.root, a.logger, coreExe, "")
-			} else if effectiveTun(settings) && a.logger != nil {
-				a.logger.Info("TUN 模式已由 strict_route 防泄露，跳过防火墙 Kill Switch")
-			}
-		} else {
-			if !shouldApplyFirewallKillSwitch(settings, false) {
-				_ = disableKillSwitch(a.root, a.logger)
-			}
-		}
-		a.emitState()
-	}
+	_ = disableKillSwitch(a.root, a.logger)
 }
 
 func (a *App) isCircuitBreakerActive() bool {
@@ -2876,16 +2817,21 @@ func (a *App) circuitBreakerReason() string {
 	return a.circuitBreakerText
 }
 
+const tunConnectivityFailThreshold = 3
+
 func (a *App) verifyTunConnectivityIfDue(port int) error {
 	now := time.Now()
+	cbActive := a.isCircuitBreakerActive()
 	a.healthMu.Lock()
-	if !a.lastTunConnectivityFailure.IsZero() && now.Sub(a.lastTunConnectivityFailure) < tunConnectivityFailureCache {
+	if !cbActive && !a.lastTunConnectivityFailure.IsZero() && now.Sub(a.lastTunConnectivityFailure) < tunConnectivityFailureCache {
 		message := a.lastTunConnectivityError
 		a.healthMu.Unlock()
 		return errors.New(firstNonEmpty(message, "TUN 代理出网验证失败"))
 	}
 	interval := tunConnectivityCheckInterval
-	if a.store != nil && a.store.Snapshot().Settings.AutoFailover {
+	if cbActive {
+		interval = 5 * time.Second
+	} else if a.store != nil && a.store.Snapshot().Settings.AutoFailover {
 		interval = 15 * time.Second
 	}
 	if !a.lastTunConnectivityCheck.IsZero() && now.Sub(a.lastTunConnectivityCheck) < interval {
@@ -2895,16 +2841,27 @@ func (a *App) verifyTunConnectivityIfDue(port int) error {
 	a.healthMu.Unlock()
 	err := verifyLocalProxyConnectivity(port, tunConnectivityTimeout)
 	a.healthMu.Lock()
-	defer a.healthMu.Unlock()
 	if err == nil {
 		a.lastTunConnectivityCheck = now
 		a.lastTunConnectivityFailure = time.Time{}
 		a.lastTunConnectivityError = ""
-	} else {
-		a.lastTunConnectivityCheck = time.Time{}
-		a.lastTunConnectivityFailure = now
-		a.lastTunConnectivityError = err.Error()
+		a.tunConnectivityConsecutiveFails = 0
+		a.healthMu.Unlock()
+		return nil
 	}
+	a.lastTunConnectivityCheck = time.Time{}
+	a.tunConnectivityConsecutiveFails++
+	fails := a.tunConnectivityConsecutiveFails
+	if !cbActive && fails < tunConnectivityFailThreshold {
+		a.healthMu.Unlock()
+		if a.logger != nil {
+			a.logger.Info("代理连通性探测第 %d/%d 次波动，暂保持连接不触发熔断：%v", fails, tunConnectivityFailThreshold, err)
+		}
+		return nil
+	}
+	a.lastTunConnectivityFailure = now
+	a.lastTunConnectivityError = err.Error()
+	a.healthMu.Unlock()
 	return err
 }
 
@@ -2917,6 +2874,7 @@ func (a *App) markTunConnectivityHealthy(settings Settings) {
 	}
 	a.lastTunConnectivityFailure = time.Time{}
 	a.lastTunConnectivityError = ""
+	a.tunConnectivityConsecutiveFails = 0
 	a.healthMu.Unlock()
 	a.setCircuitBreakerActive(false, "")
 }
@@ -3621,15 +3579,7 @@ func (a *App) startLocked() error {
 		a.emitState()
 		return err
 	}
-	if shouldApplyFirewallKillSwitch(state.Settings, a.isCircuitBreakerActive()) {
-		coreExe := ""
-		if a.manager != nil {
-			coreExe = a.manager.corePath
-		}
-		if err := enableKillSwitch(a.root, a.logger, coreExe, ""); err != nil {
-			a.logger.Error("开启防泄露防火墙拦截失败: %v", err)
-		}
-	}
+	_ = disableKillSwitch(a.root, a.logger)
 	a.markTunConnectivityHealthy(state.Settings)
 	a.initTrafficBaseline(state.SelectedID, state.Nodes)
 	a.emitState()
@@ -3906,43 +3856,33 @@ func (a *App) ensureProxyEntrancesLocked(state PersistState) error {
 			a.logger.Info("系统代理入口已自动重新同步：127.0.0.1:%d", settings.MixedPort)
 		}
 	}
-	needsConnectivityCheck := (runtime.GOOS == "windows" && effectiveTun(settings)) || (settings.AutoFailover && shouldRunProxy(settings))
-	if needsConnectivityCheck {
-		if runtime.GOOS == "windows" && effectiveTun(settings) {
-			var lastCode string
-			tunOK := false
-			for attempt := 0; attempt < 3; attempt++ {
-				if code, ok := tunReadyState(); ok {
-					tunOK = true
-					break
-				} else {
-					lastCode = code
-					if attempt < 2 {
-						time.Sleep(500 * time.Millisecond)
-					}
+	if runtime.GOOS == "windows" && effectiveTun(settings) {
+		var lastCode string
+		tunOK := false
+		for attempt := 0; attempt < 3; attempt++ {
+			if code, ok := tunReadyState(); ok {
+				tunOK = true
+				break
+			} else {
+				lastCode = code
+				if attempt < 2 {
+					time.Sleep(500 * time.Millisecond)
 				}
-			}
-			if !tunOK {
-				return fmt.Errorf("TUN 未保持接管状态：%s", tunReadyMessage(lastCode))
 			}
 		}
+		if !tunOK {
+			return fmt.Errorf("TUN 未保持接管状态：%s", tunReadyMessage(lastCode))
+		}
+	}
+	if settings.AutoFailover && shouldRunProxy(settings) {
 		if err := a.verifyTunConnectivityIfDue(settings.MixedPort); err != nil {
-			if settings.AutoFailover {
-				switchedName, failoverErr := a.autoFailoverLocked(state, err)
-				if failoverErr == nil {
-					a.logger.Info("【自动切换】已自动替换为同分组可用节点：%s", switchedName)
-					a.markTunConnectivityHealthy(settings)
-					return nil
-				}
-				a.logger.Error("【自动切换】节点替换尝试未成功：%v", failoverErr)
-			}
-			if settings.CircuitBreaker {
-				a.setCircuitBreakerActive(true, "海外代理链路测试异常，已自动触发智能熔断保护")
+			switchedName, failoverErr := a.autoFailoverLocked(state, err)
+			if failoverErr == nil {
+				a.logger.Info("【自动切换】已自动替换为同分组可用节点：%s", switchedName)
+				a.markTunConnectivityHealthy(settings)
 				return nil
 			}
-			return fmt.Errorf("代理无法实际出网：%w", err)
-		} else if settings.CircuitBreaker && a.isCircuitBreakerActive() {
-			a.setCircuitBreakerActive(false, "")
+			a.logger.Error("【自动切换】当前无可用备选节点，保持当前代理接管不熔断：%v", failoverErr)
 		}
 	}
 	return nil

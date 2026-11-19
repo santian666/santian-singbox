@@ -44,31 +44,17 @@ func TestCircuitBreakerPreventsDisablingTunOnFailure(t *testing.T) {
 
 	app.disableTunAfterStartFailure(settings, errors.New("simulated tun timeout"))
 
-	// With CircuitBreaker = true, TUN must NOT be turned off (which would expose traffic to physical NIC)
+	// TUN must NOT be turned off (which would expose traffic to physical NIC), and active circuit breaker must stay disabled
 	currentSettings := store.Snapshot().Settings
 	if !currentSettings.Tun {
-		t.Fatalf("expected TUN to remain true under CircuitBreaker, but was set to %v", currentSettings.Tun)
+		t.Fatalf("expected TUN to remain true, but was set to %v", currentSettings.Tun)
 	}
-	if !app.isCircuitBreakerActive() {
-		t.Fatal("expected CircuitBreakerActive to be true")
-	}
-	if reason := app.circuitBreakerReason(); reason == "" {
-		t.Fatal("expected CircuitBreakerReason to not be empty")
-	}
-
-	// State() should also report circuit breaker active
-	st := app.State()
-	if !st.CircuitBreakerActive {
-		t.Fatal("expected app.State().CircuitBreakerActive to be true")
-	}
-	if st.CircuitBreakerReason == "" {
-		t.Fatal("expected app.State().CircuitBreakerReason to be non-empty")
-	}
-
-	// Reset circuit breaker
-	app.setCircuitBreakerActive(false, "")
 	if app.isCircuitBreakerActive() {
-		t.Fatal("expected CircuitBreakerActive to be false after clearing")
+		t.Fatal("expected CircuitBreakerActive to remain false")
+	}
+	st := app.State()
+	if st.CircuitBreakerActive {
+		t.Fatal("expected app.State().CircuitBreakerActive to remain false")
 	}
 }
 
@@ -93,12 +79,12 @@ func TestCircuitBreakerDisabledDisablesTunOnFailure(t *testing.T) {
 
 	app.disableTunAfterStartFailure(settings, errors.New("simulated tun timeout"))
 
-	// With CircuitBreaker = false, TUN should be disabled to prevent repeated crashes
+	// Even when CircuitBreaker is false, TUN must NOT auto-disable to direct (prevents real IP leak)
 	currentSettings := store.Snapshot().Settings
-	if currentSettings.Tun {
-		t.Fatalf("expected TUN to be false when CircuitBreaker is disabled, but was %v", currentSettings.Tun)
+	if !currentSettings.Tun {
+		t.Fatalf("expected TUN to remain true to prevent real IP leak, but was set to %v", currentSettings.Tun)
 	}
 	if app.isCircuitBreakerActive() {
-		t.Fatal("expected CircuitBreakerActive to remain false when CircuitBreaker is disabled")
+		t.Fatal("expected CircuitBreakerActive to remain false")
 	}
 }
