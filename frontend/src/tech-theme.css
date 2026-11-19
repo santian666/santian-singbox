@@ -49,7 +49,7 @@ body {
 
 @media (min-width: 901px) {
   .top-bar {
-    grid-template-columns: minmax(390px, 430px) minmax(max-content, 1fr) max-content !important;
+    grid-template-columns: minmax(390px, 430px) minmax(352px, 1fr) 468px !important;
     gap: 10px !important;
   }
   .top-menu {
@@ -64,13 +64,73 @@ body {
   }
   .status-summary {
     justify-self: center !important;
+    width: 344px !important;
+    min-width: 344px !important;
+    max-width: 344px !important;
+    height: 34px !important;
+    justify-content: space-between !important;
+    padding: 0 10px !important;
+    transition: background-color 0.15s ease, border-color 0.15s ease !important;
+  }
+  .status-summary .status-detail {
+    flex: 1 1 0 !important;
+    min-width: 0 !important;
+    text-align: center !important;
+    overflow: hidden !important;
+    text-overflow: ellipsis !important;
+    white-space: nowrap !important;
   }
   .top-node-area {
     justify-self: end !important;
-    justify-content: flex-end !important;
+    width: 468px !important;
+    min-width: 468px !important;
+    max-width: 468px !important;
+    display: grid !important;
+    grid-template-columns: 230px 230px !important;
+    gap: 8px !important;
+    align-items: center !important;
   }
-  .current-node {
-    max-width: 320px !important;
+  .traffic-monitor {
+    flex: none !important;
+    width: 230px !important;
+    min-width: 230px !important;
+    max-width: 230px !important;
+    height: 34px !important;
+    padding: 0 8px !important;
+    display: grid !important;
+    grid-template-columns: 98px 10px 98px !important;
+    align-items: center !important;
+    justify-content: center !important;
+    gap: 2px !important;
+    font-size: 12px !important;
+    font-variant-numeric: tabular-nums !important;
+    transition: background-color 0.15s ease, border-color 0.15s ease !important;
+  }
+  #trafficUpload,
+  #trafficDownload {
+    width: 98px !important;
+    display: block !important;
+    text-align: left !important;
+    padding-left: 3px !important;
+    overflow: hidden !important;
+    white-space: nowrap !important;
+    font-variant-numeric: tabular-nums !important;
+  }
+  .traffic-separator {
+    width: 10px !important;
+    display: block !important;
+    text-align: center !important;
+  }
+  .current-node,
+  .current-node.empty {
+    flex: none !important;
+    width: 230px !important;
+    min-width: 230px !important;
+    max-width: 230px !important;
+    height: 34px !important;
+    padding: 0 12px !important;
+    font-size: 12px !important;
+    transition: background-color 0.15s ease, border-color 0.15s ease !important;
   }
 }
 
