@@ -342,8 +342,17 @@ func (m *SingBoxManager) HealthCheck(settings Settings) error {
 		if proxyMapPortCount <= 0 {
 			return errors.New("代理映射运行端口未初始化")
 		}
-		ports := sequentialPorts(proxyMapStartPort, proxyMapPortCount)
-		if port := firstUnboundTCPPort("127.0.0.1", ports); port != 0 {
+		var checkPorts []int
+		if proxyMapPortCount <= 8 {
+			checkPorts = sequentialPorts(proxyMapStartPort, proxyMapPortCount)
+		} else {
+			checkPorts = []int{
+				proxyMapStartPort,
+				proxyMapStartPort + proxyMapPortCount/2,
+				proxyMapStartPort + proxyMapPortCount - 1,
+			}
+		}
+		if port := firstUnboundTCPPort("127.0.0.1", checkPorts); port != 0 {
 			return fmt.Errorf("代理映射端口 %d 未监听", port)
 		}
 	}
@@ -351,7 +360,7 @@ func (m *SingBoxManager) HealthCheck(settings Settings) error {
 }
 
 func (m *SingBoxManager) pingClashAPI() error {
-	client := http.Client{Timeout: 1200 * time.Millisecond}
+	client := http.Client{Transport: clashAPIHTTPTransport, Timeout: 2500 * time.Millisecond}
 	resp, err := client.Get("http://" + clashAPIAddress + "/configs")
 	if err != nil {
 		return fmt.Errorf("内核控制接口不可用：%w", err)
@@ -698,7 +707,7 @@ func doClashAPIBytesWithRetry(req *http.Request, totalTimeout time.Duration, req
 			}
 			tryReq.Body = body
 		}
-		client := http.Client{Timeout: requestTimeout}
+		client := http.Client{Transport: clashAPIHTTPTransport, Timeout: requestTimeout}
 		resp, err := client.Do(tryReq)
 		if err == nil {
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
@@ -1131,13 +1140,15 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 			_ = m.stopLocked(true, true, true)
 			return fmt.Errorf("TUN 未能真实接管系统网络：%w", err)
 		}
-		if err := verifyLocalProxyConnectivity(state.Settings.MixedPort, tunConnectivityTimeout); err != nil {
-			_ = m.stopLocked(true, true, true)
-			return fmt.Errorf("TUN 已接管路由，但当前节点无法建立可用网络，已自动清理 TUN：%w", err)
-		}
 		closeStaleFakeIPTCPConnections(m.logger)
 		flushWindowsDNSCache(m.logger)
 		m.logger.Info("TUN 已接管系统网络：%s", tunInterfaceName)
+		mixedPort := state.Settings.MixedPort
+		safeGo(m.logger, "TUN 启动后异步探测", func() {
+			if err := verifyLocalProxyConnectivity(mixedPort, tunConnectivityTimeout); err != nil && m.logger != nil {
+				m.logger.Info("TUN 已接管网络，但当前节点暂未通过出网探测（可随时切换其他节点）：%v", err)
+			}
+		})
 	}
 	if state.Settings.ProxyMap && len(proxyMapNodes) > 0 {
 		ports := sequentialPorts(state.Settings.ProxyMapStartPort, len(proxyMapNodes))
@@ -1763,7 +1774,13 @@ func buildSingBoxConfig(state PersistState, selected Node, cachePath string, inc
 	}
 	if effectiveTun(settings) {
 		routeExclude := append([]string(nil), tunRouteExcludeIPCIDRs...)
-		for _, nodeIP := range extractNodeServerIPs(state.Nodes) {
+		ipNodes := state.Nodes
+		if len(ipNodes) > 64 {
+			ipNodes = make([]Node, 0, 1+len(proxyMapNodes))
+			ipNodes = append(ipNodes, selected)
+			ipNodes = append(ipNodes, proxyMapNodes...)
+		}
+		for _, nodeIP := range extractNodeServerIPs(ipNodes) {
 			routeExclude = append(routeExclude, nodeIP)
 		}
 		tunInbound := map[string]interface{}{

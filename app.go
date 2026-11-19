@@ -3183,6 +3183,7 @@ func needsRestartForRunningSettings(current, next Settings) bool {
 	return current.Tun != next.Tun ||
 		appProxyActive(current) != appProxyActive(next) ||
 		current.ProxyMap != next.ProxyMap ||
+		(current.ProxyMap && next.ProxyMap && (current.ProxyMapStartPort != next.ProxyMapStartPort || !sameProxyMapGroupIDs(current, next))) ||
 		current.AppProxy != next.AppProxy ||
 		!reflect.DeepEqual(current.AppProxyTargets, next.AppProxyTargets) ||
 		!reflect.DeepEqual(current.ExternalProxyEndpoints, next.ExternalProxyEndpoints) ||
