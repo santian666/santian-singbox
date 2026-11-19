@@ -5,11 +5,24 @@
    - 无重度 backdrop-filter 模糊，确保滚动、点击与页面切换 60fps 零卡顿
    ========================================================================== */
 
-/* 修复固定 30px 标题栏遮挡顶部导航栏的问题 */
+/* 修复固定 30px 标题栏遮挡及高缩放下顶部空隙过大的问题（按 --ui-scale 精确抵消） */
 .app-shell {
-  height: calc(100% - 34px) !important;
-  margin-top: 34px !important;
-  padding: 6px 0 14px !important;
+  margin-top: calc(30px / var(--ui-scale, 1) + 8px) !important;
+  height: calc(100% - (30px / var(--ui-scale, 1) + 8px)) !important;
+  padding: 0 0 12px !important;
+}
+
+@media (min-width: 901px) {
+  .top-bar {
+    grid-template-columns: max-content max-content minmax(0, 1fr) !important;
+    gap: 10px !important;
+  }
+  .top-node-area {
+    justify-content: flex-end !important;
+  }
+  .current-node {
+    max-width: 360px !important;
+  }
 }
 
 /* ---------- 1. 浅色科技界面 (Light Mode) ---------- */
