@@ -5,11 +5,11 @@
    - 无重度 backdrop-filter 模糊，确保滚动、点击与页面切换 60fps 零卡顿
    ========================================================================== */
 
-/* 修复固定 30px 标题栏遮挡及高缩放下顶部空隙过大的问题（按 --ui-scale 精确抵消） */
+/* 修复固定 30px 标题栏遮挡及高缩放下顶部/底部边距失衡的问题（按 --ui-scale 精确抵消） */
 .app-shell {
   margin-top: calc(30px / var(--ui-scale, 1) + 8px) !important;
-  height: calc(100% - (30px / var(--ui-scale, 1) + 8px)) !important;
-  padding: 0 0 12px !important;
+  height: calc(100% - (30px / var(--ui-scale, 1) + 20px)) !important;
+  padding: 0 0 4px !important;
 }
 
 @media (min-width: 901px) {
