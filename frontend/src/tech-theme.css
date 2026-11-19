@@ -5,11 +5,39 @@
    - 无重度 backdrop-filter 模糊，确保滚动、点击与页面切换 60fps 零卡顿
    ========================================================================== */
 
-/* 修复固定 30px 标题栏遮挡及高缩放下顶部/底部边距失衡的问题（按 --ui-scale 精确抵消） */
+/* 用 Flex 列布局彻底消除固定标题栏与缩放计算导致的上下边距偏移 */
+body {
+  display: flex !important;
+  flex-direction: column !important;
+  height: 100vh !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  overflow: hidden !important;
+}
+
+.window-titlebar {
+  position: relative !important;
+  top: auto !important;
+  left: auto !important;
+  right: auto !important;
+  flex: 0 0 30px !important;
+  height: 30px !important;
+}
+
+#app {
+  flex: 1 1 0 !important;
+  min-height: 0 !important;
+  width: var(--ui-viewport-width) !important;
+  height: calc((100vh - 30px) / var(--ui-scale, 1)) !important;
+  zoom: var(--ui-scale, 1) !important;
+  overflow: hidden !important;
+}
+
 .app-shell {
-  margin-top: calc(30px / var(--ui-scale, 1) + 8px) !important;
-  height: calc(100% - (30px / var(--ui-scale, 1) + 20px)) !important;
-  padding: 0 0 4px !important;
+  width: calc(100% - 24px) !important;
+  height: calc(100% - 18px) !important;
+  margin: 6px auto 12px !important;
+  padding: 0 !important;
 }
 
 @media (min-width: 901px) {
