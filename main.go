@@ -2,6 +2,7 @@ package main
 
 import (
 	"embed"
+	"net/http"
 	"os"
 	"time"
 
@@ -81,6 +82,13 @@ func main() {
 		Frameless: true,
 		AssetServer: &assetserver.Options{
 			Assets: assets,
+			Middleware: assetserver.Middleware(func(next http.Handler) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+					w.Header().Set("Pragma", "no-cache")
+					next.ServeHTTP(w, r)
+				})
+			}),
 		},
 		BackgroundColour: &options.RGBA{R: 244, G: 247, B: 251, A: 1},
 		Windows: &windows.Options{

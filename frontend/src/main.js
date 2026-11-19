@@ -4727,13 +4727,14 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
         { key: "mux", label: "启用 Mux 多路复用", type: "checkbox" },
       ];
     return e === "shadowsocks"
-      ? t.concat(
-          [
-            { key: "password", label: "密码 (password)", required: !0 },
-            { key: "method", label: "加密方式 (encryption)", type: "select", required: !0, options: fr() },
-          ],
-          r,
-        )
+      ? [
+          { type: "section", label: "基础配置" },
+          { key: "name", label: "名称 (remarks)", required: !0, wide: !0 },
+          { key: "server", label: "地址 (address)", required: !0 },
+          { key: "port", label: "端口 (port)", type: "number", required: !0 },
+          { key: "password", label: "密码 (password)", required: !0 },
+          { key: "method", label: "加密方式 (encryption)", type: "select", required: !0, options: fr() },
+        ].concat(r)
       : e === "vmess"
         ? t.concat([
             { key: "uuid", label: "用户 ID (id)", required: !0, action: "uuid" },
@@ -4750,12 +4751,13 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
                 ["chacha20-poly1305", "chacha20-poly1305"],
               ],
             },
-            { key: "mux", label: "开启 Mux 多路复用", type: "checkbox" },
+            { key: "mux", label: "开启 Mux 多路复用", type: "checkbox", wide: !0 },
             { type: "section", label: "底层传输方式 (transport)" },
             {
               key: "transport",
               label: "传输协议 (network)",
               type: "select",
+              wide: !0,
               options: [
                 ["tcp", "raw"],
                 ["ws", "ws"],
@@ -4770,13 +4772,13 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
               label: "传输层安全 (TLS)",
               type: "select",
               options: [
-                ["none", ""],
+                ["none", "无"],
                 ["tls", "tls"],
               ],
             },
             { key: "sni", label: "SNI", show: "tls-only" },
             { key: "fingerprint", label: "Fingerprint", type: "select", options: gr(), show: "tls-only" },
-            { key: "alpn", label: "Alpn", type: "select", options: yr(), show: "tls-only" },
+            { key: "alpn", label: "ALPN", type: "select", options: yr(), show: "tls-only" },
             {
               key: "allowInsecure",
               label: "跳过证书验证 (allowInsecure)",
@@ -4787,8 +4789,8 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
               ],
               show: "tls-only",
             },
-            { key: "echConfigList", label: "EchConfigList", type: "textarea", show: "tls-only" },
             { key: "certificate", label: "固定证书", type: "certificate", show: "tls-only" },
+            { key: "echConfigList", label: "ECHConfigList", type: "textarea", show: "tls-only" },
           ])
         : e === "vless"
           ? t.concat([
@@ -4798,12 +4800,12 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
                 label: "流控 (flow)",
                 type: "select",
                 options: [
-                  ["", ""],
+                  ["", "无"],
                   ["xtls-rprx-vision", "xtls-rprx-vision"],
                 ],
               },
               { key: "encryption", label: "加密方式 (encryption)", type: "select", options: [["none", "none"]] },
-              { key: "mux", label: "启用 Mux 多路复用", type: "checkbox" },
+              { key: "mux", label: "启用 Mux 多路复用", type: "checkbox", wide: !0 },
               { type: "section", label: "底层传输方式 (transport)" },
               {
                 key: "transport",
@@ -4823,25 +4825,25 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
                   ["http", "http"],
                 ],
               },
-              { key: "finalMask", label: "Finalmask" },
+              { key: "finalMask", label: "Finalmask", wide: !0 },
               { type: "section", label: "传输层安全 (TLS)" },
               {
                 key: "security",
                 label: "传输层安全 (TLS)",
                 type: "select",
                 options: [
-                  ["none", ""],
+                  ["none", "无"],
                   ["tls", "tls"],
                   ["reality", "reality"],
                 ],
               },
               { key: "sni", label: "SNI", show: "tls" },
               { key: "fingerprint", label: "Fingerprint", type: "select", options: gr(), show: "tls" },
-              { key: "publicKey", label: "PublicKey", show: "reality" },
-              { key: "shortId", label: "ShortId", show: "reality" },
+              { key: "alpn", label: "ALPN", type: "select", options: yr(), show: "tls" },
+              { key: "publicKey", label: "Reality PublicKey", show: "reality" },
+              { key: "shortId", label: "Reality ShortId", show: "reality" },
               { key: "spiderX", label: "SpiderX", show: "reality" },
               { key: "mldsa65Verify", label: "Mldsa65Verify", show: "reality" },
-              { key: "alpn", label: "Alpn", type: "select", options: yr(), show: "tls" },
               {
                 key: "allowInsecure",
                 label: "跳过证书验证 (allowInsecure)",
@@ -4852,27 +4854,29 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
                 ],
                 show: "tls",
               },
-              { key: "echConfigList", label: "EchConfigList", type: "textarea", show: "tls" },
               { key: "certificate", label: "固定证书", type: "certificate", show: "tls" },
+              { key: "echConfigList", label: "ECHConfigList", type: "textarea", show: "tls" },
             ])
           : e === "trojan"
             ? t.concat([
                 { key: "password", label: "密码 (password)", required: !0 },
-                { key: "mux", label: "开启 Mux 多路复用", type: "checkbox" },
+                { key: "mux", label: "开启 Mux 多路复用", type: "checkbox", wide: !0 },
                 { type: "section", label: "传输层安全 (TLS)" },
                 {
                   key: "security",
                   label: "传输层安全 (TLS)",
                   type: "select",
                   options: [
-                    ["none", ""],
+                    ["none", "无"],
                     ["tls", "tls"],
                     ["reality", "reality"],
                   ],
                 },
                 { key: "sni", label: "SNI", show: "tls" },
                 { key: "fingerprint", label: "Fingerprint", type: "select", options: gr(), show: "tls" },
-                { key: "alpn", label: "Alpn", type: "select", options: yr(), show: "tls-only" },
+                { key: "alpn", label: "ALPN", type: "select", options: yr(), show: "tls-only" },
+                { key: "publicKey", label: "Reality PublicKey", show: "reality" },
+                { key: "shortId", label: "Reality ShortId", show: "reality" },
                 {
                   key: "allowInsecure",
                   label: "跳过证书验证 (allowInsecure)",
@@ -4883,24 +4887,22 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
                   ],
                   show: "tls-only",
                 },
-                { key: "echConfigList", label: "EchConfigList", type: "textarea", show: "tls-only" },
                 { key: "certificate", label: "固定证书", type: "certificate", show: "tls-only" },
-                { key: "publicKey", label: "PublicKey", show: "reality" },
-                { key: "shortId", label: "ShortId", show: "reality" },
+                { key: "echConfigList", label: "ECHConfigList", type: "textarea", show: "tls-only" },
               ])
             : e === "hysteria2"
               ? t.concat([
                   { key: "password", label: "密码 (password)", required: !0 },
-                  { key: "obfsPassword", label: "混淆密码 (obfs password)" },
+                  { key: "obfsPassword", label: "混淆密码 (obfs password)", wide: !0 },
                   { key: "hopPorts", label: "跳跃端口范围" },
                   { key: "hopInterval", label: "端口跳跃时间间隔" },
-                  { key: "upMbps", label: "Hysteria 最大带宽 Up", type: "number" },
-                  { key: "downMbps", label: "Hysteria 最大带宽 Down", type: "number" },
+                  { key: "upMbps", label: "最大上行带宽 (Mbps)", type: "number" },
+                  { key: "downMbps", label: "最大下行带宽 (Mbps)", type: "number" },
                   { type: "section", label: "传输层安全 (TLS)" },
                   { key: "security", label: "传输层安全 (TLS)", type: "select", options: [["tls", "tls"]] },
                   { key: "sni", label: "SNI" },
                   { key: "fingerprint", label: "Fingerprint", type: "select", options: gr() },
-                  { key: "alpn", label: "Alpn", type: "select", options: yr() },
+                  { key: "alpn", label: "ALPN", type: "select", options: yr() },
                   {
                     key: "allowInsecure",
                     label: "跳过证书验证 (allowInsecure)",
@@ -4910,8 +4912,8 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
                       ["true", "true"],
                     ],
                   },
-                  { key: "echConfigList", label: "EchConfigList", type: "textarea" },
                   { key: "certificate", label: "固定证书", type: "certificate" },
+                  { key: "echConfigList", label: "ECHConfigList", type: "textarea" },
                 ])
               : e === "tuic"
                 ? t.concat([
@@ -4922,7 +4924,7 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
                       label: "拥塞控制算法",
                       type: "select",
                       options: [
-                        ["", ""],
+                        ["", "默认"],
                         ["cubic", "cubic"],
                         ["new_reno", "new_reno"],
                         ["bbr", "bbr"],
@@ -4932,7 +4934,7 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
                     { key: "security", label: "传输层安全 (TLS)", type: "select", options: [["tls", "tls"]] },
                     { key: "sni", label: "SNI" },
                     { key: "fingerprint", label: "Fingerprint", type: "select", options: gr() },
-                    { key: "alpn", label: "Alpn", type: "select", options: yr() },
+                    { key: "alpn", label: "ALPN", type: "select", options: yr() },
                     {
                       key: "allowInsecure",
                       label: "跳过证书验证 (allowInsecure)",
@@ -4942,8 +4944,8 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
                         ["true", "true"],
                       ],
                     },
-                    { key: "echConfigList", label: "EchConfigList", type: "textarea" },
                     { key: "certificate", label: "固定证书", type: "certificate" },
+                    { key: "echConfigList", label: "ECHConfigList", type: "textarea" },
                   ])
                 : e === "anytls"
                   ? t.concat([
@@ -4960,9 +4962,9 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
                       },
                       { key: "sni", label: "SNI" },
                       { key: "fingerprint", label: "Fingerprint", type: "select", options: gr() },
+                      { key: "alpn", label: "ALPN", type: "select", options: yr() },
                       { key: "publicKey", label: "Reality PublicKey", show: "reality" },
                       { key: "shortId", label: "Reality ShortId", show: "reality" },
-                      { key: "alpn", label: "ALPN", type: "select", options: yr() },
                       {
                         key: "allowInsecure",
                         label: "跳过证书验证 (allowInsecure)",
@@ -4972,20 +4974,24 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
                           ["true", "true"],
                         ],
                       },
-                      { key: "echConfigList", label: "ECHConfigList", type: "textarea" },
                       { key: "certificate", label: "固定证书", type: "certificate" },
+                      { key: "echConfigList", label: "ECHConfigList", type: "textarea" },
                     ])
                   : e === "wireguard"
                     ? t.concat([
+                        { key: "mtu", label: "MTU", type: "number" },
                         { key: "privateKey", label: "PrivateKey", required: !0 },
                         { key: "peerPublicKey", label: "PublicKey", required: !0 },
                         { key: "preSharedKey", label: "PreSharedKey" },
                         { key: "reserved", label: "Reserved" },
-                        { key: "localAddress", label: "Address (IPv4,IPv6)", required: !0 },
-                        { key: "mtu", label: "MTU", type: "number" },
+                        { key: "localAddress", label: "Address (IPv4, IPv6)", required: !0, wide: !0 },
                       ])
                     : e === "http"
-                      ? t.concat([
+                      ? [
+                          { type: "section", label: "基础配置" },
+                          { key: "name", label: "名称 (remarks)", required: !0, wide: !0 },
+                          { key: "server", label: "地址 (address)", required: !0 },
+                          { key: "port", label: "端口 (port)", type: "number", required: !0 },
                           { key: "username", label: "用户名 (可选)" },
                           { key: "password", label: "密码 (可选)" },
                           { type: "section", label: "传输层安全 (TLS)" },
@@ -4994,13 +5000,13 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
                             label: "传输层安全 (TLS)",
                             type: "select",
                             options: [
-                              ["none", ""],
+                              ["none", "无"],
                               ["tls", "tls"],
                             ],
                           },
                           { key: "sni", label: "SNI", show: "tls-only" },
                           { key: "fingerprint", label: "Fingerprint", type: "select", options: gr(), show: "tls-only" },
-                          { key: "alpn", label: "Alpn", type: "select", options: yr(), show: "tls-only" },
+                          { key: "alpn", label: "ALPN", type: "select", options: yr(), show: "tls-only" },
                           {
                             key: "allowInsecure",
                             label: "跳过证书验证 (allowInsecure)",
@@ -5011,20 +5017,23 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
                             ],
                             show: "tls-only",
                           },
-                          { key: "echConfigList", label: "EchConfigList", type: "textarea", show: "tls-only" },
                           { key: "certificate", label: "固定证书", type: "certificate", show: "tls-only" },
-                        ])
+                          { key: "echConfigList", label: "ECHConfigList", type: "textarea", show: "tls-only" },
+                        ]
                       : e === "naive"
-                        ? t.concat([
+                        ? [
+                            { type: "section", label: "基础配置" },
+                            { key: "name", label: "名称 (remarks)", required: !0, wide: !0 },
+                            { key: "server", label: "地址 (address)", required: !0 },
+                            { key: "port", label: "端口 (port)", type: "number", required: !0 },
                             { key: "username", label: "用户名", required: !0 },
                             { key: "password", label: "密码 (password)", required: !0 },
-                            { key: "quic", label: "QUIC", type: "checkbox" },
                             {
                               key: "congestionControl",
                               label: "拥塞控制算法",
                               type: "select",
                               options: [
-                                ["", ""],
+                                ["", "默认"],
                                 ["bbr", "bbr"],
                                 ["bbr2", "bbr2"],
                                 ["cubic", "cubic"],
@@ -5032,22 +5041,27 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
                               ],
                             },
                             { key: "insecureConcurrency", label: "不安全并发", type: "number" },
+                            { key: "quic", label: "QUIC", type: "checkbox" },
                             { key: "udpOverTcp", label: "UDP over TCP", type: "checkbox" },
                             { type: "section", label: "传输层安全 (TLS)" },
                             { key: "security", label: "传输层安全 (TLS)", type: "select", options: [["tls", "tls"]] },
                             { key: "sni", label: "SNI" },
-                            { key: "echConfigList", label: "EchConfigList", type: "textarea" },
-                            { key: "certificate", label: "固定证书", type: "certificate" },
-                          ])
+                            { key: "certificate", label: "固定证书", type: "certificate", wide: !0 },
+                            { key: "echConfigList", label: "ECHConfigList", type: "textarea" },
+                          ]
                         : e === "socks5"
-                          ? t.concat([
+                          ? [
+                              { type: "section", label: "基础配置" },
+                              { key: "name", label: "名称 (remarks)", required: !0, wide: !0 },
+                              { key: "server", label: "地址 (address)", required: !0 },
+                              { key: "port", label: "端口 (port)", type: "number", required: !0 },
                               { key: "username", label: "用户名 (可选)" },
                               { key: "password", label: "密码 (可选)" },
-                            ])
+                            ]
                           : t.concat(
                               [
                                 { key: "username", label: "用户名" },
-                                { key: "password", label: "密码" },
+                                { key: "password", label: "密码", wide: !0 },
                               ],
                               r.slice(0, 1),
                               a,
@@ -5097,6 +5111,7 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
         .filter(Boolean)
         .join(" "),
       r = e.show ? ` data-show="${m(e.show)}"` : "",
+      w = e.wide ? " node-edit-wide" : "",
       i =
         e.action === "uuid"
           ? `<button class="ghost node-edit-inline-btn" type="button" data-generate-uuid="${m(e.key)}">生成</button>`
@@ -5105,7 +5120,7 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
     if (e.type === "select") {
       const b = t === !1 ? "false" : t === !0 ? "true" : String(t != null ? t : "");
       return `
-      <label class="field"${r}>
+      <label class="field${w}"${r}>
         <span>${m(e.label)}</span>
         <select ${a}>${e.options.map(([S, C]) => `<option value="${m(S)}" ${b === S ? "selected" : ""}>${m(C)}</option>`).join("")}</select>
       </label>
@@ -5115,13 +5130,13 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
       return `
       <label class="field node-edit-wide"${r}>
         <span>${m(e.label)}</span>
-        <textarea ${a} class="node-edit-textarea">${m(t != null ? t : "")}</textarea>
+        <textarea ${a} rows="1" placeholder="可选：填入 ECHConfigList (Base64)" class="node-edit-textarea">${m(t != null ? t : "")}</textarea>
       </label>
     `;
     if (e.type === "certificate") {
       const b = String(t || "").trim() !== "";
       return `
-      <div class="node-edit-cert-row node-edit-wide">
+      <div class="field node-edit-cert-field${w}"${r}>
         <span class="node-edit-cert-label">${m(e.label)}</span>
         <button class="node-edit-cert-toggle" type="button" data-certificate-toggle>
           <span data-certificate-status>设置证书</span>
@@ -5153,13 +5168,13 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
     }
     return e.type === "checkbox"
       ? `
-      <label class="switch node-edit-switch"${r}>
+      <label class="switch node-edit-switch${w}"${r}>
         <input ${a} type="checkbox" ${t ? "checked" : ""} />
         <span>${m(e.label)}</span>
       </label>
     `
       : `
-    <label class="field"${r}>
+    <label class="field${w}"${r}>
       <span>${m(e.label)}</span>
       <div class="node-edit-control${o}">
         <input ${a} type="${e.type || "text"}" value="${m(t != null ? t : "")}" />
