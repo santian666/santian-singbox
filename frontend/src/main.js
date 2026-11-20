@@ -2788,9 +2788,10 @@ var ia = ln((an, sn) => {
           D = `流量：${Ne(zt(v))}`,
           E = f.get(v.groupId || "default") || "默认分组",
           F = l ? `分组：${E} · ${B}` : B;
+        const protoLabel = formatProtocolLabel(v.type);
         return `
         <article class="node ${l ? "" : "draggable"} ${w ? "selected" : ""}" data-node-open="${v.id}" draggable="${!l && !A ? "true" : "false"}">
-          <span class="chip node-protocol" title="${m(v.type)}">${m(v.type)}</span>
+          <span class="chip node-protocol" title="${m(protoLabel)}">${m(protoLabel)}</span>
           <div class="node-title">
             <button class="node-name-copy" data-copy-node="${v.id}" title="${m(v.name)}" type="button">${m(v.name)}</button>
           </div>
@@ -3139,7 +3140,7 @@ var ia = ln((an, sn) => {
           be.push(`
         <tr>
           <td class="proxy-map-name"><strong title="${m(q.node.name)}">${m(q.node.name)}</strong></td>
-          <td><span class="chip" title="${m(q.node.type)}">${m(q.node.type)}</span></td>
+          <td><span class="chip" title="${m(formatProtocolLabel(q.node.type))}">${m(formatProtocolLabel(q.node.type))}</span></td>
           <td class="proxy-map-node-address" title="${m(K)}">${m(K)}</td>
           <td><span class="${Ae(q.node.delayMs)}">${dl}</span></td>
           <td><span class="metric ok copy-value" data-copy-proxy-map="${m(q.address)}" title="点击复制 ${m(q.address)}">${m(q.address)}</span></td>
@@ -3253,10 +3254,11 @@ var ia = ln((an, sn) => {
           N = na(n.outboundIp),
           O = Ie(n.downloadMbps, "Mbps"),
           G = Ie(n.uploadMbps, "Mbps");
+        const protoLabel = formatProtocolLabel(n.type);
         return `
         <tr class="${r ? "testing-row" : ""}">
           <td class="test-address"><span class="copy-value" data-copy-value="${m(i)}" title="点击复制 ${m(i)}">${m(i)}</span></td>
-          <td><span class="chip copy-value" data-copy-value="${m(n.type)}" title="点击复制 ${m(n.type)}">${m(n.type)}</span></td>
+          <td><span class="chip copy-value" data-copy-value="${m(protoLabel)}" title="点击复制 ${m(protoLabel)}">${m(protoLabel)}</span></td>
           <td><span class="chip copy-value" data-copy-value="${m(n.country)}" title="点击复制 ${m(n.country)}">${m(n.country)}</span></td>
           <td class="test-name"><strong class="copy-value" data-copy-value="${m(n.name)}" title="点击复制 ${m(n.name)}">${m(n.name)}</strong></td>
           <td><span class="${Ae(n.pingMs)}" data-raw-retest="${a}" data-retest-metric="ping" title="${r || s.batchTesting ? "测试中" : "点击重新测试 Ping 延迟"}" style="cursor:${r || s.batchTesting ? "default" : "pointer"}">${m(S)}</span></td>
@@ -4288,7 +4290,7 @@ var ia = ln((an, sn) => {
       (r.value =
         b ||
         `${(t == null ? void 0 : t.name) || ""}
-${(t == null ? void 0 : t.type) || ""}
+${formatProtocolLabel(t == null ? void 0 : t.type)}
 ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}`.trim()),
       r.classList.toggle("hidden", Boolean(n.qr)),
       u.classList.toggle("hidden", Boolean(n.qr)),
@@ -5450,6 +5452,10 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
                 ? t
                 : t || "json";
   }
+  function formatProtocolLabel(e) {
+    const t = String(e || "").trim();
+    return t ? t.charAt(0).toUpperCase() + t.slice(1) : "";
+  }
   function ct(e) {
     return (
       {
@@ -5465,7 +5471,7 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
         socks5: "SOCKS5",
         http: "HTTP",
         json: "JSON Outbound",
-      }[e] || e
+      }[e] || formatProtocolLabel(e)
     );
   }
   function Mr(e, t) {
