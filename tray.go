@@ -22,6 +22,7 @@ type trayProxyCommand uint8
 const (
 	trayProxyStop trayProxyCommand = iota
 	trayProxyStart
+	trayProxyRestart
 	trayProxySystem
 	trayProxyTun
 	trayProxyGlobal
@@ -33,6 +34,7 @@ type trayMenuItems struct {
 	status           *systray.MenuItem
 	start            *systray.MenuItem
 	stop             *systray.MenuItem
+	restart          *systray.MenuItem
 	systemProxy      *systray.MenuItem
 	tun              *systray.MenuItem
 	global           *systray.MenuItem
@@ -40,6 +42,7 @@ type trayMenuItems struct {
 	currentNodeTitle string
 	statusTitle      string
 	tooltip          string
+	iconKind         string
 }
 
 func (a *App) startTray() {
@@ -51,6 +54,12 @@ func (a *App) startTray() {
 		systray.SetClickHandler(func() {
 			safeGo(a.logger, "托盘图标点击", func() {
 				a.logger.Info("托盘图标点击：显示主窗口")
+				a.showWindow()
+			})
+		})
+		systray.SetBalloonClickHandler(func() {
+			safeGo(a.logger, "托盘气泡点击", func() {
+				a.logger.Info("托盘气泡点击：显示主窗口")
 				a.showWindow()
 			})
 		})
@@ -80,6 +89,7 @@ func (a *App) onTrayReady() {
 	systray.AddSeparator()
 	startItem := systray.AddMenuItem("启动代理", "恢复停止前使用的代理模式")
 	stopItem := systray.AddMenuItem("停止代理", "关闭全部代理入口")
+	restartItem := systray.AddMenuItem("重启代理内核", "立即重启 sing-box 并刷新网络环境")
 	systray.AddSeparator()
 	systemProxyItem := systray.AddMenuItemCheckbox("系统代理", "使用 Windows 系统代理", false)
 	tunItem := systray.AddMenuItemCheckbox("TUN 代理", "使用 TUN 虚拟网卡代理", false)
@@ -96,10 +106,12 @@ func (a *App) onTrayReady() {
 		status:      statusItem,
 		start:       startItem,
 		stop:        stopItem,
+		restart:     restartItem,
 		systemProxy: systemProxyItem,
 		tun:         tunItem,
 		global:      globalItem,
 		rule:        ruleItem,
+		iconKind:    trayIconKindIdle,
 	}
 	a.trayMu.Unlock()
 	a.refreshTrayMenu()
@@ -130,6 +142,9 @@ func (a *App) onTrayReady() {
 			case <-stopItem.ClickedCh:
 				a.logger.Info("托盘操作：已收到停止代理请求")
 				enqueueTrayProxyCommand(proxyCommands, trayProxyStop)
+			case <-restartItem.ClickedCh:
+				a.logger.Info("托盘操作：已收到重启代理内核请求")
+				enqueueTrayProxyCommand(proxyCommands, trayProxyRestart)
 			case <-systemProxyItem.ClickedCh:
 				a.logger.Info("托盘操作：已收到系统代理请求")
 				enqueueTrayProxyCommand(proxyCommands, trayProxySystem)
@@ -186,6 +201,8 @@ func (a *App) executeTrayProxyCommand(command trayProxyCommand) {
 		a.trayStart()
 	case trayProxyStop:
 		a.trayStop()
+	case trayProxyRestart:
+		a.trayRestart()
 	case trayProxySystem, trayProxyTun, trayProxyGlobal, trayProxyRule:
 		a.trayApplySettings(command)
 	}
@@ -242,15 +259,36 @@ func (a *App) refreshTrayMenu() {
 	nodeName = truncateTrayText(nodeName, 28)
 	entrance := trayProxyEntranceLabel(state.Settings)
 	mode := trayProxyModeLabel(state.Settings.Mode)
+	healthStatus, healthTitle, _, _ := a.currentNetworkHealth()
 	status := "代理状态：已停止"
-	if a.isCircuitBreakerActive() {
+	iconKind := trayIconKindIdle
+	switch {
+	case a.isCircuitBreakerActive():
 		status = "代理状态：⚠️ 安全熔断保护中（国内正常通，外网已拦截）"
-	} else if running && entrance != "" {
+		iconKind = trayIconKindFault
+	case healthStatus == "node_down" || healthStatus == "local_offline" || healthStatus == "core_down":
+		label := strings.TrimSpace(healthTitle)
+		if label == "" {
+			label = "代理异常 · 防漏保护生效中"
+		}
+		status = "代理状态：❌ " + truncateTrayText(label, 24)
+		iconKind = trayIconKindFault
+	case healthStatus == "degraded" && running:
+		label := strings.TrimSpace(healthTitle)
+		if label == "" {
+			label = "高延迟波动"
+		}
+		status = "代理状态：⚠️ " + truncateTrayText(label, 18) + " · " + mode
+		iconKind = trayIconKindDegraded
+	case running && entrance != "":
 		status = "代理状态：" + entrance + " · " + mode
-	} else if running {
+		iconKind = trayIconKindRunning
+	case running:
 		status = "代理状态：内核运行 · 入口已关闭"
-	} else if shouldRunProxy(state.Settings) {
+		iconKind = trayIconKindRunning
+	case shouldRunProxy(state.Settings):
 		status = "代理状态：正在连接 · " + entrance + " · " + mode
+		iconKind = trayIconKindDegraded
 	}
 	currentNodeTitle := "当前节点：" + nodeName
 	tooltip := "SanTian-Singbox | " + strings.TrimPrefix(status, "代理状态：") + " | " + nodeName
@@ -265,10 +303,15 @@ func (a *App) refreshTrayMenu() {
 	setTrayMenuTitle(items.status, &items.statusTitle, status)
 	setTrayMenuEnabled(items.start, !running)
 	setTrayMenuEnabled(items.stop, running || shouldRunProxy(state.Settings))
+	setTrayMenuEnabled(items.restart, running || shouldRunProxy(state.Settings))
 	setTrayMenuChecked(items.systemProxy, state.Settings.SystemProxy)
 	setTrayMenuChecked(items.tun, state.Settings.Tun)
 	setTrayMenuChecked(items.global, state.Settings.Mode == "global")
 	setTrayMenuChecked(items.rule, state.Settings.Mode == "rule")
+	if items.iconKind != iconKind {
+		systray.SetIcon(trayIconForBadge(iconKind))
+		items.iconKind = iconKind
+	}
 	if items.tooltip != tooltip {
 		systray.SetTooltip(tooltip)
 		items.tooltip = tooltip
@@ -346,6 +389,7 @@ func setTrayMenuChecked(item *systray.MenuItem, checked bool) {
 
 func (a *App) showWindow() {
 	defer recoverPanic(a.logger, "显示主窗口")
+	a.setWindowHidden(false)
 	if a.ctx == nil {
 		a.logger.Error("显示主窗口失败：窗口上下文未就绪")
 		return
@@ -360,6 +404,7 @@ func (a *App) showWindow() {
 
 func (a *App) hideWindow() {
 	defer recoverPanic(a.logger, "隐藏主窗口")
+	a.setWindowHidden(true)
 	if a.ctx == nil {
 		a.logger.Error("隐藏主窗口失败：窗口上下文未就绪")
 		return
@@ -375,6 +420,16 @@ func (a *App) trayStart() {
 		return
 	}
 	a.logger.Info("托盘操作：代理启动完成")
+}
+
+func (a *App) trayRestart() {
+	a.logger.Info("托盘操作：开始重启代理内核")
+	if err := a.runTrayProxyOperation(a.Restart); err != nil {
+		a.logger.Error("托盘重启代理内核失败：%v", err)
+		a.refreshTrayMenu()
+		return
+	}
+	a.logger.Info("托盘操作：重启代理内核完成")
 }
 
 func (a *App) trayStop() {

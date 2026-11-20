@@ -41,6 +41,9 @@ func SetTooltip(tooltip string) {
 	C.setTooltip(C.CString(tooltip))
 }
 
+// ShowBalloonNotification is a no-op stub on non-Windows platforms.
+func ShowBalloonNotification(title, message string, isError bool) {}
+
 func addOrUpdateMenuItem(item *MenuItem) {
 	var disabled C.short
 	if item.disabled {

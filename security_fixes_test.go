@@ -123,6 +123,23 @@ func TestAppProxyRouteRuleMatchesAppAndDirectory(t *testing.T) {
 	if !ok || len(regexes) == 0 {
 		t.Fatal("应包含目录正则以自动覆盖子进程与内核进程")
 	}
+
+	portableSettings := Settings{
+		AppProxy: true,
+		AppProxyTargets: []AppProxyTarget{
+			{Type: "app", Path: `C:\Users\test\Downloads\tool.exe`, Enabled: true},
+		},
+	}
+	portableRule := appProxyRouteRule(portableSettings)
+	if portableRule == nil {
+		t.Fatal("应生成便携应用代理规则")
+	}
+	if _, ok := portableRule["process_path"].([]string); !ok {
+		t.Fatal("便携应用应包含 process_path")
+	}
+	if _, hasRegex := portableRule["process_path_regex"]; hasRegex {
+		t.Fatalf("位于 Downloads 等共享目录的应用不得生成整目录正则：%v", portableRule["process_path_regex"])
+	}
 }
 
 func TestTunAndAppProxyCoexistence(t *testing.T) {

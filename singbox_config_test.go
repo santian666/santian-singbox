@@ -77,8 +77,8 @@ func TestBuildSingBoxConfigRuleHasDirectRules(t *testing.T) {
 	if !foundDirect {
 		t.Fatal("规则模式应包含直连分流规则")
 	}
-	if config["log"].(map[string]interface{})["level"] != "info" {
-		t.Fatalf("非 TUN 默认内核日志应保持 info，实际：%v", config["log"])
+	if config["log"].(map[string]interface{})["level"] != "warn" {
+		t.Fatalf("非 TUN 默认内核日志应保持 warn，实际：%v", config["log"])
 	}
 }
 
@@ -532,30 +532,33 @@ func TestBuildSingBoxConfigTunInbound(t *testing.T) {
 		if inbound["endpoint_independent_nat"] != true {
 			t.Fatalf("TUN 应开启 endpoint_independent_nat：%v", inbound)
 		}
-		if mtu := intFromAny(inbound["mtu"]); mtu != 1500 {
-			t.Fatalf("TUN MTU 应使用通用值 1500，实际：%d", mtu)
+		if mtu := intFromAny(inbound["mtu"]); mtu != 1400 {
+			t.Fatalf("TUN MTU 应使用 1400 以避免分片黑洞，实际：%d", mtu)
 		}
 		excludes, _ := inbound["route_exclude_address"].([]string)
-		for _, cidr := range []string{"169.254.0.0/16", "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4"} {
+		for _, cidr := range []string{"169.254.0.0/16", "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/15", "172.18.0.0/16", "172.20.0.0/14", "172.24.0.0/13", "192.168.0.0/16", "224.0.0.0/4"} {
 			if !stringSliceContains(excludes, cidr) {
 				t.Fatalf("TUN 应排除无意义或本地网段 %s，实际：%v", cidr, excludes)
 			}
+		}
+		if stringSliceContains(excludes, "172.16.0.0/12") || stringSliceContains(excludes, "172.19.0.0/16") {
+			t.Fatalf("TUN 排除列表不得重叠包含 172.19.0.0/16：%v", excludes)
 		}
 	}
 	if !foundTun {
 		t.Fatal("开启 TUN 后应生成 tun inbound")
 	}
 	logConfig := config["log"].(map[string]interface{})
-	if logConfig["level"] != "info" {
-		t.Fatalf("TUN 默认内核日志应为 info，实际：%v", logConfig["level"])
+	if logConfig["level"] != "warn" {
+		t.Fatalf("TUN 默认内核日志应为 warn，实际：%v", logConfig["level"])
 	}
-	state.Settings.CoreLogLevel = "warn"
+	state.Settings.CoreLogLevel = "info"
 	debugConfig, err := BuildSingBoxConfig(state, state.Nodes[0], "")
 	if err != nil {
 		t.Fatalf("生成 TUN 配置失败：%v", err)
 	}
-	if debugConfig["log"].(map[string]interface{})["level"] != "warn" {
-		t.Fatalf("允许切换日志级别为 warn，实际：%v", debugConfig["log"])
+	if debugConfig["log"].(map[string]interface{})["level"] != "info" {
+		t.Fatalf("允许切换日志级别为 info，实际：%v", debugConfig["log"])
 	}
 	dns := config["dns"].(map[string]interface{})
 	if dns["strategy"] != "ipv4_only" {
@@ -848,32 +851,140 @@ func TestBuildSingBoxConfigProxyMapGroup(t *testing.T) {
 	inbounds := config["inbounds"].([]map[string]interface{})
 	outbounds := config["outbounds"].([]map[string]interface{})
 	route := config["route"].(map[string]interface{})
+	dns := config["dns"].(map[string]interface{})
 	if !hasConfigItem(inbounds, "tag", "proxy-map-in-1") ||
 		!hasConfigItem(inbounds, "tag", "proxy-map-in-2") ||
-		!hasConfigItem(inbounds, "tag", "proxy-map-in-3") {
-		t.Fatalf("应为所有节点生成映射入站，分组只控制界面显示：%v", inbounds)
+		hasConfigItem(inbounds, "tag", "proxy-map-in-3") {
+		t.Fatalf("应仅按所选映射分组生成映射入站：%v", inbounds)
 	}
 	if inbound := findConfigItem(inbounds, "tag", "proxy-map-in-1"); inbound["listen_port"] != 52001 {
-		t.Fatalf("第一个映射端口应从起始端口开始：%v", inbound)
+		t.Fatalf("第一个分组映射端口应从起始端口开始：%v", inbound)
 	}
 	if inbound := findConfigItem(inbounds, "tag", "proxy-map-in-2"); inbound["listen_port"] != 52002 {
-		t.Fatalf("第二个映射端口应连续分配：%v", inbound)
+		t.Fatalf("第二个分组映射端口应连续分配：%v", inbound)
 	}
 	if !hasConfigItem(outbounds, "tag", "proxy-map-out-1") ||
 		!hasConfigItem(outbounds, "tag", "proxy-map-out-2") ||
-		!hasConfigItem(outbounds, "tag", "proxy-map-out-3") {
-		t.Fatalf("应为所有节点生成映射出站，分组只控制界面显示：%v", outbounds)
+		hasConfigItem(outbounds, "tag", "proxy-map-out-3") {
+		t.Fatalf("应仅按所选映射分组生成映射出站：%v", outbounds)
 	}
-	if outbound := findConfigItem(outbounds, "tag", "proxy-map-out-1"); outbound["server_port"] != 10001 {
-		t.Fatalf("第一个映射出站应对应完整节点列表第一个节点：%v", outbound)
+	if outbound := findConfigItem(outbounds, "tag", "proxy-map-out-1"); outbound["server_port"] != 10002 {
+		t.Fatalf("第一个分组映射出站应对应 g1 节点 10002：%v", outbound)
 	}
-	if outbound := findConfigItem(outbounds, "tag", "proxy-map-out-2"); outbound["server_port"] != 10002 {
-		t.Fatalf("第二个映射出站应对应完整节点列表第二个节点：%v", outbound)
+	if outbound := findConfigItem(outbounds, "tag", "proxy-map-out-2"); outbound["server_port"] != 10003 {
+		t.Fatalf("第二个分组映射出站应对应 g2 节点 10003：%v", outbound)
 	}
-	if !hasRouteOutbound(route["rules"].([]map[string]interface{}), "proxy-map-out-1") ||
-		!hasRouteOutbound(route["rules"].([]map[string]interface{}), "proxy-map-out-2") ||
-		!hasRouteOutbound(route["rules"].([]map[string]interface{}), "proxy-map-out-3") {
-		t.Fatalf("应生成所有节点的映射路由规则：%v", route["rules"])
+	rules := route["rules"].([]map[string]interface{})
+	if !hasRouteOutbound(rules, "proxy-map-out-1") ||
+		!hasRouteOutbound(rules, "proxy-map-out-2") ||
+		hasRouteOutbound(rules, "proxy-map-out-3") {
+		t.Fatalf("映射路由规则必须严格对应分组节点：%v", rules)
+	}
+	dnsServers := dns["servers"].([]map[string]interface{})
+	for idx, wantDetour := range []string{"proxy-map-out-1", "proxy-map-out-2"} {
+		tag := proxyMapDNSTag(idx)
+		srv := findConfigItem(dnsServers, "tag", tag)
+		if srv == nil || srv["detour"] != wantDetour {
+			t.Fatalf("代理映射 DNS %s 应绑定出口 %s，实际：%v", tag, wantDetour, dnsServers)
+		}
+	}
+	dnsRules := dns["rules"].([]map[string]interface{})
+	for idx := range []int{0, 1} {
+		wantInbound := proxyMapInboundTag(idx)
+		wantDNS := proxyMapDNSTag(idx)
+		matched := false
+		for _, r := range dnsRules {
+			if r["server"] == wantDNS && stringSliceContains(configStringValues(r["inbound"]), wantInbound) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			t.Fatalf("DNS 规则应将 %s 路由至独立 DNS %s：%v", wantInbound, wantDNS, dnsRules)
+		}
+	}
+}
+
+func TestBuildSingBoxConfigProxyMapDetourAndFingerprintUDPBlock(t *testing.T) {
+	state := testConfigState("global")
+	state.Settings.Tun = true
+	state.Settings.ProxyMap = true
+	state.Settings.ProxyMapDetour = true
+	state.Settings.ProxyMapStartPort = 52001
+	state.Nodes = append(state.Nodes,
+		Node{
+			ID:      "n2",
+			Name:    "住宅Socks",
+			Type:    "socks",
+			Address: "198.51.100.2",
+			Port:    10002,
+			Outbound: map[string]interface{}{
+				"type":        "socks",
+				"server":      "198.51.100.2",
+				"server_port": 10002,
+			},
+		},
+		Node{
+			ID:      "n3",
+			Name:    "住宅HTTP",
+			Type:    "http",
+			Address: "198.51.100.3",
+			Port:    10003,
+			Outbound: map[string]interface{}{
+				"type":        "http",
+				"server":      "198.51.100.3",
+				"server_port": 10003,
+			},
+		},
+		Node{
+			ID:      "n4",
+			Name:    "带TLS机场节点",
+			Type:    "vless",
+			Address: "example.com",
+			Port:    443,
+			Outbound: map[string]interface{}{
+				"type":        "vless",
+				"server":      "example.com",
+				"server_port": 443,
+				"uuid":        "11111111-1111-1111-1111-111111111111",
+				"tls": map[string]interface{}{
+					"enabled":     true,
+					"server_name": "example.com",
+				},
+			},
+		},
+	)
+	config, err := BuildSingBoxConfig(state, state.Nodes[0], "")
+	if err != nil {
+		t.Fatalf("生成链式代理映射配置失败：%v", err)
+	}
+	outbounds := config["outbounds"].([]map[string]interface{})
+	if out1 := findConfigItem(outbounds, "tag", "proxy-map-out-1"); out1 == nil || out1["detour"] == "proxy" {
+		t.Fatalf("当前选中主节点不应设置 detour=proxy 防自环：%v", out1)
+	}
+	if out2 := findConfigItem(outbounds, "tag", "proxy-map-out-2"); out2 == nil || out2["detour"] != "proxy" {
+		t.Fatalf("明文 socks 映射出站应注入 detour=proxy：%v", out2)
+	}
+	if out3 := findConfigItem(outbounds, "tag", "proxy-map-out-3"); out3 == nil || out3["detour"] != "proxy" {
+		t.Fatalf("明文 http 映射出站应注入 detour=proxy：%v", out3)
+	}
+	if out4 := findConfigItem(outbounds, "tag", "proxy-map-out-4"); out4 == nil || out4["detour"] != nil {
+		t.Fatalf("带 TLS 的非明文协议映射出站不应注入 detour=proxy：%v", out4)
+	}
+
+	rules := config["route"].(map[string]interface{})["rules"].([]map[string]interface{})
+	foundUDPBlock := false
+	for _, r := range rules {
+		if r["action"] == "reject" && r["network"] == "udp" && stringSliceContains(configStringValues(r["inbound"]), "tun-in") {
+			procs := configStringValues(r["process_name"])
+			if stringSliceContains(procs, "SunBrowser.exe") && stringSliceContains(procs, "BitBrowser.exe") {
+				foundUDPBlock = true
+				break
+			}
+		}
+	}
+	if !foundUDPBlock {
+		t.Fatalf("TUN + ProxyMap 下应屏蔽指纹浏览器 UDP WebRTC 泄露：%v", rules)
 	}
 }
 

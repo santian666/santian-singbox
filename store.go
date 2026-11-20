@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -21,11 +22,13 @@ func normalizeGroupID(id string) string {
 }
 
 type Store struct {
-	mu            sync.RWMutex
-	path          string
-	selectionPath string
-	state         PersistState
-	trafficDirty  bool
+	mu               sync.RWMutex
+	selectionWriteMu sync.Mutex
+	selectionSeq     uint64
+	path             string
+	selectionPath    string
+	state            PersistState
+	trafficDirty     bool
 }
 
 func NewStore(path string) (*Store, error) {
@@ -47,6 +50,7 @@ func defaultSettings() Settings {
 		AutoStart:          false,
 		CircuitBreaker:     true,
 		AutoFailover:       false,
+		FaultPopupOnHidden: true,
 	}
 }
 
@@ -83,6 +87,9 @@ func (s *Store) load() error {
 		s.state.Settings.MixedPort = 20808
 	}
 	s.state.Settings.AutoStart = false
+	if !settingsKeyExists(data, "faultPopupOnHidden") {
+		s.state.Settings.FaultPopupOnHidden = true
+	}
 	normalizeSettings(&s.state.Settings)
 	s.normalizeLocked()
 	s.loadSelectionLocked()
@@ -188,7 +195,6 @@ func (s *Store) UpdateTheme(theme string) error {
 
 func (s *Store) SelectNode(id string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	found := false
 	for _, node := range s.state.Nodes {
 		if node.ID == id {
@@ -197,15 +203,31 @@ func (s *Store) SelectNode(id string) error {
 		}
 	}
 	if !found {
+		s.mu.Unlock()
 		return errors.New("节点不存在")
 	}
 	if s.state.SelectedID == id {
+		s.mu.Unlock()
 		return nil
 	}
 	previousID := s.state.SelectedID
 	s.state.SelectedID = id
-	if err := s.saveSelectionLocked(); err != nil {
-		s.state.SelectedID = previousID
+	seq := atomic.AddUint64(&s.selectionSeq, 1)
+	selPath := s.selectionPath
+	s.mu.Unlock()
+
+	s.selectionWriteMu.Lock()
+	var err error
+	if atomic.LoadUint64(&s.selectionSeq) == seq {
+		err = writeSelectionFile(selPath, id)
+	}
+	s.selectionWriteMu.Unlock()
+	if err != nil {
+		s.mu.Lock()
+		if s.state.SelectedID == id && atomic.LoadUint64(&s.selectionSeq) == seq {
+			s.state.SelectedID = previousID
+		}
+		s.mu.Unlock()
 		return err
 	}
 	return nil
@@ -578,11 +600,17 @@ func (s *Store) saveLocked() error {
 }
 
 func (s *Store) saveSelectionLocked() error {
-	encrypted, err := encryptBytes([]byte(s.state.SelectedID))
+	s.selectionWriteMu.Lock()
+	defer s.selectionWriteMu.Unlock()
+	return writeSelectionFile(s.selectionPath, s.state.SelectedID)
+}
+
+func writeSelectionFile(path string, selectedID string) error {
+	encrypted, err := encryptBytes([]byte(selectedID))
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(s.selectionPath, encrypted, 0644)
+	return writeFileAtomic(path, encrypted, 0644)
 }
 
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {

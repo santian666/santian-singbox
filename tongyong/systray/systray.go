@@ -16,10 +16,11 @@ import (
 var (
 	log = golog.LoggerFor("systray")
 
-	systrayReady  func()
-	systrayExit   func()
-	systrayClick  func()
-	menuItems     = make(map[uint32]*MenuItem)
+	systrayReady        func()
+	systrayExit         func()
+	systrayClick        func()
+	systrayBalloonClick func()
+	menuItems           = make(map[uint32]*MenuItem)
 	menuItemsLock sync.RWMutex
 
 	currentID       = uint32(0)
@@ -84,6 +85,11 @@ func Run(onReady func(), onExit func()) {
 // SetClickHandler sets the tray icon click callback.
 func SetClickHandler(onClick func()) {
 	systrayClick = onClick
+}
+
+// SetBalloonClickHandler sets the balloon notification click callback.
+func SetBalloonClickHandler(onClick func()) {
+	systrayBalloonClick = onClick
 }
 
 // Register initializes GUI and registers the callbacks but relies on the
@@ -254,5 +260,11 @@ func systrayIconClicked() {
 	}
 	if atomic.CompareAndSwapInt64(&lastClickAtNano, last, now) {
 		systrayClick()
+	}
+}
+
+func systrayBalloonClicked() {
+	if systrayBalloonClick != nil {
+		systrayBalloonClick()
 	}
 }

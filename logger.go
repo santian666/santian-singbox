@@ -17,6 +17,7 @@ const (
 
 type Logger struct {
 	mu        sync.Mutex
+	fileMu    sync.Mutex
 	path      string
 	transient bool
 	file      *os.File
@@ -73,6 +74,21 @@ func (l *Logger) Logs() []LogMessage {
 	return out
 }
 
+func (l *Logger) RecentLogs(limit int) []LogMessage {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.trimLocked(time.Now())
+	if limit <= 0 || len(l.buffer) <= limit {
+		out := make([]LogMessage, len(l.buffer))
+		copy(out, l.buffer)
+		return out
+	}
+	start := len(l.buffer) - limit
+	out := make([]LogMessage, limit)
+	copy(out, l.buffer[start:])
+	return out
+}
+
 func (l *Logger) add(level, format string, args ...interface{}) {
 	text := stripANSI(fmt.Sprintf(format, args...))
 	now := time.Now()
@@ -85,9 +101,11 @@ func (l *Logger) add(level, format string, args ...interface{}) {
 	l.buffer = append(l.buffer, msg)
 	l.created = append(l.created, now)
 	l.trimLocked(now)
-	l.writeFileLocked(now, level, msg.Text)
 	listener := l.listener
 	l.mu.Unlock()
+	l.fileMu.Lock()
+	l.writeFileLocked(now, level, msg.Text)
+	l.fileMu.Unlock()
 	if listener != nil {
 		listener(msg)
 	}
@@ -154,8 +172,8 @@ func (l *Logger) Close() {
 	if l == nil {
 		return
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.fileMu.Lock()
+	defer l.fileMu.Unlock()
 	l.closeFileLocked()
 }
 
@@ -216,8 +234,8 @@ func (l *Logger) RotateIfLarge(maxBytes int64) {
 	if l == nil || maxBytes <= 0 {
 		return
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.fileMu.Lock()
+	defer l.fileMu.Unlock()
 	l.maxBytes = maxBytes
 	info, err := os.Stat(l.path)
 	if err == nil {

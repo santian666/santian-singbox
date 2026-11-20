@@ -37,6 +37,7 @@ function updateTraffic(snapshot = {}) {
 function renderLogPreview() {
   const target = document.getElementById("logPreviewItems");
   if (!target) return;
+  target.dataset.streamManaged = "1";
   const logs = recentLogs.slice(-8);
   if (!logs.length) {
     target.className = "log-preview-items empty";

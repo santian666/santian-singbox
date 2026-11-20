@@ -1231,3 +1231,175 @@ body[data-theme="dark"] .node-edit-card .confirm-actions {
 .node-edit-form .hidden {
   display: none !important;
 }
+
+/* ---------- 4. 四态运行徽章 / 故障弹窗 / 前置链 / 活跃连接控制 ---------- */
+.proxy-map-settings .proxy-map-detour-card {
+  grid-column: 1 / -1 !important;
+  height: 50px !important;
+  min-height: 50px !important;
+}
+
+.more-grid .switch:has(#faultPopupOnHidden) {
+  grid-column: 1 / -1;
+}
+
+.connection-list-header,
+.connection-row {
+  grid-template-columns: 185px minmax(190px, 1fr) minmax(210px, 280px) 195px !important;
+  gap: 12px !important;
+}
+
+.conn-rule-col {
+  min-width: 0;
+  overflow: hidden;
+}
+
+.conn-rule-chip {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+#faultAlertDialog {
+  position: fixed !important;
+  top: 30px !important;
+  left: 0 !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  z-index: 4500 !important;
+  background: rgba(15, 23, 42, 0.45) !important;
+}
+
+body[data-theme="dark"] #faultAlertDialog {
+  background: rgba(5, 5, 14, 0.68) !important;
+}
+
+.badge.degraded {
+  background: rgba(245, 158, 11, 0.14) !important;
+  border-color: rgba(245, 158, 11, 0.4) !important;
+  color: #b45309 !important;
+}
+
+.badge.degraded::before {
+  background: #f59e0b !important;
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.2) !important;
+}
+
+body[data-theme="dark"] .badge.degraded {
+  background: rgba(245, 158, 11, 0.18) !important;
+  border-color: rgba(251, 191, 36, 0.42) !important;
+  color: #fbbf24 !important;
+}
+
+.badge.fault,
+.badge.circuit-breaker {
+  background: rgba(239, 68, 68, 0.14) !important;
+  border-color: rgba(239, 68, 68, 0.42) !important;
+  color: #b91c1c !important;
+}
+
+.badge.fault::before,
+.badge.circuit-breaker::before {
+  background: #ef4444 !important;
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.22) !important;
+}
+
+body[data-theme="dark"] .badge.fault,
+body[data-theme="dark"] .badge.circuit-breaker {
+  background: rgba(239, 68, 68, 0.18) !important;
+  border-color: rgba(248, 113, 113, 0.45) !important;
+  color: #fca5a5 !important;
+}
+
+.fault-alert-card {
+  width: min(460px, 90vw) !important;
+  border: 1.5px solid rgba(239, 68, 68, 0.45) !important;
+  box-shadow: 0 18px 46px rgba(15, 23, 42, 0.22), 0 0 0 1px rgba(124, 58, 237, 0.12) !important;
+}
+
+.fault-alert-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  margin-bottom: 10px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #b91c1c;
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.35);
+}
+
+.fault-alert-note {
+  display: block;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(124, 58, 237, 0.06);
+  border-left: 3px solid #7c3aed;
+  font-size: 12px !important;
+  line-height: 1.45;
+  color: var(--muted) !important;
+}
+
+.fault-alert-actions {
+  flex-wrap: wrap;
+  gap: 8px !important;
+}
+
+body[data-theme="dark"] .fault-alert-card {
+  background: #171828 !important;
+  border-color: rgba(248, 113, 113, 0.48) !important;
+  box-shadow: 0 20px 52px rgba(0, 0, 0, 0.52), 0 0 0 1px rgba(168, 85, 247, 0.2) !important;
+}
+
+body[data-theme="dark"] .fault-alert-badge {
+  color: #fca5a5;
+  background: rgba(239, 68, 68, 0.18);
+  border-color: rgba(248, 113, 113, 0.42);
+}
+
+body[data-theme="dark"] .fault-alert-note {
+  background: rgba(168, 85, 247, 0.1);
+  border-left-color: #a855f7;
+}
+
+.connections-top-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.conn-process {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 140px;
+}
+
+.conn-traffic {
+  font-size: 11.5px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.conn-status-col {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: flex-end !important;
+  gap: 8px !important;
+}
+
+.conn-close-btn {
+  height: 24px !important;
+  min-width: 44px !important;
+  padding: 0 8px !important;
+  font-size: 11.5px !important;
+  border-radius: 6px !important;
+}

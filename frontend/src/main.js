@@ -1337,6 +1337,20 @@ var ia = ln((an, sn) => {
   function LogsApi() {
     return window.go.main.App.Logs ? window.go.main.App.Logs() : wn().then((e) => e.logs || []);
   }
+  function RestartApi() {
+    return window.go?.main?.App?.Restart ? window.go.main.App.Restart() : Promise.resolve();
+  }
+  function ActiveConnectionsApi() {
+    return window.go?.main?.App?.ActiveConnections
+      ? window.go.main.App.ActiveConnections()
+      : Promise.resolve({ uploadTotal: 0, downloadTotal: 0, count: 0, connections: [] });
+  }
+  function CloseConnectionApi(e) {
+    return window.go?.main?.App?.CloseConnection ? window.go.main.App.CloseConnection(e) : Promise.resolve();
+  }
+  function CloseAllConnectionsApi() {
+    return window.go?.main?.App?.CloseAllConnections ? window.go.main.App.CloseAllConnections() : Promise.resolve();
+  }
   function kn() {
     return window.go.main.App.StopIperf3();
   }
@@ -1412,6 +1426,13 @@ var ia = ln((an, sn) => {
       connectionQuery: "",
       connectionType: "all",
       connectionRule: "all",
+      activeConnections: [],
+      hasActiveConnectionsSnapshot: !1,
+      connectionsTimer: 0,
+      lastAckedFaultSeq: 0,
+      selectingNodeId: "",
+      committedSelectedId: "",
+      selectNodeReqSeq: 0,
       proxyMapScrollTop: 0,
       uiPaused: !1,
       lastStatePollAt: 0,
@@ -1586,6 +1607,10 @@ var ia = ln((an, sn) => {
                 <input id="circuitBreaker" type="checkbox" />
                 <span>智能分流熔断（防裸奔）</span>
               </label>
+              <label class="switch" title="界面最小化到右下角托盘时，若遇到节点失联或内核异常自动弹出主窗口并闪烁任务栏">
+                <input id="faultPopupOnHidden" type="checkbox" checked />
+                <span>后台隐藏时遇故障自动弹窗提醒</span>
+              </label>
               <div class="app-proxy-section">
                 <label class="option-card switch-card app-proxy-switch" for="appProxy">
                   <span class="option-icon">A</span>
@@ -1701,6 +1726,15 @@ var ia = ln((an, sn) => {
           </div>
         </div>
         <div id="proxyMapSummary" class="proxy-map-summary">未启用</div>
+        <label class="option-card switch-card proxy-map-detour-card" for="proxyMapDetour" title="将明文 Socks5 / HTTP 映射节点经当前主代理节点加密中转，隐藏本机真实发起 IP">
+          <span class="option-icon">D</span>
+          <span class="option-text">
+            <strong>前置代理链保护（住宅 IP 中转）</strong>
+            <span>将明文 Socks5 / HTTP 映射节点经当前主代理节点加密中转，隐藏本机真实发起 IP</span>
+          </span>
+          <input id="proxyMapDetour" type="checkbox" />
+          <span class="toggle-ui" aria-hidden="true"></span>
+        </label>
       </section>
       <section class="panel proxy-map-panel">
         <div class="panel-head">
@@ -1715,12 +1749,15 @@ var ia = ln((an, sn) => {
       <section class="page-title-row">
         <div>
           <h1>连接管理</h1>
-          <p class="muted">查看当前代理连接和命中规则</p>
+          <p class="muted">实时查看与管理 sing-box 活跃连接（切换此页时自动刷新）</p>
         </div>
-        <button id="refreshConnections" class="primary page-action">刷新</button>
+        <div class="connections-top-actions">
+          <button id="closeAllConnections" class="ghost danger-action page-action" type="button">断开全部连接</button>
+          <button id="refreshConnections" class="primary page-action" type="button">刷新</button>
+        </div>
       </section>
       <section class="panel page-filter-panel">
-        <input id="connectionSearch" class="search-input" placeholder="搜索连接、ID、IP、域名或规则..." />
+        <input id="connectionSearch" class="search-input" placeholder="搜索进程、域名、IP、链路或规则..." />
         <select id="connectionType" class="filter-select">
           <option value="all">网络类型</option>
           <option value="tcp">TCP</option>
@@ -1738,10 +1775,10 @@ var ia = ln((an, sn) => {
       </section>
       <section class="panel connection-view-panel">
         <div class="connection-list-header">
-          <span class="conn-header-meta">协议 / ID / 时间</span>
-          <span class="conn-header-flow">来源 ➜ 目标</span>
-          <span class="conn-header-rule">命中规则</span>
-          <span class="conn-header-status">状态</span>
+          <span class="conn-header-meta">协议 / 进程</span>
+          <span class="conn-header-flow">目标地址</span>
+          <span class="conn-header-rule">规则 / 链路</span>
+          <span class="conn-header-status">流量 / 操作</span>
         </div>
         <div id="connections" class="connection-grid empty">暂无连接</div>
       </section>
@@ -2246,6 +2283,21 @@ var ia = ln((an, sn) => {
         <button id="networkToolClose" class="primary" type="button">关闭</button>
       </div>
     </div>
+  </div>
+  <div id="faultAlertDialog" class="confirm-dialog hidden" role="dialog" aria-modal="true" aria-labelledby="faultAlertTitle">
+    <div class="confirm-card fault-alert-card">
+      <div class="confirm-content">
+        <span id="faultAlertBadge" class="fault-alert-badge">防漏保护锁定中</span>
+        <h2 id="faultAlertTitle">检测到代理故障</h2>
+        <p id="faultAlertMessage"></p>
+        <span class="fault-alert-note">为保障您的真实网络环境不暴露，系统已阻止直连回退。请切换可用节点、重启内核或手动停止代理后关闭网页。</span>
+      </div>
+      <div class="confirm-actions fault-alert-actions">
+        <button id="faultAlertKeepLock" class="ghost" type="button">保持断网防漏</button>
+        <button id="faultAlertRestartCore" class="ghost" type="button">立即重启内核</button>
+        <button id="faultAlertSwitchNode" class="primary" type="button">去切换节点</button>
+      </div>
+    </div>
   </div>  <div class="notice-stack">
     <div id="toast" class="toast" role="status" aria-live="polite"></div>
     <div id="activity" class="activity hidden" role="status" aria-live="polite">
@@ -2324,14 +2376,52 @@ var ia = ln((an, sn) => {
     const n = Boolean(e.running),
       a = W("refreshConnections"),
       r = Boolean(s.busyKey);
-    const cb = Boolean(e.circuitBreakerActive);
-    ((runBadge.textContent = cb ? "安全熔断中" : n ? "\u8FD0\u884C\u4E2D" : "\u672A\u8FD0\u884C"),
-      c("runBadge").classList.toggle("running", n && !cb),
-      c("runBadge").classList.toggle("circuit-breaker", cb),
-      c("runBadge").classList.toggle("working", W("settings")),
-      cb &&
-        !s.lastCircuitBreakerActive &&
-        P("【智能分流熔断】海外代理链路异常，已自动拦截海外流量以防直连泄露，国内网络保持正常畅通。"),
+    const cb = Boolean(e.circuitBreakerActive),
+      hs = String(e.networkHealthStatus || ""),
+      fseq = Number(e.networkFaultSeq || 0);
+    if (!s.selectingNodeId) s.committedSelectedId = e.selectedId || "";
+    const effectiveSelectedId = s.selectingNodeId || e.selectedId || "";
+    if (s.selectingNodeId && e.selectedId === s.selectingNodeId) s.selectingNodeId = "";
+    const rb = c("runBadge");
+    if (rb) {
+      let badgeText = n ? "\u8FD0\u884C\u4E2D" : "\u672A\u8FD0\u884C";
+      if (hs === "local_offline") badgeText = "本机断网 · 防漏锁定";
+      else if (hs === "node_down") badgeText = "节点不可达 · 防漏锁定";
+      else if (hs === "core_down") badgeText = "内核异常 · 防漏锁定";
+      else if (hs === "degraded" && n) badgeText = e.networkHealthTitle || "延迟偏高";
+      else if (cb) badgeText = "安全熔断中";
+      const isFault = hs === "local_offline" || hs === "node_down" || hs === "core_down";
+      const isDegraded = hs === "degraded" && n;
+      rb.textContent = badgeText;
+      rb.classList.toggle("running", n && !cb && !isFault && !isDegraded);
+      rb.classList.toggle("degraded", isDegraded);
+      rb.classList.toggle("fault", isFault);
+      rb.classList.toggle("circuit-breaker", cb);
+      rb.classList.toggle("working", W("settings"));
+    }
+    const faultDlg = c("faultAlertDialog");
+    if (faultDlg) {
+      const isHardFault = hs === "local_offline" || hs === "node_down" || hs === "core_down";
+      if (isHardFault && fseq > s.lastAckedFaultSeq) {
+        const badgeEl = c("faultAlertBadge");
+        if (badgeEl) {
+          badgeEl.textContent =
+            hs === "local_offline"
+              ? "本机物理网络中断 · 防漏锁定中"
+              : hs === "core_down"
+                ? "sing-box 内核异常 · 防漏锁定中"
+                : "代理节点无响应 · 防漏锁定中";
+        }
+        if (c("faultAlertTitle")) c("faultAlertTitle").textContent = e.networkHealthTitle || "检测到代理故障";
+        if (c("faultAlertMessage")) c("faultAlertMessage").textContent = e.networkHealthMessage || "";
+        faultDlg.classList.remove("hidden");
+      } else if (!isHardFault) {
+        faultDlg.classList.add("hidden");
+      }
+    }
+    (cb &&
+      !s.lastCircuitBreakerActive &&
+      P("【智能分流熔断】海外代理链路异常，已自动拦截海外流量以防直连泄露，国内网络保持正常畅通。"),
       (s.lastCircuitBreakerActive = cb));
     const proxyJustStarted = n && !s.lastProxyRunning;
     s.lastProxyRunning = n;
@@ -2357,12 +2447,14 @@ var ia = ln((an, sn) => {
         ((c("mixedPort").value = s.settings.mixedPort || 20808),
         (c("proxyMap").checked = Boolean(s.settings.proxyMap)),
         (c("proxyMapStartPort").value = s.settings.proxyMapStartPort || 52001),
+        c("proxyMapDetour") && (c("proxyMapDetour").checked = Boolean(s.settings.proxyMapDetour)),
         Dn(e.groups || [], Ze(s.settings)),
         (c("systemProxy").checked = Boolean(s.settings.systemProxy)),
         (c("tunProxy").checked = Boolean(s.settings.tun)),
         (c("ruleSource").value = s.settings.ruleSource || "sagernet"),
         (c("autoStart").checked = !1),
         c("circuitBreaker") && (c("circuitBreaker").checked = s.settings.circuitBreaker !== !1),
+        c("faultPopupOnHidden") && (c("faultPopupOnHidden").checked = s.settings.faultPopupOnHidden !== !1),
         (c("appProxy").checked = Boolean(s.settings.appProxy)),
         Ke(s.settings.appProxyTargets || [])),
       (() => {
@@ -2395,6 +2487,7 @@ var ia = ln((an, sn) => {
       _t(),
       (c("mixedPort").disabled = n),
       (c("proxyMap").disabled = Rt()),
+      c("proxyMapDetour") && (c("proxyMapDetour").disabled = Rt()),
       (c("proxyMapStartPort").disabled = n),
       (c("proxyMapGroupToggle").disabled = Rt()),
       (c("systemProxy").disabled = Rt()),
@@ -2411,13 +2504,14 @@ var ia = ln((an, sn) => {
   function refreshVisibleStatePanels(e = {}) {
     const t = e.nodes || [],
       n = e.groups || [],
-      a = e.logs || [];
+      a = e.logs || [],
+      sel = s.selectingNodeId || e.selectedId;
     (s.page === "home"
-      ? (Oe(n, t), Ce(t, e.selectedId))
+      ? (Oe(n, t), Ce(t, sel))
       : s.page === "proxyMap"
         ? It(t)
         : s.page === "connections"
-          ? Be(a)
+          ? Be(s.hasActiveConnectionsSnapshot ? s.activeConnections : a)
           : s.page === "logs" && loadFullLogs(),
       Xn(a));
   }
@@ -2779,7 +2873,7 @@ var ia = ln((an, sn) => {
     }
     const renderNode = (v) => {
         const w = v.id === t,
-          x = W(`selectNode:${v.id}`),
+          x = s.selectingNodeId === v.id,
           y = W(`deleteNode:${v.id}`),
           z = s.testingNodeId === v.id,
           A = Boolean(s.busyKey || s.testingNodeId),
@@ -2818,15 +2912,33 @@ var ia = ln((an, sn) => {
           if (!w) return;
           const x = w.dataset;
           if (x.select) {
-            if (s.busyKey) return;
-            ((s.busyKey = `selectNode:${x.select}`), te());
-            try {
-              (await vn(x.select), s.lastState && (s.lastState.selectedId = x.select), P("节点已选择"));
-            } catch (y) {
-              P(J(y));
-            } finally {
-              ((s.busyKey = ""), te());
-            }
+            const targetId = x.select;
+            if (!s.lastState) return;
+            const prevCommitted = s.committedSelectedId || s.lastState.selectedId || "";
+            if ((s.lastState.selectedId || "") === targetId && s.committedSelectedId === targetId) return;
+            const reqSeq = (s.selectNodeReqSeq = (s.selectNodeReqSeq || 0) + 1);
+            s.selectingNodeId = targetId;
+            s.lastState.selectedId = targetId;
+            Ce(s.lastState.nodes || [], targetId);
+            vn(targetId)
+              .then(() => {
+                if (s.selectNodeReqSeq === reqSeq) {
+                  s.selectingNodeId = "";
+                  s.committedSelectedId = targetId;
+                  if (s.lastState) s.lastState.selectedId = targetId;
+                  P("节点已选择");
+                }
+              })
+              .catch((y) => {
+                if (s.selectNodeReqSeq === reqSeq) {
+                  s.selectingNodeId = "";
+                  if (s.lastState) {
+                    s.lastState.selectedId = prevCommitted;
+                    Ce(s.lastState.nodes || [], prevCommitted);
+                  }
+                  P(J(y));
+                }
+              });
             return;
           }
           if (x.copyNode) {
@@ -3456,31 +3568,20 @@ var ia = ln((an, sn) => {
   function Be(e) {
     const t = c("connections");
     if (!t) return;
-    const n = Jn(e),
-      a = n.filter((r) => tr(r)).slice(0, 60);
+    const n = Jn(Array.isArray(e) ? e : []),
+      a = n.filter((r) => tr(r)).slice(0, 80);
     if (!a.length) {
-      ((t.className = "connection-grid empty"), (t.textContent = n.length ? "没有匹配的连接" : "暂无连接"));
+      ((t.className = "connection-grid empty"), (t.textContent = n.length ? "没有匹配的连接" : "暂无活跃连接"));
       return;
     }
     ((t.className = "connection-grid"),
       (t.innerHTML = a
         .map((r, i) => {
           const o = i === 0 ? " featured" : "",
-            isBlock =
-              r.rule === "block" ||
-              String(r.rule || "")
-                .toLowerCase()
-                .includes("block"),
-            isProxy =
-              r.rule === "proxy" ||
-              String(r.rule || "")
-                .toLowerCase()
-                .includes("proxy"),
-            isDirect =
-              r.rule === "direct" ||
-              String(r.rule || "")
-                .toLowerCase()
-                .includes("direct"),
+            ruleLower = String(r.ruleFull || r.rule || "").toLowerCase(),
+            isBlock = r.rule === "block" || ruleLower.includes("block") || ruleLower.includes("reject"),
+            isProxy = r.rule === "proxy" || ruleLower.includes("proxy"),
+            isDirect = r.rule === "direct" || ruleLower.includes("direct"),
             u = r.error
               ? " rule-error"
               : isBlock
@@ -3490,13 +3591,20 @@ var ia = ln((an, sn) => {
                   : isDirect
                     ? " rule-direct"
                     : "",
-            b = r.rule || (r.error ? "error" : "final"),
-            S = isBlock
-              ? '<span class="traffic-blocked">已拦截</span>'
-              : r.error
-                ? '<span class="traffic-up">异常</span>'
-                : '<span class="traffic-muted">正常</span>',
-            p = r.protocol === "UDP" ? "chip-udp" : "chip-tcp";
+            b = r.ruleFull || r.rule || (r.error ? "error" : "final"),
+            p = r.protocol === "UDP" ? "chip-udp" : "chip-tcp",
+            metaExtra = r.process
+              ? `<span class="conn-process" title="${m(r.process)}">${m(r.process)}</span>`
+              : `<span class="connection-id">#${m(r.shortId || r.id)}</span>`,
+            statusHtml = r.structured
+              ? `<span class="conn-traffic">${m(Ne(r.upload))} ↑ / ${m(Ne(r.download))} ↓</span>${
+                  r.id ? `<button class="ghost small conn-close-btn" data-close-conn="${m(r.id)}" type="button">断开</button>` : ""
+                }`
+              : isBlock
+                ? '<span class="traffic-blocked">已拦截</span>'
+                : r.error
+                  ? '<span class="traffic-up">异常</span>'
+                  : '<span class="traffic-muted">正常</span>';
           return (
             '<div class="connection-row' +
             o +
@@ -3504,15 +3612,14 @@ var ia = ln((an, sn) => {
             p +
             '">' +
             m(r.protocol) +
-            '</span><span class="connection-id">#' +
-            m(r.id) +
-            '</span><time class="conn-time">' +
-            m(r.time) +
-            '</time></div><div class="conn-flow"><span class="conn-source" title="来源: ' +
-            m(r.source) +
-            '">' +
-            m(r.source) +
-            '</span><span class="conn-arrow" aria-hidden="true">➜</span><strong class="conn-target" title="目标: ' +
+            "</span>" +
+            metaExtra +
+            (r.time ? '<time class="conn-time">' + m(r.time) + "</time>" : "") +
+            '</div><div class="conn-flow">' +
+            (r.source && !r.structured
+              ? '<span class="conn-source" title="来源: ' + m(r.source) + '">' + m(r.source) + '</span><span class="conn-arrow" aria-hidden="true">➜</span>'
+              : "") +
+            '<strong class="conn-target" title="目标: ' +
             m(r.target) +
             '">' +
             m(r.target) +
@@ -3523,7 +3630,7 @@ var ia = ln((an, sn) => {
             '">' +
             m(b) +
             '</mark></div><div class="conn-status-col">' +
-            S +
+            statusHtml +
             "</div></div>"
           );
         })
@@ -3569,7 +3676,7 @@ var ia = ln((an, sn) => {
   }
   function Xn(e) {
     const t = c("logPreviewItems");
-    if (!t) return;
+    if (!t || t.dataset.streamManaged === "1") return;
     const a = e.slice(s.clearedLogIndex).slice(-8);
     if (!a.length) {
       ((t.className = "log-preview-items empty"), (t.textContent = "暂无日志"));
@@ -3590,13 +3697,38 @@ var ia = ln((an, sn) => {
   }
   function Jn(e) {
     const t = [];
-    return (
-      e.forEach((n, a) => {
-        const r = Yn(n, a);
-        r && t.push(r);
-      }),
-      t.slice(-60).reverse()
-    );
+    (e || []).forEach((n, a) => {
+      if (n && (n.destinationIp !== undefined || n.chains !== undefined || n.host !== undefined)) {
+        const proto = String(n.network || n.type || "TCP").toUpperCase(),
+          proc = String(n.process || "").trim(),
+          targetHost = String(n.host || n.destinationIp || "未知"),
+          target = n.port ? `${targetHost}:${n.port}` : targetHost,
+          chainsText = Array.isArray(n.chains) && n.chains.length ? n.chains.join(" → ") : "",
+          ruleText = String(n.rule || chainsText || "final"),
+          ruleFull = n.rule && chainsText ? `${n.rule} (${chainsText})` : ruleText,
+          id = String(n.id || "");
+        t.push({
+          structured: !0,
+          id,
+          shortId: id.slice(0, 6) || String(a + 1).padStart(4, "0"),
+          time: "",
+          protocol: proto,
+          process: proc,
+          source: proc || String(n.type || "本机"),
+          target,
+          rule: ruleText,
+          ruleFull,
+          upload: Number(n.upload || 0),
+          download: Number(n.download || 0),
+          error: !1,
+          searchText: `${proto} ${proc} ${target} ${n.destinationIp || ""} ${ruleFull}`.toLowerCase(),
+        });
+        return;
+      }
+      const r = Yn(n, a);
+      r && t.push(r);
+    });
+    return t[0]?.structured ? t.slice(0, 80) : t.slice(-60).reverse();
   }
   function Yn(e, t) {
     const n = String(e.text || "");
@@ -3717,11 +3849,11 @@ var ia = ln((an, sn) => {
       a = Ze();
     if (!a.length) return [];
     return (e || [])
+      .filter((r) => a.includes(r.groupId || "default"))
       .map((r, i) => {
         const o = t + i;
         return { node: r, port: o, address: `127.0.0.1:${o}` };
-      })
-      .filter((r) => a.includes(r.node.groupId || "default"));
+      });
   }
   function sr(e) {
     return it(e).map((t) => t.address).join(`
@@ -5887,6 +6019,7 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
       proxyMapStartPort: Number(c("proxyMapStartPort").value),
       proxyMapGroupIds: e,
       proxyMapGroupId: e[0] || "",
+      proxyMapDetour: c("proxyMapDetour") ? c("proxyMapDetour").checked : !1,
       appProxy: c("appProxy").checked,
       appProxyTargets: Kt(s.settings.appProxyTargets || []),
       ruleSource: c("ruleSource").value,
@@ -5895,6 +6028,7 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
       fakeDns: !1,
       autoStart: !1,
       circuitBreaker: c("circuitBreaker") ? c("circuitBreaker").checked : !0,
+      faultPopupOnHidden: c("faultPopupOnHidden") ? c("faultPopupOnHidden").checked : !0,
       autoFailover: Boolean(s.settings.autoFailover),
       theme: document.body.dataset.theme === "dark" ? "dark" : "light",
       directDomains: t.value,
@@ -6053,9 +6187,11 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
       xe(n, e.systemProxy, t.systemProxy, "系统代理"),
       xe(n, e.tun, t.tun, "TUN 代理"),
       xe(n, e.proxyMap, t.proxyMap, "代理映射"),
+      xe(n, Boolean(e.proxyMapDetour), Boolean(t.proxyMapDetour), "前置代理链"),
       xe(n, e.appProxy, t.appProxy, "全局代理应用"),
       xe(n, e.autoStart !== !1, t.autoStart !== !1, "开机自启动"),
       xe(n, e.circuitBreaker !== !1, t.circuitBreaker !== !1, "智能分流熔断"),
+      xe(n, e.faultPopupOnHidden !== !1, t.faultPopupOnHidden !== !1, "隐藏故障弹窗"),
       xe(n, Boolean(e.autoFailover), Boolean(t.autoFailover), "自动切换"),
       ge(n, e.mixedPort, t.mixedPort, "\u672C\u5730\u7AEF\u53E3\u5DF2\u66F4\u65B0"),
       ge(n, e.proxyMapStartPort, t.proxyMapStartPort, "\u4EE3\u7406\u6620\u5C04\u7AEF\u53E3\u5DF2\u66F4\u65B0"),
@@ -6195,12 +6331,14 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
       c("proxyMap").addEventListener("change", () => {
         ue(0);
       }),
+      we("proxyMapDetour"),
       c("appProxy").addEventListener("change", () => {
         (Ke(s.settings.appProxyTargets || []), ue(0));
       }),
       we("ruleSource"),
       we("autoStart"),
       we("circuitBreaker"),
+      we("faultPopupOnHidden"),
       we("mixedPort", "input", 700),
       we("proxyMapStartPort", "input", 700),
       c("pickAppProxyFolder").addEventListener("click", () => Mt("folder")),
@@ -6388,23 +6526,80 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
           "refreshConnections",
           "正在刷新连接",
           async () => {
-            await Me();
+            await loadActiveConnections(!0);
           },
           null,
           { skipRefresh: !0 },
         ),
       ),
+      c("closeAllConnections") &&
+        c("closeAllConnections").addEventListener("click", () =>
+          H(
+            "closeAllConnections",
+            "正在断开全部连接",
+            async () => {
+              await CloseAllConnectionsApi();
+              s.activeConnections = [];
+              s.hasActiveConnectionsSnapshot = !0;
+              Be([]);
+              P("已断开全部活跃连接");
+            },
+            null,
+            { skipRefresh: !0 },
+          ),
+        ),
+      c("connections") &&
+        c("connections").addEventListener("click", async (e) => {
+          const btn = e.target.closest("[data-close-conn]");
+          if (!btn) return;
+          const id = btn.dataset.closeConn;
+          if (!id) return;
+          btn.disabled = !0;
+          try {
+            await CloseConnectionApi(id);
+            s.activeConnections = (s.activeConnections || []).filter((item) => item.id !== id);
+            Be(s.activeConnections);
+            P("已断开连接");
+          } catch (err) {
+            btn.disabled = !1;
+            P(J(err));
+          }
+        }),
+      c("faultAlertSwitchNode") &&
+        c("faultAlertSwitchNode").addEventListener("click", () => {
+          s.lastAckedFaultSeq = Number(s.lastState?.networkFaultSeq || s.lastAckedFaultSeq || 0);
+          c("faultAlertDialog")?.classList.add("hidden");
+          Tt("home");
+        }),
+      c("faultAlertRestartCore") &&
+        c("faultAlertRestartCore").addEventListener("click", () => {
+          s.lastAckedFaultSeq = Number(s.lastState?.networkFaultSeq || s.lastAckedFaultSeq || 0);
+          c("faultAlertDialog")?.classList.add("hidden");
+          H("restartCore", "正在重启代理内核", async () => {
+            await RestartApi();
+            P("代理内核重启完成");
+          });
+        }),
+      c("faultAlertKeepLock") &&
+        c("faultAlertKeepLock").addEventListener("click", () => {
+          s.lastAckedFaultSeq = Number(s.lastState?.networkFaultSeq || s.lastAckedFaultSeq || 0);
+          c("faultAlertDialog")?.classList.add("hidden");
+          P("已保持断网防漏锁定，保护真实环境不暴露");
+        }),
       c("connectionSearch").addEventListener("input", (e) => {
         var t;
-        ((s.connectionQuery = e.target.value), Be(((t = s.lastState) == null ? void 0 : t.logs) || []));
+        ((s.connectionQuery = e.target.value),
+          Be(s.hasActiveConnectionsSnapshot ? s.activeConnections : ((t = s.lastState) == null ? void 0 : t.logs) || []));
       }),
       c("connectionType").addEventListener("change", (e) => {
         var t;
-        ((s.connectionType = e.target.value), Be(((t = s.lastState) == null ? void 0 : t.logs) || []));
+        ((s.connectionType = e.target.value),
+          Be(s.hasActiveConnectionsSnapshot ? s.activeConnections : ((t = s.lastState) == null ? void 0 : t.logs) || []));
       }),
       c("connectionRule").addEventListener("change", (e) => {
         var t;
-        ((s.connectionRule = e.target.value), Be(((t = s.lastState) == null ? void 0 : t.logs) || []));
+        ((s.connectionRule = e.target.value),
+          Be(s.hasActiveConnectionsSnapshot ? s.activeConnections : ((t = s.lastState) == null ? void 0 : t.logs) || []));
       }),
       c("logSearch").addEventListener("input", (e) => {
         ((s.logQuery = e.target.value), s.fullLogs ? Se(s.fullLogs) : loadFullLogs());
@@ -6513,6 +6708,34 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
       c("toolboxTesterTab") && c("toolboxTesterTab").classList.toggle("hidden", s.testerTab !== "toolbox"),
       (s.testerTab === "mtr" || s.testerTab === "iperf3" || s.testerTab === "localSpeedtest") && Qr());
   }
+  async function loadActiveConnections(showError = !1) {
+    if (!window.go?.main?.App?.ActiveConnections) {
+      Be((s.lastState && s.lastState.logs) || []);
+      return;
+    }
+    try {
+      const res = await ActiveConnectionsApi();
+      s.activeConnections = Array.isArray(res?.connections) ? res.connections : [];
+      s.connectionsTotalUp = Number(res?.uploadTotal || 0);
+      s.connectionsTotalDown = Number(res?.downloadTotal || 0);
+      s.hasActiveConnectionsSnapshot = !0;
+      if (s.page === "connections") Be(s.activeConnections);
+    } catch (err) {
+      if (showError) P("获取活跃连接失败：" + J(err));
+    }
+  }
+  function syncConnectionsPolling() {
+    if (s.connectionsTimer) {
+      clearInterval(s.connectionsTimer);
+      s.connectionsTimer = 0;
+    }
+    if (s.page === "connections" && !document.hidden) {
+      loadActiveConnections(!1);
+      s.connectionsTimer = setInterval(() => {
+        if (s.page === "connections" && !document.hidden) loadActiveConnections(!1);
+      }, 1500);
+    }
+  }
   function Tt(e) {
     const t = ["home", "proxyMap", "connections", "logs", "tester"];
     if (
@@ -6526,6 +6749,7 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
         n.classList.toggle("active", n.dataset.page === s.page);
       }),
       refreshVisibleStatePanels(s.lastState || {}),
+      syncConnectionsPolling(),
       s.page === "logs" && s.logAutoScroll)
     ) {
       const n = c("logItems");
@@ -7358,7 +7582,7 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
   initAppUpdateUI();
   setInterval(scheduleStatePoll, 30000);
   document.addEventListener("visibilitychange", () => {
-    document.hidden ? (s.uiPaused = !0) : ((s.uiPaused = !1), handleSystemResume());
+    document.hidden ? ((s.uiPaused = !0), syncConnectionsPolling()) : ((s.uiPaused = !1), syncConnectionsPolling(), handleSystemResume());
   });
 });
 export default ia();

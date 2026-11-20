@@ -133,6 +133,20 @@ func cleanupProxyAfterParentExit(options proxyWatchdogOptions) error {
 		logger.Info("检测到同路径的新 GUI 已启动，跳过系统代理、TUN 和状态清理")
 		return result
 	}
+	if wasEnabled {
+		if effectiveTun(settings) {
+			cleanupTunInterface(logger)
+			if settings.CircuitBreaker && strings.TrimSpace(options.Root) != "" && hasAdminPrivileges() {
+				if ksErr := enableKillSwitch(options.Root, logger, options.CorePath, options.GUIPath); ksErr != nil {
+					result = errors.Join(result, ksErr)
+				}
+			}
+		} else {
+			_ = disableKillSwitch(options.Root, logger)
+		}
+		logger.Error("检测到 GUI 异常退出且代理处于开启状态：已清除无主 TUN 网卡并保持防漏锁定（不自动恢复直连），请重新打开应用恢复或停止代理")
+		return result
+	}
 	if owned, err := systemProxyEnabledForPort(settings.MixedPort); err != nil {
 		result = errors.Join(result, fmt.Errorf("读取系统代理失败：%w", err))
 	} else if owned {
@@ -142,21 +156,7 @@ func cleanupProxyAfterParentExit(options proxyWatchdogOptions) error {
 			logger.Info("已关闭异常退出后残留的系统代理：127.0.0.1:%d", settings.MixedPort)
 		}
 	}
-	if effectiveTun(settings) {
-		cleanupTunInterface(logger)
-	}
 	_ = disableKillSwitch(options.Root, logger)
-	if storeErr != nil {
-		result = errors.Join(result, fmt.Errorf("读取代理状态失败：%w", storeErr))
-	} else {
-		app := &App{store: store, logger: logger}
-		if err := app.disableStoredProxyEntrances("异常退出恢复"); err != nil {
-			result = errors.Join(result, err)
-		}
-	}
-	if result == nil && wasEnabled {
-		logger.Info("异常退出残留已清理完成")
-	}
 	return result
 }
 

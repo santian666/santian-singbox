@@ -249,6 +249,16 @@ var clashAPITransport = &http.Transport{
 }
 
 func (m *SingBoxManager) testNodeDelayViaClashAPI(tag string, testURL string, timeout time.Duration) (int, error) {
+	return m.testNodeDelayViaClashAPIContext(context.Background(), tag, testURL, timeout)
+}
+
+func (m *SingBoxManager) testNodeDelayViaClashAPIContext(ctx context.Context, tag string, testURL string, timeout time.Duration) (int, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if !m.Running() {
 		return 0, errors.New("sing-box 内核未运行")
 	}
@@ -270,6 +280,9 @@ func (m *SingBoxManager) testNodeDelayViaClashAPI(tag string, testURL string, ti
 	escapedTag := url.PathEscape(strings.ReplaceAll(tag, "/", "%2F"))
 	var lastErr error
 	for _, target := range targets {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 		apiURL := fmt.Sprintf("http://%s/proxies/%s/delay?url=%s&timeout=%d",
 			clashAPIAddress,
 			escapedTag,
@@ -277,13 +290,16 @@ func (m *SingBoxManager) testNodeDelayViaClashAPI(tag string, testURL string, ti
 			timeoutMS,
 		)
 		client := http.Client{Transport: clashAPITransport, Timeout: timeout + 1200*time.Millisecond}
-		req, err := http.NewRequest(http.MethodGet, apiURL, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 		if err != nil {
 			lastErr = err
 			continue
 		}
 		resp, err := client.Do(req)
 		if err != nil {
+			if ctx.Err() != nil {
+				return 0, ctx.Err()
+			}
 			if isClashAPIDialError(err) {
 				return 0, err
 			}

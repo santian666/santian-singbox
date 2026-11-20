@@ -40,6 +40,7 @@ type Settings struct {
 	ProxyMapStartPort      int                     `json:"proxyMapStartPort"`
 	ProxyMapGroupID        string                  `json:"proxyMapGroupId"`
 	ProxyMapGroupIDs       []string                `json:"proxyMapGroupIds"`
+	ProxyMapDetour         bool                    `json:"proxyMapDetour"`
 	ExternalProxyEndpoints []ExternalProxyEndpoint `json:"externalProxyEndpoints"`
 	AppProxy               bool                    `json:"appProxy"`
 	AppProxyTargets        []AppProxyTarget        `json:"appProxyTargets"`
@@ -53,6 +54,7 @@ type Settings struct {
 	CircuitBreaker         bool                    `json:"circuitBreaker"`
 	KillSwitch             bool                    `json:"killSwitch"`
 	AutoFailover           bool                    `json:"autoFailover"`
+	FaultPopupOnHidden     bool                    `json:"faultPopupOnHidden"`
 	Theme                  string                  `json:"theme"`
 }
 
@@ -120,6 +122,10 @@ type RuntimeState struct {
 	TunStatus            string       `json:"tunStatus"`
 	CircuitBreakerActive bool         `json:"circuitBreakerActive"`
 	CircuitBreakerReason string       `json:"circuitBreakerReason,omitempty"`
+	NetworkHealthStatus  string       `json:"networkHealthStatus,omitempty"`
+	NetworkHealthTitle   string       `json:"networkHealthTitle,omitempty"`
+	NetworkHealthMessage string       `json:"networkHealthMessage,omitempty"`
+	NetworkFaultSeq      int64        `json:"networkFaultSeq,omitempty"`
 }
 
 type RulePreset struct {
@@ -248,4 +254,26 @@ type ConfigMode struct {
 	RuleSets   []string `json:"ruleSets"`
 	HasDirect  bool     `json:"hasDirect"`
 	DirectHits []string `json:"directHits"`
+}
+
+type ConnectionItem struct {
+	ID            string   `json:"id"`
+	Host          string   `json:"host"`
+	DestinationIP string   `json:"destinationIp"`
+	Port          string   `json:"port"`
+	Network       string   `json:"network"`
+	Type          string   `json:"type"`
+	Rule          string   `json:"rule"`
+	Chains        []string `json:"chains"`
+	Process       string   `json:"process"`
+	Upload        int64    `json:"upload"`
+	Download      int64    `json:"download"`
+	Start         string   `json:"start"`
+}
+
+type ConnectionsSnapshot struct {
+	UploadTotal   int64            `json:"uploadTotal"`
+	DownloadTotal int64            `json:"downloadTotal"`
+	Count         int              `json:"count"`
+	Connections   []ConnectionItem `json:"connections"`
 }

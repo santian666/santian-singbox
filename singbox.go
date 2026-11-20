@@ -5,7 +5,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -70,7 +72,10 @@ var tunRouteExcludeIPCIDRs = []string{
 	"100.64.0.0/10",
 	"127.0.0.0/8",
 	"169.254.0.0/16",
-	"172.16.0.0/12",
+	"172.16.0.0/15",
+	"172.18.0.0/16",
+	"172.20.0.0/14",
+	"172.24.0.0/13",
 	"192.168.0.0/16",
 	"224.0.0.0/4",
 	"240.0.0.0/4",
@@ -79,6 +84,13 @@ var tunRouteExcludeIPCIDRs = []string{
 	"fc00::/7",
 	"fe80::/10",
 	"ff00::/8",
+}
+
+var domesticDoHBypassDomains = []string{
+	"dns.alidns.com",
+	"doh.pub",
+	"sm2.doh.pub",
+	"dns.pub",
 }
 
 var tunBlockIPCIDRs = []string{
@@ -252,6 +264,13 @@ type SingBoxManager struct {
 	missingFakeIPLogCount  int
 	lastMissingFakeIPLogAt time.Time
 	runningDirectDNS       string
+	lastVerifiedConfigHash string
+	cachedConfigMode       ConfigMode
+	cachedConfigModes      map[string]ConfigMode
+	cachedTunActive        bool
+	hasCachedConfigMode    bool
+	coreMissingUntil       time.Time
+	onUnexpectedExit       func(error)
 }
 
 type TrafficSnapshot struct {
@@ -267,6 +286,11 @@ type trafficCache struct {
 }
 
 func NewSingBoxManager(rootDir, corePath, config, cachePath string, logger *Logger) *SingBoxManager {
+	if strings.TrimSpace(corePath) != "" {
+		if abs, err := filepath.Abs(corePath); err == nil {
+			corePath = abs
+		}
+	}
 	return &SingBoxManager{
 		rootDir:   rootDir,
 		corePath:  corePath,
@@ -449,22 +473,15 @@ func (m *SingBoxManager) SelectOutboundVerified(tag string) error {
 		return errors.New("节点出站标识为空")
 	}
 	fastErr := m.selectOutbound(tag, true)
-	if fastErr == nil && outboundSelectionMatches(tag, m.currentOutbound, 0, true) {
-		return nil
-	}
-	if outboundSelectionMatches(tag, m.currentOutbound, 80*time.Millisecond, true) {
+	if fastErr == nil {
 		return nil
 	}
 	reliableErr := m.selectOutbound(tag, false)
-	if outboundSelectionMatches(tag, m.currentOutbound, 150*time.Millisecond, true) ||
-		outboundSelectionMatches(tag, m.currentOutbound, 300*time.Millisecond, false) {
+	if reliableErr == nil {
 		return nil
 	}
-	if fastErr == nil {
-		fastErr = errors.New("selector 未更新为目标节点")
-	}
-	if reliableErr == nil {
-		reliableErr = errors.New("selector 重试后仍未更新为目标节点")
+	if outboundSelectionMatches(tag, m.currentOutbound, 80*time.Millisecond, false) {
+		return nil
 	}
 	return fmt.Errorf("节点切换未确认成功：快速确认失败：%v；稳定重试失败：%w", fastErr, reliableErr)
 }
@@ -553,6 +570,15 @@ func (m *SingBoxManager) SetMode(mode string) error {
 	applyErr := doClashAPIFast(req)
 	confirmErr := confirmModeSelection(wanted, m.currentMode, 1200*time.Millisecond, 80*time.Millisecond)
 	if confirmErr == nil {
+		m.mu.Lock()
+		if m.hasCachedConfigMode {
+			if cached, ok := m.cachedConfigModes[wanted]; ok {
+				m.cachedConfigMode = cached
+			} else {
+				m.cachedConfigMode.Mode = wanted
+			}
+		}
+		m.mu.Unlock()
 		return nil
 	}
 	if applyErr != nil {
@@ -613,6 +639,178 @@ func confirmModeSelection(wanted string, current func() (string, error), timeout
 
 func (m *SingBoxManager) CloseConnections() error {
 	req, err := http.NewRequest(http.MethodDelete, "http://"+clashAPIAddress+"/connections", nil)
+	if err != nil {
+		return err
+	}
+	return doClashAPIFast(req)
+}
+
+func (m *SingBoxManager) CloseConnection(id string) error {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return errors.New("连接 ID 不能为空")
+	}
+	req, err := http.NewRequest(http.MethodDelete, "http://"+clashAPIAddress+"/connections/"+url.PathEscape(id), nil)
+	if err != nil {
+		return err
+	}
+	return doClashAPIFast(req)
+}
+
+func (m *SingBoxManager) FetchConnections() (ConnectionsSnapshot, error) {
+	req, err := http.NewRequest(http.MethodGet, "http://"+clashAPIAddress+"/connections", nil)
+	if err != nil {
+		return ConnectionsSnapshot{}, err
+	}
+	data, err := doClashAPIBytesFast(req)
+	if err != nil {
+		return ConnectionsSnapshot{}, err
+	}
+	var raw struct {
+		UploadTotal   int64 `json:"uploadTotal"`
+		DownloadTotal int64 `json:"downloadTotal"`
+		Connections   []struct {
+			ID       string   `json:"id"`
+			Upload   int64    `json:"upload"`
+			Download int64    `json:"download"`
+			Start    string   `json:"start"`
+			Chains   []string `json:"chains"`
+			Rule     string   `json:"rule"`
+			Payload  string   `json:"rulePayload"`
+			Metadata struct {
+				Network         string `json:"network"`
+				Type            string `json:"type"`
+				DestinationIP   string `json:"destinationIP"`
+				DestinationPort string `json:"destinationPort"`
+				Host            string `json:"host"`
+				Process         string `json:"process"`
+				ProcessPath     string `json:"processPath"`
+			} `json:"metadata"`
+		} `json:"connections"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return ConnectionsSnapshot{}, fmt.Errorf("解析活跃连接列表失败：%w", err)
+	}
+	items := make([]ConnectionItem, 0, len(raw.Connections))
+	for _, c := range raw.Connections {
+		proc := strings.TrimSpace(c.Metadata.Process)
+		if proc == "" && strings.TrimSpace(c.Metadata.ProcessPath) != "" {
+			proc = filepath.Base(c.Metadata.ProcessPath)
+		}
+		ruleText := strings.TrimSpace(c.Rule)
+		if p := strings.TrimSpace(c.Payload); p != "" {
+			if ruleText != "" {
+				ruleText += "(" + p + ")"
+			} else {
+				ruleText = p
+			}
+		}
+		host := strings.TrimSpace(c.Metadata.Host)
+		if host == "" {
+			host = strings.TrimSpace(c.Metadata.DestinationIP)
+		}
+		items = append(items, ConnectionItem{
+			ID:            c.ID,
+			Host:          host,
+			DestinationIP: c.Metadata.DestinationIP,
+			Port:          c.Metadata.DestinationPort,
+			Network:       c.Metadata.Network,
+			Type:          c.Metadata.Type,
+			Rule:          ruleText,
+			Chains:        c.Chains,
+			Process:       proc,
+			Upload:        c.Upload,
+			Download:      c.Download,
+			Start:         c.Start,
+		})
+	}
+	return ConnectionsSnapshot{
+		UploadTotal:   raw.UploadTotal,
+		DownloadTotal: raw.DownloadTotal,
+		Count:         len(items),
+		Connections:   items,
+	}, nil
+}
+
+func (m *SingBoxManager) StreamTraffic(ctx context.Context, onSample func(TrafficSnapshot)) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+clashAPIAddress+"/traffic", nil)
+	if err != nil {
+		return err
+	}
+	streamTransport := &http.Transport{
+		DisableKeepAlives:     true,
+		ResponseHeaderTimeout: 2 * time.Second,
+	}
+	defer streamTransport.CloseIdleConnections()
+	client := http.Client{Transport: streamTransport, Timeout: 0}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("订阅实时流量失败：HTTP %d", resp.StatusCode)
+	}
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 4096), 64*1024)
+	for scanner.Scan() {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var frame struct {
+			Up   int64 `json:"up"`
+			Down int64 `json:"down"`
+		}
+		if err := json.Unmarshal([]byte(line), &frame); err != nil {
+			continue
+		}
+		snapshot := m.recordStreamTraffic(frame.Up, frame.Down)
+		if onSample != nil {
+			onSample(snapshot)
+		}
+	}
+	return scanner.Err()
+}
+
+func (m *SingBoxManager) recordStreamTraffic(up, down int64) TrafficSnapshot {
+	if up < 0 {
+		up = 0
+	}
+	if down < 0 {
+		down = 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	snapshot := m.traffic.snapshot
+	snapshot.UploadRate = up
+	snapshot.DownloadRate = down
+	snapshot.UploadTotal += up
+	snapshot.DownloadTotal += down
+	m.traffic = trafficCache{snapshot: snapshot, lastTime: time.Now()}
+	return snapshot
+}
+
+func (m *SingBoxManager) CachedRuntimeInfo() (ConfigMode, bool, bool) {
+	if m == nil {
+		return ConfigMode{}, false, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.hasCachedConfigMode {
+		return ConfigMode{}, false, false
+	}
+	return m.cachedConfigMode, m.cachedTunActive, true
+}
+
+func (m *SingBoxManager) FlushDNS() error {
+	req, err := http.NewRequest(http.MethodPost, "http://"+clashAPIAddress+"/dns/flush", nil)
 	if err != nil {
 		return err
 	}
@@ -768,10 +966,15 @@ func (m *SingBoxManager) CoreVersion() string {
 	if m.coreVer != "" {
 		return m.coreVer
 	}
-
-	if _, err := os.Stat(m.corePath); err != nil {
+	if !m.coreMissingUntil.IsZero() && time.Now().Before(m.coreMissingUntil) {
 		return "未安装"
 	}
+
+	if _, err := os.Stat(m.corePath); err != nil {
+		m.coreMissingUntil = time.Now().Add(5 * time.Second)
+		return "未安装"
+	}
+	m.coreMissingUntil = time.Time{}
 	ctx, cancel := context.WithTimeout(context.Background(), coreVersionTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, m.corePath, "version")
@@ -1062,6 +1265,7 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 	if err := m.ensureRuleSets(state.Settings); err != nil {
 		return err
 	}
+	m.ensureCompiledRuleSets(state.Settings)
 	config, err := buildSingBoxConfig(state, node, m.cachePath, true, dnsPlan)
 	if err != nil {
 		return err
@@ -1095,14 +1299,21 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 		m.proxyMapStartPort = state.Settings.ProxyMapStartPort
 		m.proxyMapPortCount = len(proxyMapNodes)
 	}
-	if err := m.checkConfig(); err != nil {
-		if repaired, repairErr := m.tryAutoRepairOutboundConfig(err, node); repairErr == nil && repaired {
-			if m.logger != nil {
-				m.logger.Info("内核配置包含异常节点，已自动隔离修复并成功通过校验")
+	configHash := m.computeConfigVerificationHash(data)
+	if configHash == "" || configHash != m.lastVerifiedConfigHash {
+		if err := m.checkConfig(); err != nil {
+			if repaired, repairErr := m.tryAutoRepairOutboundConfig(err, node); repairErr == nil && repaired {
+				if m.logger != nil {
+					m.logger.Info("内核配置包含异常节点，已自动隔离修复并成功通过校验")
+				}
+				if updatedData, readErr := os.ReadFile(m.config); readErr == nil {
+					configHash = m.computeConfigVerificationHash(updatedData)
+				}
+			} else {
+				return err
 			}
-		} else {
-			return err
 		}
+		m.lastVerifiedConfigHash = configHash
 	}
 	if !isTCPPortFree("127.0.0.1", state.Settings.MixedPort) {
 		return fmt.Errorf("本地代理端口 %d 已被占用，请在运行设置中修改端口或关闭占用该端口的程序", state.Settings.MixedPort)
@@ -1116,7 +1327,7 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 
 	cmd := exec.Command(m.corePath, "run", "-c", m.config)
 	cmd.Dir = m.rootDir
-	hideCommandWindow(cmd)
+	configureSingBoxCmd(cmd)
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
 	if err := cmd.Start(); err != nil {
@@ -1145,7 +1356,7 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 	})
 
 	if err := waitPortOrProcessExit("127.0.0.1", state.Settings.MixedPort, startupPortTimeout, done); err != nil {
-		reason := m.stopLocked(true, true, true)
+		reason := m.stopLocked(false, true, true)
 		if reason != nil {
 			return fmt.Errorf("sing-box 启动后已退出：%w", reason)
 		}
@@ -1153,7 +1364,7 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 	}
 	if effectiveTun(state.Settings) && runtime.GOOS == "windows" {
 		if err := waitTunReadyOrProcessExit(20*time.Second, done); err != nil {
-			reason := m.stopLocked(true, true, true)
+			reason := m.stopLocked(false, true, true)
 			if reason != nil {
 				return fmt.Errorf("TUN 未能真实接管系统网络：%v；停止残留进程：%w", err, reason)
 			}
@@ -1173,12 +1384,12 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 		ports := sequentialPorts(state.Settings.ProxyMapStartPort, len(proxyMapNodes))
 		port, err := waitPortsOrProcessExit("127.0.0.1", ports, startupPortTimeout, done)
 		if err != nil {
-			_ = m.stopLocked(true, true, true)
+			_ = m.stopLocked(false, true, true)
 			return fmt.Errorf("代理映射端口 %d 未能监听：%w", port, err)
 		}
 	}
 	if err := m.ValidateRuntimeSettings(state.Settings); err != nil {
-		_ = m.stopLocked(true, true, true)
+		_ = m.stopLocked(false, true, true)
 		return fmt.Errorf("运行配置校验失败：%w", err)
 	}
 	if externalProxyCount > 0 {
@@ -1186,7 +1397,7 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 	}
 	if state.Settings.SystemProxy && runtime.GOOS == "windows" {
 		if err := EnableSystemProxy(state.Settings.MixedPort); err != nil {
-			_ = m.stopLocked(true, true, true)
+			_ = m.stopLocked(false, true, true)
 			return err
 		}
 		m.logger.Info("系统代理已开启：127.0.0.1:%d", state.Settings.MixedPort)
@@ -1194,6 +1405,16 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 	m.tunActive = effectiveTun(state.Settings)
 	m.runtimeOutboundTags = runtimeOutboundTagSet(state.Nodes)
 	m.runningDirectDNS = dnsPlan.Direct.Server
+	modeRule := configModeFromConfigDetails(config, "rule", state.Settings.ExternalProxyEndpoints, appProxyActive(state.Settings))
+	modeGlobal := configModeFromConfigDetails(config, "global", state.Settings.ExternalProxyEndpoints, appProxyActive(state.Settings))
+	m.cachedConfigModes = map[string]ConfigMode{"rule": modeRule, "global": modeGlobal}
+	if clashMode(state.Settings.Mode) == "global" {
+		m.cachedConfigMode = modeGlobal
+	} else {
+		m.cachedConfigMode = modeRule
+	}
+	m.cachedTunActive = hasTunInbound(config)
+	m.hasCachedConfigMode = true
 	m.logger.Info("sing-box 已启动，本地混合代理端口：%d", state.Settings.MixedPort)
 	return nil
 }
@@ -1388,20 +1609,42 @@ func (m *SingBoxManager) stopLocked(disableSystemProxy bool, cleanupTun bool, wa
 	m.cmd = nil
 	m.processJob = 0
 	m.done = nil
+	m.hasCachedConfigMode = false
+	m.cachedConfigMode = ConfigMode{}
+	m.cachedConfigModes = nil
+	m.cachedTunActive = false
 	m.traffic = trafficCache{}
-	err := terminateProcess(cmd)
-	if err != nil && strings.Contains(err.Error(), "process already finished") {
-		err = nil
-	}
-	if done != nil {
-		select {
-		case <-done:
-		case <-time.After(5 * time.Second):
-			if cmd.Process != nil {
-				_ = cmd.Process.Kill()
+	var err error
+	gracefullyExited := false
+	if runtime.GOOS == "windows" && cmd.Process.Pid > 0 && done != nil {
+		if ctrlErr := gracefulStopSingBox(cmd.Process.Pid); ctrlErr == nil {
+			select {
+			case exitErr := <-done:
+				done = nil
+				gracefullyExited = true
+				err = exitErr
+			case <-time.After(2 * time.Second):
 			}
-			m.logger.Error("等待 sing-box 退出超时，继续清理")
 		}
+	}
+	if !gracefullyExited {
+		err = terminateProcess(cmd)
+		if err != nil && strings.Contains(err.Error(), "process already finished") {
+			err = nil
+		}
+		if done != nil {
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				if cmd.Process != nil {
+					_ = cmd.Process.Kill()
+				}
+				m.logger.Error("等待 sing-box 退出超时，继续清理")
+			}
+		}
+	} else if err != nil && strings.Contains(err.Error(), "exit status") {
+		// CTRL_BREAK_EVENT 触发的优雅退出在 Windows 上可能返回非零控制台退出码，属正常退出。
+		err = nil
 	}
 	closeKillOnCloseJob(processJob)
 	if runtime.GOOS == "windows" && waitProcessGone {
@@ -1741,6 +1984,7 @@ func (m *SingBoxManager) watchExit(cmd *exec.Cmd, done chan<- error) {
 	m.mu.Lock()
 	expected := m.cmd != cmd
 	processJob := uintptr(0)
+	onUnexpectedExit := m.onUnexpectedExit
 	if m.cmd == cmd {
 		m.cmd = nil
 		processJob = m.processJob
@@ -1748,11 +1992,22 @@ func (m *SingBoxManager) watchExit(cmd *exec.Cmd, done chan<- error) {
 		m.done = nil
 		m.proxyMapStartPort = 0
 		m.proxyMapPortCount = 0
+		m.hasCachedConfigMode = false
+		m.cachedConfigMode = ConfigMode{}
+		m.cachedConfigModes = nil
+		m.cachedTunActive = false
 	}
 	m.mu.Unlock()
 	closeKillOnCloseJob(processJob)
-	if err != nil && !expected {
-		m.logger.Error("sing-box 已退出：%v", err)
+	if !expected {
+		if err != nil {
+			m.logger.Error("sing-box 已退出：%v", err)
+		}
+		if onUnexpectedExit != nil {
+			safeGo(m.logger, "内核意外退出处理", func() {
+				onUnexpectedExit(err)
+			})
+		}
 	}
 }
 
@@ -1793,21 +2048,12 @@ func buildSingBoxConfig(state PersistState, selected Node, cachePath string, inc
 	}
 	if effectiveTun(settings) {
 		routeExclude := append([]string(nil), tunRouteExcludeIPCIDRs...)
-		ipNodes := state.Nodes
-		if len(ipNodes) > 64 {
-			ipNodes = make([]Node, 0, 1+len(proxyMapNodes))
-			ipNodes = append(ipNodes, selected)
-			ipNodes = append(ipNodes, proxyMapNodes...)
-		}
-		for _, nodeIP := range extractNodeServerIPs(ipNodes) {
-			routeExclude = append(routeExclude, nodeIP)
-		}
 		tunInbound := map[string]interface{}{
 			"type":                     "tun",
 			"tag":                      "tun-in",
 			"interface_name":           tunInterfaceName,
 			"address":                  []string{"172.19.0.1/30", "fdfe:dcba:9876::1/126"},
-			"mtu":                      1500,
+			"mtu":                      1400,
 			"auto_route":               true,
 			"strict_route":             true,
 			"endpoint_independent_nat": true,
@@ -1842,7 +2088,7 @@ func buildSingBoxConfig(state PersistState, selected Node, cachePath string, inc
 		}
 		selectorTagSet[tag] = true
 		selectorTags = append(selectorTags, tag)
-		proxy := sanitizeOutboundForSingBox(node.Outbound)
+		proxy := applyOutboundStealthDefaults(sanitizeOutboundForSingBox(node.Outbound))
 		proxy["tag"] = tag
 		if endpoint := wireGuardEndpointFromOutbound(proxy); endpoint != nil {
 			endpoints = append(endpoints, endpoint)
@@ -1856,7 +2102,7 @@ func buildSingBoxConfig(state PersistState, selected Node, cachePath string, inc
 	}
 	if !selectorTagSet[selectedTag] {
 		selectorTags = append(selectorTags, selectedTag)
-		proxy := sanitizeOutboundForSingBox(selected.Outbound)
+		proxy := applyOutboundStealthDefaults(sanitizeOutboundForSingBox(selected.Outbound))
 		proxy["tag"] = selectedTag
 		if endpoint := wireGuardEndpointFromOutbound(proxy); endpoint != nil {
 			endpoints = append(endpoints, endpoint)
@@ -1866,8 +2112,11 @@ func buildSingBoxConfig(state PersistState, selected Node, cachePath string, inc
 	}
 	if settings.ProxyMap {
 		for index, node := range proxyMapNodes {
-			proxy := sanitizeOutboundForSingBox(node.Outbound)
+			proxy := applyOutboundStealthDefaults(sanitizeOutboundForSingBox(node.Outbound))
 			proxy["tag"] = proxyMapOutboundTag(index)
+			if settings.ProxyMapDetour && node.ID != selected.ID && isPlainProxyOutbound(proxy) {
+				proxy["detour"] = "proxy"
+			}
 			if endpoint := wireGuardEndpointFromOutbound(proxy); endpoint != nil {
 				endpoints = append(endpoints, endpoint)
 			} else {
@@ -1893,7 +2142,7 @@ func buildSingBoxConfig(state PersistState, selected Node, cachePath string, inc
 			"server":   defaultResolver,
 			"strategy": "prefer_ipv4",
 		},
-		"rules": buildRouteRules(settings, state.Nodes, includeRemoteRuleSets),
+		"rules": buildRouteRulesForSelected(settings, state.Nodes, selected, includeRemoteRuleSets),
 		"final": final,
 	}
 	if includeRemoteRuleSets {
@@ -1943,7 +2192,7 @@ func coreLogLevel(settings Settings) string {
 	case "debug", "info", "warn", "error":
 		return level
 	}
-	return "info"
+	return "warn"
 }
 
 func configModeSummary(state PersistState) ConfigMode {
@@ -2137,7 +2386,9 @@ func hasGlobalModeBlockRule(config map[string]interface{}) bool {
 		return false
 	}
 	for _, rule := range configRules(route["rules"]) {
-		if rule["outbound"] != "block" || !ruleAppliesToMode(rule, "global") {
+		action, _ := rule["action"].(string)
+		outbound, _ := rule["outbound"].(string)
+		if (outbound != "block" && action != "reject") || !ruleAppliesToMode(rule, "global") {
 			continue
 		}
 		if isTunStabilityBlockRule(rule) || isLocalMetadataBlockRule(rule) {
@@ -2153,7 +2404,14 @@ func isTunStabilityBlockRule(rule map[string]interface{}) bool {
 	if !stringSliceContains(inbounds, "tun-in") {
 		return false
 	}
-	return rule["port"] != nil || rule["ip_cidr"] != nil || rule["source_ip_cidr"] != nil
+	return rule["port"] != nil ||
+		rule["ip_cidr"] != nil ||
+		rule["source_ip_cidr"] != nil ||
+		rule["protocol"] != nil ||
+		rule["ip_version"] != nil ||
+		rule["domain"] != nil ||
+		rule["process_name"] != nil ||
+		rule["process_path_regex"] != nil
 }
 
 func isLocalMetadataBlockRule(rule map[string]interface{}) bool {
@@ -2338,6 +2596,74 @@ func readTrafficConnections(decoder *json.Decoder, total *TrafficSnapshot) error
 	return err
 }
 
+func (m *SingBoxManager) computeConfigVerificationHash(data []byte) string {
+	info, err := os.Stat(m.corePath)
+	var coreSig string
+	if err == nil {
+		coreSig = fmt.Sprintf("|%d|%d", info.Size(), info.ModTime().UnixNano())
+	}
+	sum := sha256.Sum256(append(append([]byte(nil), data...), coreSig...))
+	return hex.EncodeToString(sum[:])
+}
+
+func compiledRuleSetPath(jsonPath string) string {
+	trimmed := strings.TrimSpace(jsonPath)
+	if strings.HasSuffix(strings.ToLower(trimmed), ".json") {
+		return trimmed[:len(trimmed)-5] + ".srs"
+	}
+	return trimmed + ".srs"
+}
+
+func (m *SingBoxManager) ensureCompiledRuleSets(settings Settings) {
+	if m == nil || strings.TrimSpace(m.corePath) == "" {
+		return
+	}
+	coreBin := m.corePath
+	if abs, err := filepath.Abs(coreBin); err == nil {
+		coreBin = abs
+	}
+	if _, err := os.Stat(coreBin); err != nil {
+		return
+	}
+	normalizeSettings(&settings)
+	defs := rulePresetDefs[settings.RuleSource]
+	if len(defs) == 0 {
+		return
+	}
+	ruleDir := ruleSetDirFromCachePath(m.cachePath)
+	for _, def := range defs {
+		srcPath := filepath.Join(ruleDir, def.FileName)
+		srcInfo, err := os.Stat(srcPath)
+		if err != nil || srcInfo.Size() == 0 {
+			continue
+		}
+		srsPath := compiledRuleSetPath(srcPath)
+		if srsInfo, err := os.Stat(srsPath); err == nil && srsInfo.Size() > 0 && !srsInfo.ModTime().Before(srcInfo.ModTime()) {
+			continue
+		}
+		tmpSRS := srsPath + ".tmp"
+		_ = os.Remove(tmpSRS)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		cmd := exec.CommandContext(ctx, coreBin, "rule-set", "compile", srcPath, "-o", tmpSRS)
+		cmd.Dir = m.rootDir
+		hideCommandWindow(cmd)
+		out, err := cmd.CombinedOutput()
+		cancel()
+		if err != nil {
+			_ = os.Remove(tmpSRS)
+			if m.logger != nil {
+				m.logger.Warn("编译二进制规则集 %s 失败（将回退源码格式）：%v %s", def.FileName, err, trimForLog(string(out)))
+			}
+			continue
+		}
+		if err := replaceFileWithRetry(tmpSRS, srsPath, 3); err != nil {
+			_ = os.Remove(tmpSRS)
+			continue
+		}
+		_ = os.Chtimes(srsPath, srcInfo.ModTime(), srcInfo.ModTime())
+	}
+}
+
 func (m *SingBoxManager) ensureRuleSets(settings Settings) error {
 	normalizeSettings(&settings)
 	defs := rulePresetDefs[settings.RuleSource]
@@ -2499,6 +2825,7 @@ func (m *SingBoxManager) updateRuleSets(settings Settings, version string) (int,
 	if err := commitStagedRuleSets(staged); err != nil {
 		return 0, err
 	}
+	m.ensureCompiledRuleSets(settings)
 	return len(staged), nil
 }
 
@@ -2873,13 +3200,27 @@ func buildRuleSets(settings Settings, cachePath string) []map[string]interface{}
 	if len(defs) == 0 {
 		return nil
 	}
+	useCompiled := strings.TrimSpace(cachePath) != ""
 	ruleSets := make([]map[string]interface{}, 0, len(defs))
 	for _, def := range defs {
+		localJSON := ruleSetLocalPath(cachePath, def.FileName)
+		if useCompiled {
+			srsPath := compiledRuleSetPath(localJSON)
+			if info, err := os.Stat(srsPath); err == nil && info.Size() > 0 {
+				ruleSets = append(ruleSets, map[string]interface{}{
+					"type":   "local",
+					"tag":    def.Tag,
+					"format": "binary",
+					"path":   srsPath,
+				})
+				continue
+			}
+		}
 		ruleSets = append(ruleSets, map[string]interface{}{
 			"type":   "local",
 			"tag":    def.Tag,
 			"format": "source",
-			"path":   ruleSetLocalPath(cachePath, def.FileName),
+			"path":   localJSON,
 		})
 	}
 	return ruleSets
@@ -2923,8 +3264,12 @@ var aiAntiDetectProxyDomainSuffixes = []string{
 }
 
 func buildRouteRules(settings Settings, nodes []Node, includeRemoteRuleSets bool) []map[string]interface{} {
+	return buildRouteRulesForSelected(settings, nodes, Node{}, includeRemoteRuleSets)
+}
+
+func buildRouteRulesForSelected(settings Settings, nodes []Node, selected Node, includeRemoteRuleSets bool) []map[string]interface{} {
 	rules := []map[string]interface{}{
-		{"action": "sniff"},
+		{"action": "sniff", "timeout": "300ms"},
 		{"port": []int{53}, "action": "hijack-dns"},
 		{"protocol": "dns", "action": "hijack-dns"},
 	}
@@ -2932,6 +3277,34 @@ func buildRouteRules(settings Settings, nodes []Node, includeRemoteRuleSets bool
 	rules = append(rules, buildExternalProxyDirectRules(settings)...)
 	if effectiveTun(settings) {
 		rules = append(rules, buildTunStabilityRouteRules()...)
+		rules = append(rules,
+			map[string]interface{}{
+				"inbound":  []string{"tun-in"},
+				"port":     []int{853},
+				"action":   "route",
+				"outbound": "block",
+			},
+			map[string]interface{}{
+				"inbound": []string{"tun-in"},
+				"domain":  append([]string(nil), domesticDoHBypassDomains...),
+				"action":  "reject",
+			},
+		)
+		if !nodeSupportsIPv6(selected) {
+			rules = append(rules, map[string]interface{}{
+				"inbound":    []string{"tun-in"},
+				"ip_version": 6,
+				"action":     "reject",
+			})
+		}
+		if settings.ProxyMap {
+			rules = append(rules, map[string]interface{}{
+				"inbound":      []string{"tun-in"},
+				"network":      "udp",
+				"process_name": []string{"SunBrowser.exe", "BitBrowser.exe", "AdsPower.exe", "MoreLogin.exe", "Hubstudio.exe", "ixBrowser.exe", "orbita.exe"},
+				"action":       "reject",
+			})
+		}
 	}
 	if settings.AppProxy {
 		if appRule := appProxyRouteRule(settings); len(appRule) > 0 {
@@ -3269,9 +3642,10 @@ func appProxyRouteRule(settings Settings) map[string]interface{} {
 	for _, target := range settings.AppProxyTargets {
 		if target.Enabled && target.Type == "app" {
 			add(target.Path)
-			dir := filepath.Dir(target.Path)
-			if pattern := appProxyFolderRegex(dir); pattern != "" {
-				addRegex(pattern)
+			if appPath := normalizeAppProxyPath(target.Path); appPath != "" {
+				if dir := filepath.Dir(appPath); isDedicatedAppInstallDir(dir) {
+					addRegex(appProxyFolderRegex(dir))
+				}
 			}
 		}
 	}
@@ -3289,6 +3663,37 @@ func appProxyRouteRule(settings Settings) map[string]interface{} {
 		rule["process_path_regex"] = folderRegex
 	}
 	return rule
+}
+
+func isDedicatedAppInstallDir(dir string) bool {
+	dir = strings.TrimSpace(dir)
+	if dir == "" || dir == "." {
+		return false
+	}
+	clean := filepath.Clean(strings.TrimRight(dir, `\/`))
+	if clean == "" || clean == "." {
+		return false
+	}
+	// Drive roots like "C:" or "/" or "C:\"
+	if len(clean) <= 3 && (strings.HasSuffix(clean, ":") || clean == `\` || clean == "/") {
+		return false
+	}
+	if filepath.Dir(clean) == clean {
+		return false
+	}
+	base := strings.ToLower(filepath.Base(clean))
+	switch base {
+	case "windows", "system32", "syswow64",
+		"program files", "program files (x86)", "programdata",
+		"users", "desktop", "downloads", "documents",
+		"temp", "tmp", "appdata", "local", "roaming", "locallow":
+		return false
+	}
+	// Do not auto-expand a user profile root (e.g. C:\Users\Alice)
+	if strings.EqualFold(filepath.Base(filepath.Dir(clean)), "users") {
+		return false
+	}
+	return true
 }
 
 func appProxyFolderRegex(folder string) string {
@@ -3323,8 +3728,38 @@ func proxyMapOutboundTag(index int) string {
 	return fmt.Sprintf("proxy-map-out-%d", index+1)
 }
 
+func proxyMapDNSTag(index int) string {
+	return fmt.Sprintf("proxy-map-dns-%d", index+1)
+}
+
+func isPlainProxyOutbound(outbound map[string]interface{}) bool {
+	if outbound == nil {
+		return false
+	}
+	typ, _ := outbound["type"].(string)
+	if typ != "socks" && typ != "http" {
+		return false
+	}
+	if tlsMap, ok := outbound["tls"].(map[string]interface{}); ok {
+		if enabled, _ := tlsMap["enabled"].(bool); enabled {
+			return false
+		}
+	}
+	return true
+}
+
 func proxyMapNodesForSettings(nodes []Node, settings Settings) []Node {
-	return nodes
+	groupSet := proxyMapGroupIDSet(settings)
+	if len(groupSet) == 0 {
+		return nodes
+	}
+	filtered := make([]Node, 0, len(nodes))
+	for _, node := range nodes {
+		if groupSet[normalizeGroupID(node.GroupID)] {
+			filtered = append(filtered, node)
+		}
+	}
+	return filtered
 }
 
 func normalizeProxyMapGroupIDs(ids []string, legacyID string) []string {
@@ -3452,6 +3887,23 @@ func buildDNSConfig(settings Settings, final string, dnsPlan autoDNSPlan, includ
 	}
 
 	dnsRules := []map[string]interface{}{}
+	if settings.ProxyMap {
+		proxyMapNodes := proxyMapNodesForSettings(nodes, settings)
+		for index := range proxyMapNodes {
+			dnsTag := proxyMapDNSTag(index)
+			servers = append(servers, map[string]interface{}{
+				"tag":    dnsTag,
+				"type":   dnsPlan.Remote.Type,
+				"server": dnsPlan.Remote.Server,
+				"detour": proxyMapOutboundTag(index),
+			})
+			dnsRules = append(dnsRules, map[string]interface{}{
+				"inbound": []string{proxyMapInboundTag(index)},
+				"action":  "route",
+				"server":  dnsTag,
+			})
+		}
+	}
 
 	directDNSServer := "local"
 	if effectiveTun(settings) {
@@ -4144,6 +4596,44 @@ func normalizeECHConfigToPEMLines(raw string) []string {
 		}
 	}
 	return nil
+}
+
+func nodeSupportsIPv6(node Node) bool {
+	if len(node.Outbound) == 0 {
+		return false
+	}
+	typ := strings.ToLower(strings.TrimSpace(stringFromAny(node.Outbound["type"])))
+	if typ == "wireguard" {
+		for _, item := range stringListFromAny(node.Outbound["address"]) {
+			if strings.Contains(item, ":") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func applyOutboundStealthDefaults(outbound map[string]interface{}) map[string]interface{} {
+	if outbound == nil {
+		return nil
+	}
+	typ := strings.ToLower(strings.TrimSpace(stringFromAny(outbound["type"])))
+	switch typ {
+	case "vless", "vmess", "trojan", "anytls":
+	default:
+		return outbound
+	}
+	tls, ok := outbound["tls"].(map[string]interface{})
+	if !ok || tls == nil || !boolFromAny(tls["enabled"]) {
+		return outbound
+	}
+	if _, hasUTLS := tls["utls"]; !hasUTLS {
+		tls["utls"] = map[string]interface{}{
+			"enabled":     true,
+			"fingerprint": "chrome",
+		}
+	}
+	return outbound
 }
 
 func sanitizeOutboundForSingBox(outbound map[string]interface{}) map[string]interface{} {

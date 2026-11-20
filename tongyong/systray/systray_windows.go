@@ -242,23 +242,78 @@ func (t *winTray) setTooltip(src string) error {
 	return t.nid.modify()
 }
 
+// copyUTF16Fixed copies UTF-16 code units from src into dst, always NUL-terminating.
+func copyUTF16Fixed(dst []uint16, src string) {
+	for i := range dst {
+		dst[i] = 0
+	}
+	if len(dst) == 0 {
+		return
+	}
+	u16, err := windows.UTF16FromString(src)
+	if err != nil {
+		return
+	}
+	if len(u16) > len(dst) {
+		u16 = u16[:len(dst)]
+		u16[len(u16)-1] = 0
+	}
+	copy(dst, u16)
+}
+
+func (t *winTray) showBalloon(title, message string, isError bool) error {
+	const (
+		NIF_INFO     = 0x00000010
+		NIIF_WARNING = 0x00000002
+		NIIF_ERROR   = 0x00000003
+	)
+	t.muNID.Lock()
+	defer t.muNID.Unlock()
+	if t.nid == nil {
+		return nil
+	}
+	prevFlags := t.nid.Flags
+	copyUTF16Fixed(t.nid.InfoTitle[:], title)
+	copyUTF16Fixed(t.nid.Info[:], message)
+	if isError {
+		t.nid.InfoFlags = NIIF_ERROR
+	} else {
+		t.nid.InfoFlags = NIIF_WARNING
+	}
+	t.nid.Timeout = 10000
+	t.nid.Flags = prevFlags | NIF_INFO
+	t.nid.Size = uint32(unsafe.Sizeof(*t.nid))
+	err := t.nid.modify()
+	t.nid.Flags = prevFlags &^ NIF_INFO
+	t.nid.InfoFlags = 0
+	t.nid.Timeout = 0
+	for i := range t.nid.InfoTitle {
+		t.nid.InfoTitle[i] = 0
+	}
+	for i := range t.nid.Info {
+		t.nid.Info[i] = 0
+	}
+	return err
+}
+
 var wt winTray
 
 // WindowProc callback function that processes messages sent to a window.
 // https://msdn.microsoft.com/en-us/library/windows/desktop/ms633573(v=vs.85).aspx
 func (t *winTray) wndProc(hWnd windows.Handle, message uint32, wParam, lParam uintptr) (lResult uintptr) {
 	const (
-		WM_RBUTTONUP     = 0x0205
-		WM_LBUTTONDOWN   = 0x0201
-		WM_LBUTTONUP     = 0x0202
-		WM_LBUTTONDBLCLK = 0x0203
-		WM_CONTEXTMENU   = 0x007B
-		NIN_SELECT       = 0x0400
-		NIN_KEYSELECT    = 0x0401
-		WM_COMMAND       = 0x0111
-		WM_ENDSESSION    = 0x0016
-		WM_CLOSE         = 0x0010
-		WM_DESTROY       = 0x0002
+		WM_RBUTTONUP         = 0x0205
+		WM_LBUTTONDOWN       = 0x0201
+		WM_LBUTTONUP         = 0x0202
+		WM_LBUTTONDBLCLK     = 0x0203
+		WM_CONTEXTMENU       = 0x007B
+		NIN_SELECT           = 0x0400
+		NIN_KEYSELECT        = 0x0401
+		NIN_BALLOONUSERCLICK = 0x0405
+		WM_COMMAND           = 0x0111
+		WM_ENDSESSION        = 0x0016
+		WM_CLOSE             = 0x0010
+		WM_DESTROY           = 0x0002
 	)
 	switch message {
 	case WM_COMMAND:
@@ -288,6 +343,8 @@ func (t *winTray) wndProc(hWnd windows.Handle, message uint32, wParam, lParam ui
 			t.showMenu()
 		case WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK, NIN_SELECT, NIN_KEYSELECT:
 			systrayIconClicked()
+		case NIN_BALLOONUSERCLICK:
+			systrayBalloonClicked()
 		default:
 		}
 	case t.wmTaskbarCreated: // on explorer.exe restarts
@@ -915,6 +972,13 @@ func SetTooltip(tooltip string) {
 	if err := wt.setTooltip(tooltip); err != nil {
 		log.Errorf("Unable to set tooltip: %v", err)
 		return
+	}
+}
+
+// ShowBalloonNotification displays a Windows tray balloon notification.
+func ShowBalloonNotification(title, message string, isError bool) {
+	if err := wt.showBalloon(title, message, isError); err != nil {
+		log.Errorf("Unable to show balloon notification: %v", err)
 	}
 }
 

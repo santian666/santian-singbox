@@ -276,7 +276,11 @@ func cleanupTunInterfaceWithSummary(logger *Logger) string {
 	pnpItems := removeOrphanedSingTunPnPDevices(logger)
 	var outputs []string
 	outputs = append(outputs, pnpItems...)
-	if hasAnyTunAdapterResidual() {
+	hasAdapter := hasAnyTunAdapterResidual()
+	if len(pnpItems) == 0 && !hasAdapter {
+		return ""
+	}
+	if hasAdapter {
 		script := `
 $name=$env:GO_SINGBOX_TUN_NAME
 $oldName="SanTianTun"

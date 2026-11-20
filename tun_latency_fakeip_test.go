@@ -292,7 +292,10 @@ func TestNodeServerIPsExcludedFromTunRoute(t *testing.T) {
 			}
 		}
 	}
-	if !foundExclude {
-		t.Fatalf("TUN 入站 route_exclude_address 必须包含节点服务器 IP 209.248.57.144/32，以避开内核路由拦截")
+	if foundExclude {
+		t.Fatalf("TUN 入站 route_exclude_address 不得排除节点服务器 IP 209.248.57.144/32，避免经物理网卡直连旁路泄露")
+	}
+	if !hasDirectRouteForProcessName(config, "sing-box.exe") {
+		t.Fatalf("TUN 防回环应通过 sing-box.exe 进程直连与 auto_detect_interface 实现")
 	}
 }

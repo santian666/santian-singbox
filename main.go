@@ -23,6 +23,9 @@ const minWindowWidth = 980
 const minWindowHeight = 620
 
 func main() {
+	if handled, exitCode := runSendCtrlBreakHelperFromArgs(); handled {
+		os.Exit(exitCode)
+	}
 	if handled, exitCode := runSystemProxyRASHelperFromArgs(); handled {
 		os.Exit(exitCode)
 	}

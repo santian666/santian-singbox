@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/getlantern/systray"
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
@@ -62,6 +63,15 @@ type App struct {
 	circuitBreakerMu            sync.Mutex
 	circuitBreakerActive        bool
 	circuitBreakerText          string
+	netHealthMu                 sync.Mutex
+	netHealthStatus             string
+	netHealthTitle              string
+	netHealthMessage            string
+	netHealthFaultSeq           int64
+	netHealthProbeCancel        context.CancelFunc
+	netHealthProbeGen           uint64
+	windowHiddenMu              sync.Mutex
+	windowHidden                bool
 	resumeCheckMu               sync.Mutex
 	resumeCheckTimers           [2]*time.Timer
 	tunStatusMu                 sync.Mutex
@@ -159,6 +169,9 @@ func NewApp() *App {
 		appUpdater:         newAppUpdateManager(logger),
 	}
 	app.directDNSChecker = newDirectDNSHealthChecker(app)
+	manager.onUnexpectedExit = func(exitErr error) {
+		app.handleUnexpectedCoreExit(exitErr)
+	}
 	return app
 }
 
@@ -573,14 +586,13 @@ func (a *App) stopProxyForUser() error {
 			}
 		}
 	}
-	if !a.isCircuitBreakerActive() {
-		_ = disableKillSwitch(a.root, a.logger)
-	}
+	_ = disableKillSwitch(a.root, a.logger)
 	if err := a.disableStoredProxyEntrances("停止代理"); err != nil {
 		result = errors.Join(result, fmt.Errorf("保存代理关闭状态失败：%w", err))
 	}
 	a.cleanupProxyResiduals(cleanupTun)
 	a.resetTrafficTracking()
+	a.clearNetworkHealth()
 	return result
 }
 
@@ -659,6 +671,7 @@ func (a *App) State() (result RuntimeState) {
 		appUpdateAvailable = a.appUpdater.lastInfo.Available
 		appReleaseNotes = a.appUpdater.lastInfo.ReleaseNotes
 	}
+	healthStatus, healthTitle, healthMessage, healthSeq := a.currentNetworkHealth()
 	return RuntimeState{
 		Running:              a.manager != nil && a.manager.Running(),
 		AppVersion:           AppVersion,
@@ -682,6 +695,10 @@ func (a *App) State() (result RuntimeState) {
 		TunStatus:            tunStatus,
 		CircuitBreakerActive: a.isCircuitBreakerActive(),
 		CircuitBreakerReason: a.circuitBreakerReason(),
+		NetworkHealthStatus:  healthStatus,
+		NetworkHealthTitle:   healthTitle,
+		NetworkHealthMessage: healthMessage,
+		NetworkFaultSeq:      healthSeq,
 	}
 }
 
@@ -689,6 +706,17 @@ func (a *App) runtimeStateConfigInfo(state PersistState) (ConfigMode, bool, stri
 	settings := state.Settings
 	normalizeSettings(&settings)
 	configMode := configModeSummary(state)
+	if a != nil && a.manager != nil && a.manager.Running() {
+		if cachedMode, cachedTunIn, ok := a.manager.CachedRuntimeInfo(); ok {
+			if !effectiveTun(settings) {
+				return cachedMode, false, "TUN未开启"
+			}
+			if !cachedTunIn {
+				return cachedMode, false, "TUN未生效：运行配置缺少TUN"
+			}
+			return cachedMode, true, "TUN已生效"
+		}
+	}
 	if !effectiveTun(settings) {
 		return configMode, false, "TUN未开启"
 	}
@@ -741,6 +769,12 @@ func (a *App) runtimeTunStatus(settings Settings) (bool, string) {
 	}
 	if a == nil || a.manager == nil || !a.manager.Running() {
 		return false, "TUN未生效：内核未运行"
+	}
+	if _, tunIn, ok := a.manager.CachedRuntimeInfo(); ok {
+		if !tunIn {
+			return false, "TUN未生效：运行配置缺少TUN"
+		}
+		return true, "TUN已生效"
 	}
 	config, err := a.manager.readRuntimeConfig()
 	if err != nil {
@@ -866,15 +900,52 @@ func (a *App) startTrafficWatcher() {
 		return
 	}
 	ctx := a.ctx
-	safeGo(a.logger, "流量统计", func() {
-		sampleTicker := time.NewTicker(trafficSampleInterval)
+	if ctx == nil {
+		return
+	}
+	safeGo(a.logger, "流量流式推送", func() {
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			if !a.manager.Running() {
+				a.publishTrafficSnapshot(TrafficSnapshot{})
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Second):
+				}
+				continue
+			}
+			_ = a.manager.StreamTraffic(ctx, func(traffic TrafficSnapshot) {
+				if a.store == nil {
+					return
+				}
+				selectedID, selectedGroupID := a.store.TrafficTarget()
+				if selectedID == "" {
+					a.publishTrafficSnapshot(TrafficSnapshot{})
+					return
+				}
+				a.recordTrafficDelta(selectedID, selectedGroupID, traffic)
+				a.emitTrafficSnapshot(traffic)
+			})
+			if !a.manager.Running() {
+				a.publishTrafficSnapshot(TrafficSnapshot{})
+			} else {
+				a.sampleTraffic()
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
+		}
+	})
+	safeGo(a.logger, "流量统计落盘", func() {
 		persistTicker := time.NewTicker(trafficPersistInterval)
-		defer sampleTicker.Stop()
 		defer persistTicker.Stop()
 		for {
 			select {
-			case <-sampleTicker.C:
-				a.sampleTraffic()
 			case <-persistTicker.C:
 				if err := a.store.FlushTraffic(); err != nil && a.logger != nil {
 					a.logger.Error("定时保存流量统计失败：%v", err)
@@ -885,6 +956,29 @@ func (a *App) startTrafficWatcher() {
 			}
 		}
 	})
+}
+
+func (a *App) ActiveConnections() (ConnectionsSnapshot, error) {
+	if a == nil || a.manager == nil || !a.manager.Running() {
+		return ConnectionsSnapshot{Connections: []ConnectionItem{}}, nil
+	}
+	return a.manager.FetchConnections()
+}
+
+func (a *App) CloseConnection(id string) (err error) {
+	defer a.recoverError("断开连接", &err)
+	if a == nil || a.manager == nil || !a.manager.Running() {
+		return nil
+	}
+	return a.manager.CloseConnection(id)
+}
+
+func (a *App) CloseAllConnections() (err error) {
+	defer a.recoverError("断开全部连接", &err)
+	if a == nil || a.manager == nil || !a.manager.Running() {
+		return nil
+	}
+	return a.manager.CloseConnections()
 }
 
 func (a *App) sampleTraffic() {
@@ -1478,6 +1572,7 @@ func (a *App) SelectNode(id string) (err error) {
 	if a.store == nil {
 		return errors.New("配置存储未初始化")
 	}
+	a.preemptBackgroundChecks()
 	state := a.store.Snapshot()
 	if _, ok := findSelectedNode(state.Nodes, id); !ok {
 		return errors.New("节点不存在")
@@ -1486,6 +1581,7 @@ func (a *App) SelectNode(id string) (err error) {
 		if err := a.store.SelectNode(id); err != nil {
 			return err
 		}
+		a.clearNetworkHealth()
 		a.logger.Info("已选择节点（代理未运行）：%s", selectedNodeLogName(state.Nodes, id))
 		a.emitState()
 		return nil
@@ -1513,12 +1609,23 @@ func (a *App) selectNodeLocked(id string) error {
 		if err := a.store.SelectNode(id); err != nil {
 			return err
 		}
+		a.clearNetworkHealth()
 		a.logger.Info("已选择节点（代理未运行）：%s", selectedNodeLogName(state.Nodes, id))
 		a.emitState()
 		return nil
 	}
 	if !a.manager.Running() {
-		return errors.New("sing-box 未运行，节点未切换，请先恢复代理后重试")
+		if err := a.store.SelectNode(id); err != nil {
+			return err
+		}
+		a.clearNetworkHealth()
+		if err := a.startLocked(); err != nil {
+			a.logger.Error("切换节点并启动内核失败：%v", err)
+			return err
+		}
+		a.refreshEnvironmentOnSwitch(true)
+		a.logger.Info("节点切换已拉起内核：%s", selectedNodeLogName(state.Nodes, id))
+		return nil
 	}
 	selectedTag := nodeOutboundTag(node)
 	if selectedTag == "" {
@@ -1557,6 +1664,8 @@ func (a *App) selectNodeLocked(id string) error {
 		})
 	}
 	a.markTunConnectivityHealthy(state.Settings)
+	a.clearNetworkHealth()
+	a.refreshEnvironmentOnSwitch(reloaded || effectiveTun(state.Settings) || state.Settings.FakeDNS)
 	a.logger.Info("节点切换已确认：%s", selectedNodeLogName(state.Nodes, id))
 	a.emitState()
 	return nil
@@ -1566,30 +1675,35 @@ func (a *App) reloadRuntimeForSelectedNode(previous PersistState, id string, sel
 	next := previous
 	next.SelectedID = id
 	a.logger.Info("运行内核尚未加载所选节点，正在同步节点配置：%s", selectedNodeLogName(next.Nodes, id))
-	if err := a.manager.Restart(next, effectiveTun(next.Settings)); err != nil {
+	a.enableTunKillSwitchIfConfigured(next.Settings)
+	rollback := func(stepDesc string, cause error) error {
 		restoreErr := a.manager.Restart(previous, effectiveTun(previous.Settings))
 		if restoreErr != nil {
-			return fmt.Errorf("同步所选节点失败：%v；恢复原节点代理失败：%w", err, restoreErr)
+			a.enableTunKillSwitchIfConfigured(previous.Settings)
+			a.setNetworkHealth(
+				"core_down",
+				"节点同步与回滚失败（防漏保护生效中）",
+				fmt.Sprintf("恢复原节点代理失败：%v。真实网络已保持防漏锁定，请点击「立即重启内核」或切换节点恢复。", restoreErr),
+				true,
+			)
+			return fmt.Errorf("%s：%v；恢复原节点代理失败：%w", stepDesc, cause, restoreErr)
 		}
-		return fmt.Errorf("同步所选节点失败，已恢复原节点代理：%w", err)
+		_ = disableKillSwitch(a.root, a.logger)
+		return fmt.Errorf("%s，已恢复原节点代理：%w", stepDesc, cause)
+	}
+	if err := a.manager.Restart(next, effectiveTun(next.Settings)); err != nil {
+		return rollback("同步所选节点失败", err)
 	}
 	current, err := a.manager.CurrentOutbound()
 	if err != nil || strings.TrimSpace(current) != selectedTag {
 		if switchErr := a.manager.SelectOutboundVerified(selectedTag); switchErr != nil {
-			restoreErr := a.manager.Restart(previous, effectiveTun(previous.Settings))
-			if restoreErr != nil {
-				return fmt.Errorf("同步后节点确认失败：%v；恢复原节点代理失败：%w", switchErr, restoreErr)
-			}
-			return fmt.Errorf("同步后节点确认失败，已恢复原节点代理：%w", switchErr)
+			return rollback("同步后节点确认失败", switchErr)
 		}
 	}
 	if err := a.store.SelectNode(id); err != nil {
-		restoreErr := a.manager.Restart(previous, effectiveTun(previous.Settings))
-		if restoreErr != nil {
-			return fmt.Errorf("保存所选节点失败：%v；恢复原节点代理失败：%w", err, restoreErr)
-		}
-		return fmt.Errorf("保存所选节点失败，已恢复原节点代理：%w", err)
+		return rollback("保存所选节点失败", err)
 	}
+	_ = disableKillSwitch(a.root, a.logger)
 	return nil
 }
 
@@ -2488,6 +2602,7 @@ func (a *App) speedTestOptionsForCurrentSettings(options SpeedTestOptions, node 
 
 func (a *App) SaveSettings(settings Settings) (err error) {
 	defer a.recoverError("保存设置", &err)
+	a.preemptBackgroundChecks()
 	externalProxyEndpointsProvided := settings.ExternalProxyEndpoints != nil
 	if !a.lockProxyOperation(saveSettingsLockTimeout) {
 		return errors.New("代理正在切换节点或执行自检，设置未应用，请稍后重试")
@@ -2562,6 +2677,7 @@ func (a *App) SaveSettings(settings Settings) (err error) {
 			}
 			_ = disableKillSwitch(a.root, a.logger)
 			a.resetTrafficTracking()
+			a.clearNetworkHealth()
 			a.logger.Info("代理入口已全部关闭，代理已停止")
 			a.emitState()
 			return nil
@@ -2582,10 +2698,10 @@ func (a *App) SaveSettings(settings Settings) (err error) {
 		}
 		if restartNeeded {
 			cleanupTun := shouldCleanupTunOnRunningRestart(current, settings)
-			if runtime.GOOS == "windows" && current.SystemProxy && !settings.SystemProxy {
-				if err := DisableSystemProxy(); err != nil {
-					return a.rollbackSettingsAfterApplyFailure(previousState, err)
-				}
+			if effectiveTun(settings) {
+				a.enableTunKillSwitchIfConfigured(settings)
+			} else if effectiveTun(current) {
+				a.enableTunKillSwitchIfConfigured(current)
 			}
 			if err := a.manager.Restart(state, cleanupTun); err != nil {
 				a.logger.Error("设置已保存，但代理重启失败：%v", err)
@@ -2594,6 +2710,11 @@ func (a *App) SaveSettings(settings Settings) (err error) {
 			if err := a.manager.ValidateRuntimeSettings(settings); err != nil {
 				a.logger.Error("%v", err)
 				return a.rollbackSettingsAfterApplyFailure(previousState, err)
+			}
+			if runtime.GOOS == "windows" && current.SystemProxy && !settings.SystemProxy {
+				if err := DisableSystemProxy(); err != nil {
+					return a.rollbackSettingsAfterApplyFailure(previousState, err)
+				}
 			}
 			a.logger.Info("运行中设置已保存并重启内核生效：模式=%s，系统代理=%v，TUN=%v", settings.Mode, settings.SystemProxy, settings.Tun)
 		} else {
@@ -2629,6 +2750,8 @@ func (a *App) SaveSettings(settings Settings) (err error) {
 		}
 		_ = disableKillSwitch(a.root, a.logger)
 		a.markTunConnectivityHealthy(settings)
+		a.clearNetworkHealth()
+		a.refreshEnvironmentOnSwitch(restartNeeded || current.Mode != settings.Mode || effectiveTun(settings) || settings.FakeDNS)
 		a.emitState()
 		return nil
 	}
@@ -2651,21 +2774,24 @@ func (a *App) SaveSettings(settings Settings) (err error) {
 			a.logger.Error("清理残留内核失败：%v", err)
 			return a.rollbackSettingsAfterApplyFailure(previousState, err)
 		}
-		a.cleanupSystemProxyForStartup(state.Settings)
 		if err := a.prepareStartupPorts(state); err != nil {
 			a.logger.Error("启动失败：%v", err)
-			a.cleanupSystemProxyForStartup(state.Settings)
 			return a.rollbackSettingsAfterApplyFailure(previousState, err)
 		}
 		if err := a.manager.Start(state); err != nil {
 			a.logger.Error("启动失败：%v", err)
-			a.cleanupSystemProxyForStartup(state.Settings)
 			return a.rollbackSettingsAfterApplyFailure(previousState, err)
 		}
+		_ = disableKillSwitch(a.root, a.logger)
 		a.markTunConnectivityHealthy(state.Settings)
+		a.clearNetworkHealth()
 		a.initTrafficBaseline(state.SelectedID, state.Nodes)
+		a.refreshEnvironmentOnSwitch(effectiveTun(state.Settings) || state.Settings.FakeDNS)
 		a.logger.Info("代理入口已开启，代理已自动启动")
 		safeGo(a.logger, "代理开启后检查更新", a.onProxyStarted)
+	} else {
+		_ = disableKillSwitch(a.root, a.logger)
+		a.clearNetworkHealth()
 	}
 	a.emitState()
 	return nil
@@ -2739,8 +2865,10 @@ func (a *App) restoreProxyState(previous PersistState) error {
 				return fmt.Errorf("停止失败代理失败：%w", err)
 			}
 		}
+		_ = disableKillSwitch(a.root, a.logger)
 		a.resetTrafficTracking()
 		a.markTunConnectivityHealthy(previous.Settings)
+		a.clearNetworkHealth()
 		if a.logger != nil {
 			a.logger.Info("已恢复切换前状态：代理入口关闭")
 		}
@@ -2759,10 +2887,14 @@ func (a *App) restoreProxyState(previous PersistState) error {
 		err = a.manager.Start(previous)
 	}
 	if err != nil {
+		a.enableTunKillSwitchIfConfigured(previous.Settings)
+		a.setNetworkHealth("core_down", "代理回滚失败（防漏保护生效中）", fmt.Sprintf("恢复切换前代理失败：%v。真实网络已被锁定防漏，请检查节点或重启内核。", err), true)
 		return fmt.Errorf("恢复切换前代理失败：%w", err)
 	}
+	_ = disableKillSwitch(a.root, a.logger)
 	a.initTrafficBaseline(previous.SelectedID, previous.Nodes)
 	a.markTunConnectivityHealthy(previous.Settings)
+	a.clearNetworkHealth()
 	if a.logger != nil {
 		a.logger.Info("已恢复切换前代理状态：模式=%s，系统代理=%v，TUN=%v", previous.Settings.Mode, previous.Settings.SystemProxy, previous.Settings.Tun)
 	}
@@ -2889,25 +3021,6 @@ func stateHasSelectedNode(state PersistState) bool {
 		}
 	}
 	return false
-}
-
-func (a *App) cleanupSystemProxyForStartup(settings Settings) {
-	if runtime.GOOS != "windows" || !settings.SystemProxy {
-		return
-	}
-	ok, err := systemProxyEnabledForPort(settings.MixedPort)
-	if err != nil {
-		a.logger.Error("读取系统代理失败：%v", err)
-		return
-	}
-	if !ok {
-		return
-	}
-	if err := DisableSystemProxy(); err != nil {
-		a.logger.Error("关闭残留系统代理失败：%v", err)
-		return
-	}
-	a.logger.Info("已关闭残留系统代理，等待内核监听成功后重新开启：127.0.0.1:%d", settings.MixedPort)
 }
 
 func (a *App) applyRuntimeSelectedNode(state PersistState, reason string) error {
@@ -3183,7 +3296,7 @@ func needsRestartForRunningSettings(current, next Settings) bool {
 	return current.Tun != next.Tun ||
 		appProxyActive(current) != appProxyActive(next) ||
 		current.ProxyMap != next.ProxyMap ||
-		(current.ProxyMap && next.ProxyMap && (current.ProxyMapStartPort != next.ProxyMapStartPort || !sameProxyMapGroupIDs(current, next))) ||
+		(current.ProxyMap && next.ProxyMap && (current.ProxyMapStartPort != next.ProxyMapStartPort || current.ProxyMapDetour != next.ProxyMapDetour || !sameProxyMapGroupIDs(current, next))) ||
 		current.AppProxy != next.AppProxy ||
 		!reflect.DeepEqual(current.AppProxyTargets, next.AppProxyTargets) ||
 		!reflect.DeepEqual(current.ExternalProxyEndpoints, next.ExternalProxyEndpoints) ||
@@ -3519,6 +3632,7 @@ func (a *App) ApplyAppUpdate() (result *AppUpdateInfo, err error) {
 
 func (a *App) Start() (err error) {
 	defer a.recoverError("启动代理", &err)
+	a.preemptBackgroundChecks()
 	if !a.lockProxyOperation(saveSettingsLockTimeout) {
 		return errProxyOperationBusy
 	}
@@ -3536,7 +3650,7 @@ func (a *App) startLocked() error {
 	if a.manager.Running() {
 		a.logger.Info("检测到旧内核正在运行，先停止旧进程")
 		a.persistTraffic()
-		if err := a.manager.Stop(); err != nil {
+		if err := a.manager.StopWithoutSystemProxyCleanup(); err != nil {
 			a.logger.Error("停止旧内核失败：%v", err)
 			a.emitState()
 			return err
@@ -3566,23 +3680,24 @@ func (a *App) startLocked() error {
 		a.emitState()
 		return err
 	}
-	a.cleanupSystemProxyForStartup(state.Settings)
 	if err := a.prepareStartupPorts(state); err != nil {
 		a.logger.Error("启动失败：%v", err)
-		a.cleanupSystemProxyForStartup(state.Settings)
-		a.emitState()
+		a.enableTunKillSwitchIfConfigured(state.Settings)
+		a.setNetworkHealth("core_down", "代理端口被占用（防漏保护生效中）", fmt.Sprintf("启动失败：%v。已保持防漏保护，请释放端口后重试。", err), true)
 		return err
 	}
 	if err := a.manager.Start(state); err != nil {
 		a.logger.Error("启动失败：%v", err)
-		a.cleanupSystemProxyForStartup(state.Settings)
+		a.enableTunKillSwitchIfConfigured(state.Settings)
 		a.disableTunAfterStartFailure(state.Settings, err)
-		a.emitState()
+		a.setNetworkHealth("core_down", "代理内核启动失败（防漏保护生效中）", fmt.Sprintf("sing-box 启动失败：%v。已保持断网防漏锁定，请切换节点或检查配置后重试。", err), true)
 		return err
 	}
 	_ = disableKillSwitch(a.root, a.logger)
 	a.markTunConnectivityHealthy(state.Settings)
+	a.clearNetworkHealth()
 	a.initTrafficBaseline(state.SelectedID, state.Nodes)
+	a.refreshEnvironmentOnSwitch(effectiveTun(state.Settings) || state.Settings.FakeDNS)
 	a.emitState()
 	safeGo(a.logger, "代理开启后检查更新", a.onProxyStarted)
 	return nil
@@ -3693,6 +3808,7 @@ func (a *App) isOwnCoreProcess(item portProcess) bool {
 
 func (a *App) Stop() (err error) {
 	defer a.recoverError("停止代理", &err)
+	a.preemptBackgroundChecks()
 	if !a.lockProxyOperation(saveSettingsLockTimeout) {
 		return errProxyOperationBusy
 	}
@@ -3746,118 +3862,59 @@ func (a *App) ensureProxyHealthAsync(reason string) {
 	})
 }
 
+const (
+	proxyHealthFailThreshold      = 2
+	proxyDegradedDelayThresholdMS = 1200
+)
+
 func (a *App) ensureProxyHealth(reason string) {
+	if a == nil || a.store == nil || a.manager == nil {
+		return
+	}
 	state := a.store.Snapshot()
 	normalizeSettings(&state.Settings)
 	if !shouldRunProxy(state.Settings) || !stateHasSelectedNode(state) {
+		a.clearNetworkHealth()
+		return
+	}
+	if a.isQuitting() {
 		return
 	}
 	if !a.manager.Running() {
-		if !a.proxyOpMu.TryLock() {
-			return
-		}
-		defer a.proxyOpMu.Unlock()
-		state = a.store.Snapshot()
-		normalizeSettings(&state.Settings)
-		if !shouldRunProxy(state.Settings) || !stateHasSelectedNode(state) || a.manager.Running() {
-			return
-		}
-		a.logger.Error("%s：代理入口仍开启，但内核未运行，正在自动恢复", reason)
-		if err := a.startLocked(); err != nil {
-			a.logger.Error("%s：自动恢复代理失败：%v", reason, err)
-		}
+		a.enableTunKillSwitchIfConfigured(state.Settings)
+		a.setNetworkHealth(
+			"core_down",
+			"代理内核未运行（防漏保护生效中）",
+			fmt.Sprintf("%s：代理入口处于开启状态，但 sing-box 内核已停止。为防止真实网络暴露，已保持防漏锁定，请点击「立即重启内核」或切换节点恢复。", reason),
+			true,
+		)
 		return
 	}
-	if err := a.manager.HealthCheck(state.Settings); err != nil {
-		time.Sleep(500 * time.Millisecond)
-		if retryErr := a.manager.HealthCheck(state.Settings); retryErr == nil {
-			a.logger.Info("%s：代理健康检查瞬时异常已恢复，无需重启", reason)
-			return
-		} else {
-			a.logger.Error("%s：代理健康检查连续失败：%v", reason, retryErr)
-		}
-	}
-	if !a.proxyOpMu.TryLock() {
-		return
-	}
-	locked := true
-	defer func() {
-		if locked {
-			a.proxyOpMu.Unlock()
-		}
-	}()
-	state = a.store.Snapshot()
-	normalizeSettings(&state.Settings)
-	if !shouldRunProxy(state.Settings) || !stateHasSelectedNode(state) {
-		return
-	}
-	if !a.manager.Running() {
-		a.logger.Error("%s：内核已停止，正在自动恢复", reason)
-		if err := a.startLocked(); err != nil {
-			a.logger.Error("%s：自动恢复代理失败：%v", reason, err)
-		}
-		return
-	}
-	if err := a.manager.HealthCheck(state.Settings); err == nil {
-		if err := a.ensureProxyEntrancesLocked(state); err == nil {
-			locked = false
-			a.proxyOpMu.Unlock()
-			a.ensureDirectDNSHealth()
-			return
-		}
-		time.Sleep(500 * time.Millisecond)
-		if retryErr := a.ensureProxyEntrancesLocked(state); retryErr == nil {
-			a.logger.Info("%s：代理入口瞬时异常已恢复，无需重启", reason)
-			locked = false
-			a.proxyOpMu.Unlock()
-			a.ensureDirectDNSHealth()
-			return
-		} else {
-			a.logger.Error("%s：代理入口检查连续失败：%v", reason, retryErr)
-			if errors.Is(retryErr, errSystemProxyEntrance) {
-				a.logger.Error("%s：系统代理可能被其他软件持续覆盖，保持 sing-box 运行并等待下次自检", reason)
-				locked = false
-				a.proxyOpMu.Unlock()
-				a.ensureDirectDNSHealth()
-				return
-			}
-		}
-	}
-	if time.Since(a.lastHealthRestart) < 20*time.Second {
-		a.logger.Error("%s：距离上次自动恢复过近，跳过本轮重启", reason)
-		return
-	}
-	a.lastHealthRestart = time.Now()
-	a.persistTraffic()
-	if err := a.manager.Restart(state, effectiveTun(state.Settings)); err != nil {
-		a.logger.Error("%s：自动重启代理失败：%v", reason, err)
-		a.disableTunAfterStartFailure(state.Settings, err)
-		a.emitState()
-		return
-	}
-	a.markTunConnectivityHealthy(state.Settings)
-	a.initTrafficBaseline(state.SelectedID, state.Nodes)
-	a.logger.Info("%s：代理已自动恢复", reason)
-	a.emitState()
-}
 
-func (a *App) ensureProxyEntrancesLocked(state PersistState) error {
-	settings := state.Settings
-	normalizeSettings(&settings)
-	if runtime.GOOS == "windows" && settings.SystemProxy {
-		issue, err := systemProxyConfigurationIssueForPort(settings.MixedPort)
-		if err != nil {
-			return fmt.Errorf("%w：%v", errSystemProxyEntrance, err)
-		}
-		if issue != "" {
-			a.logger.Error("系统代理入口配置被清空或覆盖：%s，正在重新同步", issue)
-			if err := EnableSystemProxy(settings.MixedPort); err != nil {
-				return fmt.Errorf("%w：%v", errSystemProxyEntrance, err)
+	ctx, cancelProbe := a.registerProbeContext()
+	defer cancelProbe()
+
+	if runtime.GOOS == "windows" && state.Settings.SystemProxy {
+		issue, err := systemProxyConfigurationIssueForPort(state.Settings.MixedPort)
+		if err == nil && issue != "" && a.proxyOpMu.TryLock() {
+			latest := a.store.Snapshot()
+			normalizeSettings(&latest.Settings)
+			if latest.Settings.SystemProxy && a.manager.Running() {
+				a.logger.Error("系统代理入口配置被清空或覆盖：%s，正在重新同步", issue)
+				if syncErr := EnableSystemProxy(latest.Settings.MixedPort); syncErr != nil {
+					a.logger.Error("重新同步系统代理失败：%v", syncErr)
+				} else {
+					a.logger.Info("系统代理入口已自动重新同步：127.0.0.1:%d", latest.Settings.MixedPort)
+				}
 			}
-			a.logger.Info("系统代理入口已自动重新同步：127.0.0.1:%d", settings.MixedPort)
+			a.proxyOpMu.Unlock()
 		}
 	}
-	if runtime.GOOS == "windows" && effectiveTun(settings) {
+	if ctx.Err() != nil {
+		return
+	}
+
+	if runtime.GOOS == "windows" && effectiveTun(state.Settings) {
 		var lastCode string
 		tunOK := false
 		for attempt := 0; attempt < 3; attempt++ {
@@ -3867,26 +3924,96 @@ func (a *App) ensureProxyEntrancesLocked(state PersistState) error {
 			} else {
 				lastCode = code
 				if attempt < 2 {
-					time.Sleep(500 * time.Millisecond)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(500 * time.Millisecond):
+					}
 				}
 			}
 		}
 		if !tunOK {
-			return fmt.Errorf("TUN 未保持接管状态：%s", tunReadyMessage(lastCode))
+			a.enableTunKillSwitchIfConfigured(state.Settings)
+			a.setNetworkHealth(
+				"core_down",
+				"TUN 虚拟网卡接管中断（防漏保护生效中）",
+				fmt.Sprintf("检测到 TUN 未保持接管状态（%s）。已保持防漏保护，请点击「立即重启内核」恢复。", tunReadyMessage(lastCode)),
+				true,
+			)
+			return
 		}
 	}
-	if settings.AutoFailover && shouldRunProxy(settings) {
-		if err := a.verifyTunConnectivityIfDue(settings.MixedPort); err != nil {
-			switchedName, failoverErr := a.autoFailoverLocked(state, err)
-			if failoverErr == nil {
-				a.logger.Info("【自动切换】已自动替换为同分组可用节点：%s", switchedName)
-				a.markTunConnectivityHealthy(settings)
-				return nil
-			}
-			a.logger.Error("【自动切换】当前无可用备选节点，保持当前代理接管不熔断：%v", failoverErr)
-		}
+
+	delayMS, probeErr := a.manager.testNodeDelayViaClashAPIContext(ctx, "proxy", "", 3500*time.Millisecond)
+	if ctx.Err() != nil {
+		return
 	}
-	return nil
+	if probeErr == nil {
+		a.markTunConnectivityHealthy(state.Settings)
+		if delayMS > proxyDegradedDelayThresholdMS {
+			a.setNetworkHealth(
+				"degraded",
+				fmt.Sprintf("节点延迟偏高 (%dms)", delayMS),
+				"当前节点延迟较高，已保留当前出口 IP 不自动切换；如需更流畅体验可手动切换节点。",
+				false,
+			)
+		} else {
+			a.clearNetworkHealth()
+		}
+		a.ensureDirectDNSHealth()
+		return
+	}
+
+	a.healthMu.Lock()
+	a.tunConnectivityConsecutiveFails++
+	fails := a.tunConnectivityConsecutiveFails
+	a.healthMu.Unlock()
+	if fails < proxyHealthFailThreshold {
+		if a.logger != nil {
+			a.logger.Info("%s：代理出网探测第 %d/%d 次波动，保持当前接管状态不切换：%v", reason, fails, proxyHealthFailThreshold, probeErr)
+		}
+		return
+	}
+
+	if !checkLocalPhysicalConnectivity() {
+		a.setNetworkHealth(
+			"local_offline",
+			"本机物理网络已断开",
+			"检测到电脑本地 Wi-Fi / 有线宽带无法连通外网 DNS（223.5.5.5 / 119.29.29.29 无响应），非代理软件故障。防漏保护仍生效，请检查本机网络连接。",
+			true,
+		)
+		return
+	}
+
+	if state.Settings.AutoFailover {
+		switchedName, failoverErr := a.autoFailoverWithPreempt(ctx, state, probeErr)
+		if ctx.Err() != nil {
+			return
+		}
+		if failoverErr == nil {
+			a.logger.Info("【自动切换】已自动替换为同分组可用节点：%s", switchedName)
+			a.markTunConnectivityHealthy(state.Settings)
+			a.clearNetworkHealth()
+			a.refreshEnvironmentOnSwitch(true)
+			return
+		}
+		a.logger.Error("【自动切换】当前无可用备选节点，保持防漏锁定：%v", failoverErr)
+	}
+
+	a.setNetworkHealth(
+		"node_down",
+		"当前节点无法连接（防漏保护生效中）",
+		fmt.Sprintf("本机物理网络正常，但当前节点 [%s] 无响应（%v）。为避免真实环境暴露，已保持断网防漏锁定，请手动切换其他节点或重启内核。", selectedNodeLogName(state.Nodes, state.SelectedID), probeErr),
+		true,
+	)
+}
+
+func checkLocalPhysicalConnectivity() bool {
+	if _, ok := probeDirectUDPDNS("223.5.5.5"); ok {
+		return true
+	}
+	_, ok := probeDirectUDPDNS("119.29.29.29")
+	return ok
 }
 
 func detectNodeRegion(node Node) string {
@@ -4007,7 +4134,7 @@ func filterAndRankCandidatesForAutoFailover(nodes []Node, groups []NodeGroup, cu
 	return candidates, normalizedGroup, currentGroupName, nil
 }
 
-func (a *App) autoFailoverLocked(state PersistState, triggerErr error) (string, error) {
+func (a *App) autoFailoverWithPreempt(ctx context.Context, state PersistState, triggerErr error) (string, error) {
 	if a == nil || a.manager == nil || a.store == nil {
 		return "", errors.New("服务未初始化")
 	}
@@ -4018,27 +4145,21 @@ func (a *App) autoFailoverLocked(state PersistState, triggerErr error) (string, 
 			}
 		}
 	}
+	a.healthMu.Lock()
 	now := time.Now()
 	if !a.lastAutoFailover.IsZero() && now.Sub(a.lastAutoFailover) < 10*time.Second {
+		a.healthMu.Unlock()
 		return "", errors.New("距离上次自动故障切换时间过短，暂缓切换")
 	}
 	a.lastAutoFailover = now
+	a.healthMu.Unlock()
 
 	candidates, normalizedGroup, currentGroupName, err := filterAndRankCandidatesForAutoFailover(state.Nodes, state.Groups, state.SelectedID)
 	if err != nil {
 		return "", err
 	}
 
-	currentName := state.SelectedID
-	for _, n := range state.Nodes {
-		if n.ID == state.SelectedID {
-			if strings.TrimSpace(n.Name) != "" {
-				currentName = n.Name
-			}
-			break
-		}
-	}
-
+	currentName := selectedNodeLogName(state.Nodes, state.SelectedID)
 	a.logger.Info("【自动切换检测】检测到当前节点 [%s] 断网或不可用（%v），正在测试同分组 [%s] 下 %d 个备选节点真实延迟...",
 		currentName, triggerErr, currentGroupName, len(candidates))
 
@@ -4063,6 +4184,9 @@ func (a *App) autoFailoverLocked(state PersistState, triggerErr error) (string, 
 		go func() {
 			defer wg.Done()
 			for node := range taskCh {
+				if ctx.Err() != nil {
+					return
+				}
 				res, err := a.manager.TestNodeMetricWithProgressAndOptions(
 					node,
 					"delay",
@@ -4090,6 +4214,10 @@ func (a *App) autoFailoverLocked(state PersistState, triggerErr error) (string, 
 	wg.Wait()
 	close(resCh)
 
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+
 	var workingNodes []probeResult
 	for r := range resCh {
 		if r.err == nil && r.delayMS > 0 {
@@ -4101,25 +4229,22 @@ func (a *App) autoFailoverLocked(state PersistState, triggerErr error) (string, 
 		return "", fmt.Errorf("当前分组 [%s] 下已测试 %d 个候选节点，但均未连通（可能该分组节点全部失效或本机网络已中断）", currentGroupName, len(candidates))
 	}
 
-	// 核心：严格按本次真实测试延迟从小到大排序，优先分配同分组下延迟最快的节点
 	sort.Slice(workingNodes, func(i, j int) bool {
 		return workingNodes[i].delayMS < workingNodes[j].delayMS
 	})
 
 	for _, w := range workingNodes {
-		if err := a.selectNodeLocked(w.node.ID); err != nil {
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		switched, err := a.commitAutoFailoverCandidate(ctx, state.SelectedID, w.node)
+		if err != nil {
 			a.logger.Error("【自动切换】尝试切换至同分组候选节点 [%s] 失败：%v", w.node.Name, err)
 			continue
 		}
-		_ = a.manager.CloseConnections()
-		time.Sleep(200 * time.Millisecond)
-		if shouldRunProxy(state.Settings) {
-			if err := verifyLocalProxyConnectivity(state.Settings.MixedPort, 2500*time.Millisecond); err != nil {
-				a.logger.Error("【自动切换】切换至候选节点 [%s]（延迟 %d ms）后网络校验未通过：%v，继续尝试同分组下一个延迟最低节点", w.node.Name, w.delayMS, err)
-				continue
-			}
+		if !switched {
+			return "", errors.New("用户已手动切换节点或修改设置，取消自动切换")
 		}
-
 		a.logger.Info("【自动切换成功】原节点 [%s] 异常，已自动无缝切换至同分组 [%s] 最低延迟节点 [%s]（真连接延迟 %d ms），代理稳定运行中",
 			currentName, currentGroupName, w.node.Name, w.delayMS)
 		if a.ctx != nil {
@@ -4138,8 +4263,33 @@ func (a *App) autoFailoverLocked(state PersistState, triggerErr error) (string, 
 	return "", fmt.Errorf("当前分组 [%s] 测通的候选节点切换后均未能通过本地网络校验", currentGroupName)
 }
 
+func (a *App) commitAutoFailoverCandidate(ctx context.Context, expectedSelectedID string, candidate Node) (bool, error) {
+	if !a.proxyOpMu.TryLock() {
+		return false, errors.New("代理正在执行手动操作")
+	}
+	defer a.proxyOpMu.Unlock()
+	if ctx.Err() != nil {
+		return false, nil
+	}
+	latest := a.store.Snapshot()
+	normalizeSettings(&latest.Settings)
+	if !latest.Settings.AutoFailover || latest.SelectedID != expectedSelectedID || !shouldRunProxy(latest.Settings) {
+		return false, nil
+	}
+	if err := a.selectNodeLocked(candidate.ID); err != nil {
+		return true, err
+	}
+	_ = a.manager.CloseConnections()
+	time.Sleep(200 * time.Millisecond)
+	if err := verifyLocalProxyConnectivity(latest.Settings.MixedPort, 2500*time.Millisecond); err != nil {
+		return true, err
+	}
+	return true, nil
+}
+
 func (a *App) Restart() (err error) {
 	defer a.recoverError("重启代理", &err)
+	a.preemptBackgroundChecks()
 	if !a.lockProxyOperation(saveSettingsLockTimeout) {
 		return errProxyOperationBusy
 	}
@@ -4147,12 +4297,18 @@ func (a *App) Restart() (err error) {
 	if a.manager == nil {
 		return errors.New("内核管理器未初始化")
 	}
+	settings := defaultSettings()
+	if a.store != nil {
+		settings = a.store.Snapshot().Settings
+		normalizeSettings(&settings)
+	}
 	a.logger.Info("开始自检并重启代理")
+	a.enableTunKillSwitchIfConfigured(settings)
 	if a.manager.Running() {
 		a.persistTraffic()
-		if err := a.manager.Stop(); err != nil {
+		if err := a.manager.StopWithoutSystemProxyCleanup(); err != nil {
 			a.logger.Error("重启前停止旧内核失败：%v", err)
-			a.emitState()
+			a.setNetworkHealth("core_down", "代理内核重启失败（防漏保护生效中）", fmt.Sprintf("停止旧内核失败：%v。已保持防漏锁定，请稍后重试重启内核。", err), true)
 			return err
 		}
 		a.resetTrafficTracking()
@@ -4161,9 +4317,207 @@ func (a *App) Restart() (err error) {
 		a.logger.Error("自检重启代理失败：%v", err)
 		return err
 	}
+	_ = disableKillSwitch(a.root, a.logger)
 	a.setCircuitBreakerActive(false, "")
+	a.clearNetworkHealth()
+	a.refreshEnvironmentOnSwitch(true)
 	a.logger.Info("自检重启代理完成")
 	return nil
+}
+
+func (a *App) preemptBackgroundChecks() {
+	if a == nil {
+		return
+	}
+	a.netHealthMu.Lock()
+	cancel := a.netHealthProbeCancel
+	a.netHealthProbeCancel = nil
+	a.netHealthProbeGen++
+	a.netHealthMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (a *App) registerProbeContext() (context.Context, func()) {
+	parent := context.Background()
+	if a != nil && a.ctx != nil {
+		parent = a.ctx
+	}
+	ctx, cancel := context.WithCancel(parent)
+	if a == nil {
+		return ctx, cancel
+	}
+	a.netHealthMu.Lock()
+	prev := a.netHealthProbeCancel
+	a.netHealthProbeCancel = cancel
+	a.netHealthProbeGen++
+	gen := a.netHealthProbeGen
+	a.netHealthMu.Unlock()
+	if prev != nil {
+		prev()
+	}
+	return ctx, func() {
+		cancel()
+		a.netHealthMu.Lock()
+		if a.netHealthProbeGen == gen {
+			a.netHealthProbeCancel = nil
+		}
+		a.netHealthMu.Unlock()
+	}
+}
+
+func (a *App) currentNetworkHealth() (string, string, string, int64) {
+	if a == nil {
+		return "", "", "", 0
+	}
+	a.netHealthMu.Lock()
+	defer a.netHealthMu.Unlock()
+	return a.netHealthStatus, a.netHealthTitle, a.netHealthMessage, a.netHealthFaultSeq
+}
+
+func (a *App) clearNetworkHealth() {
+	a.setNetworkHealth("", "", "", false)
+}
+
+func (a *App) setNetworkHealth(status, title, message string, triggerAlert bool) {
+	if a == nil {
+		return
+	}
+	a.netHealthMu.Lock()
+	prevStatus := a.netHealthStatus
+	prevTitle := a.netHealthTitle
+	prevMessage := a.netHealthMessage
+	isHardFault := status == "node_down" || status == "local_offline" || status == "core_down"
+	if status == "" {
+		if prevStatus == "" && prevTitle == "" && prevMessage == "" {
+			a.netHealthMu.Unlock()
+			return
+		}
+		a.netHealthStatus = ""
+		a.netHealthTitle = ""
+		a.netHealthMessage = ""
+		a.netHealthMu.Unlock()
+		a.emitState()
+		return
+	}
+	if prevStatus == status && prevTitle == title && prevMessage == message {
+		a.netHealthMu.Unlock()
+		return
+	}
+	a.netHealthStatus = status
+	a.netHealthTitle = title
+	a.netHealthMessage = message
+	notifyHardFault := false
+	if isHardFault && triggerAlert && (prevStatus != status || prevMessage != message) {
+		a.netHealthFaultSeq++
+		notifyHardFault = true
+	}
+	a.netHealthMu.Unlock()
+
+	a.emitState()
+	if !notifyHardFault {
+		return
+	}
+	if a.hasTray() {
+		systray.ShowBalloonNotification(title, message, true)
+	}
+	popupOnHidden := true
+	if a.store != nil {
+		popupOnHidden = a.store.Snapshot().Settings.FaultPopupOnHidden
+	}
+	if a.isWindowHidden() && a.ctx != nil {
+		if popupOnHidden {
+			a.showWindow()
+		}
+		flashMainWindow()
+	}
+}
+
+func (a *App) setWindowHidden(hidden bool) {
+	if a == nil {
+		return
+	}
+	a.windowHiddenMu.Lock()
+	a.windowHidden = hidden
+	a.windowHiddenMu.Unlock()
+}
+
+func (a *App) isWindowHidden() bool {
+	if a == nil {
+		return false
+	}
+	a.windowHiddenMu.Lock()
+	defer a.windowHiddenMu.Unlock()
+	return a.windowHidden
+}
+
+func (a *App) hasTray() bool {
+	if a == nil {
+		return false
+	}
+	a.trayMu.Lock()
+	has := a.trayItems != nil
+	a.trayMu.Unlock()
+	return has
+}
+
+func (a *App) refreshEnvironmentOnSwitch(flushDNS bool) {
+	if a == nil {
+		return
+	}
+	manager := a.manager
+	logger := a.logger
+	safeGo(logger, "切换后立即刷新网络环境", func() {
+		if manager != nil && manager.Running() {
+			_ = manager.CloseConnections()
+			if flushDNS {
+				_ = manager.FlushDNS()
+			}
+		}
+		if flushDNS && runtime.GOOS == "windows" {
+			closeStaleFakeIPTCPConnections(logger)
+			flushWindowsDNSCache(logger)
+		}
+	})
+}
+
+func (a *App) handleUnexpectedCoreExit(exitErr error) {
+	if a == nil || a.isQuitting() || a.store == nil || a.manager == nil {
+		return
+	}
+	state := a.store.Snapshot()
+	normalizeSettings(&state.Settings)
+	if !shouldRunProxy(state.Settings) || a.manager.Running() {
+		return
+	}
+	a.enableTunKillSwitchIfConfigured(state.Settings)
+	detail := "进程意外中止"
+	if exitErr != nil {
+		detail = exitErr.Error()
+	}
+	a.setNetworkHealth(
+		"core_down",
+		"代理内核意外退出（防漏保护生效中）",
+		fmt.Sprintf("检测到 sing-box 意外退出（%s）。为防止真实网络暴露，已保持系统代理 / 防火墙锁定，请点击「立即重启内核」或切换节点恢复。", detail),
+		true,
+	)
+}
+
+func (a *App) enableTunKillSwitchIfConfigured(settings Settings) {
+	if a == nil || runtime.GOOS != "windows" {
+		return
+	}
+	normalizeSettings(&settings)
+	if !effectiveTun(settings) || !settings.CircuitBreaker || strings.TrimSpace(a.root) == "" || !hasAdminPrivileges() {
+		return
+	}
+	corePath := ""
+	if a.manager != nil {
+		corePath = a.manager.corePath
+	}
+	exePath, _ := os.Executable()
+	_ = enableKillSwitch(a.root, a.logger, corePath, exePath)
 }
 
 func (a *App) initTrafficBaseline(selectedID string, nodes []Node) {
@@ -4305,12 +4659,11 @@ func (a *App) Logs() (result []LogMessage) {
 }
 
 func (a *App) stateLogsPreview() []LogMessage {
-	logs := a.logs()
-	const stateLogPreviewLimit = 160
-	if len(logs) <= stateLogPreviewLimit {
-		return logs
+	if a == nil || a.logger == nil {
+		return nil
 	}
-	return append([]LogMessage(nil), logs[len(logs)-stateLogPreviewLimit:]...)
+	const stateLogPreviewLimit = 160
+	return a.logger.RecentLogs(stateLogPreviewLimit)
 }
 
 func findNodeByID(nodes []Node, id string) (Node, bool) {
