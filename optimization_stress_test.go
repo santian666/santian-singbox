@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -463,4 +467,74 @@ func TestSingBoxCtrlBreakGracefulStopRealBinary(t *testing.T) {
 			t.Fatalf("cycle %d sing-box did not exit within 2s after CTRL_BREAK_EVENT", cycle)
 		}
 	}
+}
+
+func TestBatchTestBothMetricEmitsPingAndDelay(t *testing.T) {
+	rec := newBatchEventRecorder()
+	deps, _, _ := fakeCoreDeps(rec, func(port int) (int, error) {
+		return 88, nil
+	})
+	deps.ping = func(ctx context.Context, item batchNodeTestItem) (SpeedResult, error) {
+		res := batchBaseResult(item.node)
+		res.PingMS = 23
+		res.DelayMS = 23
+		return res, nil
+	}
+	items := []batchNodeTestItem{
+		{index: 0, node: Node{ID: "n0", Name: "node0", Outbound: map[string]interface{}{"type": "vless"}}},
+		{index: 1, node: Node{ID: "n1", Name: "node1", Outbound: map[string]interface{}{"type": "trojan"}}},
+	}
+	runner := newBatchTestJobRunnerWithDeps("job-both", len(items), items, "both", true, 0, deps)
+	runner.Run()
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.done) != 1 {
+		t.Fatalf("expected 1 done event, got %d", len(rec.done))
+	}
+	if rec.done[0].Total != 2 || rec.done[0].OK != 2 || rec.done[0].Failed != 0 {
+		t.Fatalf("unexpected done counts: %+v", rec.done[0])
+	}
+	phases := map[string]int{}
+	for _, ev := range rec.results {
+		phases[ev.Phase]++
+	}
+	if phases["ping"] != 2 || phases["delay"] != 2 || phases["ip"] != 2 {
+		t.Fatalf("expected 2 ping, 2 delay, 2 ip events, got %+v", phases)
+	}
+}
+
+func TestMultiStreamSpeedtestExcludesHandshakeLatency(t *testing.T) {
+	chunk := make([]byte, 512*1024)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Simulate 250ms proxy/TLS/TTFB handshake latency before first payload byte.
+		time.Sleep(250 * time.Millisecond)
+		if r.Method == http.MethodGet {
+			w.WriteHeader(http.StatusOK)
+			for i := 0; i < 8; i++ {
+				_, _ = w.Write(chunk)
+			}
+			return
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client := &http.Client{Timeout: 8 * time.Second}
+	dlMbps, err := measureMultiStreamDownload(client, srv.URL, 1500*time.Millisecond, 100*1000*1000, nil)
+	if err != nil {
+		t.Fatalf("measureMultiStreamDownload failed: %v", err)
+	}
+	if dlMbps <= 0 {
+		t.Fatalf("expected positive download Mbps, got %v", dlMbps)
+	}
+	ulMbps, err := measureMultiStreamUpload(client, srv.URL, 1500*time.Millisecond, 100*1000*1000, nil)
+	if err != nil {
+		t.Fatalf("measureMultiStreamUpload failed: %v", err)
+	}
+	if ulMbps <= 0 {
+		t.Fatalf("expected positive upload Mbps, got %v", ulMbps)
+	}
+	t.Logf("multi-stream localhost speedtest (with 250ms TTFB): download=%.2f Mbps, upload=%.2f Mbps", dlMbps, ulMbps)
 }

@@ -187,7 +187,7 @@ type batchTestJobRunner struct {
 func newBatchTestJobRunnerWithDeps(jobID string, total int, items []batchNodeTestItem, metric string, withIP bool, initialFailed int, deps batchTestDeps) *batchTestJobRunner {
 	ctx, cancel := context.WithCancel(context.Background())
 	metric = strings.ToLower(strings.TrimSpace(metric))
-	if metric != "ping" {
+	if metric != "ping" && metric != "both" {
 		metric = "delay"
 	}
 	if deps.workers <= 0 {
@@ -410,7 +410,53 @@ func (r *batchTestJobRunner) Run() {
 		}
 		return
 	}
+	if r.metric == "both" {
+		r.runPingStageForBoth()
+		if !r.stopped() {
+			r.runProxyStage(r.items, false)
+		}
+		return
+	}
 	r.runProxyStage(r.items, false)
+}
+
+// runPingStageForBoth 在同时测试 TCP 与 URL 延迟时先并发执行 TCP Ping，仅推送 ping 事件，由后续 URL 阶段统计总成败与出口 IP。
+func (r *batchTestJobRunner) runPingStageForBoth() {
+	jobs := make(chan batchNodeTestItem, len(r.items))
+	for _, item := range r.items {
+		jobs <- item
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	workers := r.deps.workers
+	if workers > len(r.items) {
+		workers = len(r.items)
+	}
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for item := range jobs {
+				if r.stopped() {
+					return
+				}
+				result, err := r.deps.ping(r.ctx, item)
+				if r.stopped() {
+					return
+				}
+				if err != nil {
+					failRes := batchBaseResult(item.node)
+					failRes.PingMS = -1
+					failRes.DelayMS = -1
+					r.emit(BatchTestResultEvent{Index: item.index, Phase: "ping", Result: failRes, Error: err.Error()})
+					continue
+				}
+				r.emit(BatchTestResultEvent{Index: item.index, Phase: "ping", Result: result})
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // runPingStage 并发执行 TCP Ping，返回成功的节点（用于后续补查出口 IP）。

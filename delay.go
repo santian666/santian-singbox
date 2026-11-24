@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -51,9 +52,13 @@ const defaultSpeedTestTrafficMB = 20
 
 const defaultSpeedTestDurationSec = 3
 
-const speedTestRequestExtraTimeout = 3 * time.Second
+const speedTestRequestExtraTimeout = 6 * time.Second
 
 const speedProgressInterval = 500 * time.Millisecond
+
+const speedTestStreams = 4
+
+const speedTestWarmupDuration = 300 * time.Millisecond
 
 type delayTestResult struct {
 	delay int
@@ -1327,16 +1332,20 @@ func testOutboundIP(client *http.Client) (string, error) {
 }
 
 func testDownload(client *http.Client, config speedTestConfig, sample speedSampleFunc) (float64, error) {
+	perStreamBytes := config.bytes
+	if perStreamBytes < 20*1000*1000 {
+		perStreamBytes = 20 * 1000 * 1000
+	}
 	targets := []string{
-		fmt.Sprintf("https://speed.cloudflare.com/__down?bytes=%d", config.bytes),
+		fmt.Sprintf("https://speed.cloudflare.com/__down?bytes=%d", perStreamBytes),
 		"https://cachefly.cachefly.net/50mb.test",
 	}
-	if config.trafficMB == 100 {
+	if config.trafficMB >= 100 {
 		targets = append(targets, "https://proof.ovh.net/files/100Mb.dat")
 	}
 	var lastErr error
 	for _, target := range targets {
-		speed, err := measureHTTP(client, http.MethodGet, target, nil, 0, config.duration, sample)
+		speed, err := measureMultiStreamDownload(client, target, config.duration, int64(config.bytes), sample)
 		if err == nil {
 			return speed, nil
 		}
@@ -1346,56 +1355,305 @@ func testDownload(client *http.Client, config speedTestConfig, sample speedSampl
 }
 
 func testUpload(client *http.Client, config speedTestConfig, sample speedSampleFunc) (float64, error) {
-	body := newTimedUploadReader(config.duration, config.bytes, sample)
-	return measureHTTP(client, http.MethodPost, "https://speed.cloudflare.com/__up", body, 0, config.duration, sample)
+	return measureMultiStreamUpload(client, "https://speed.cloudflare.com/__up", config.duration, int64(config.bytes), sample)
 }
 
-func measureHTTP(client *http.Client, method, target string, body io.Reader, bytesCount int, duration time.Duration, sample speedSampleFunc) (float64, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), duration)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, method, target, body)
-	if err != nil {
-		return 0, err
+type multiStreamSpeedMeter struct {
+	duration    time.Duration
+	maxBytes    int64
+	startOnce   sync.Once
+	startNano   int64
+	lastNano    int64
+	totalBytes  int64
+	warmupBytes int64
+	deadlineCh  chan struct{}
+	sample      speedSampleFunc
+}
+
+func newMultiStreamSpeedMeter(duration time.Duration, maxBytes int64, sample speedSampleFunc) *multiStreamSpeedMeter {
+	return &multiStreamSpeedMeter{
+		duration:   duration,
+		maxBytes:   maxBytes,
+		deadlineCh: make(chan struct{}),
+		sample:     sample,
 	}
-	if method == http.MethodPost {
-		req.Header.Set("Content-Type", "application/octet-stream")
-		req.ContentLength = -1
+}
+
+func (m *multiStreamSpeedMeter) record(n int64) {
+	if n <= 0 {
+		return
 	}
-	start := time.Now()
-	resp, err := client.Do(req)
-	if err != nil {
-		if upload, ok := body.(*timedUploadReader); ok && upload.BytesWritten() > 0 {
-			return mbpsFromBytes(upload.BytesWritten(), time.Since(start)), nil
+	now := time.Now()
+	nowNano := now.UnixNano()
+	m.startOnce.Do(func() {
+		atomic.StoreInt64(&m.startNano, nowNano)
+		time.AfterFunc(m.duration, func() {
+			close(m.deadlineCh)
+		})
+	})
+	atomic.StoreInt64(&m.lastNano, nowNano)
+	total := atomic.AddInt64(&m.totalBytes, n)
+	start := atomic.LoadInt64(&m.startNano)
+	if start > 0 && nowNano-start < int64(speedTestWarmupDuration) {
+		atomic.AddInt64(&m.warmupBytes, n)
+	}
+	if m.maxBytes > 0 && total >= m.maxBytes {
+		select {
+		case <-m.deadlineCh:
+		default:
+			// Use startOnce-style safety via recover? No, better use sync.Once for stop.
 		}
-		return 0, err
 	}
-	defer resp.Body.Close()
-	if method == http.MethodGet {
-		n, err := copyUntilDone(io.Discard, resp.Body, ctx, start, sample)
-		if err != nil && n == 0 {
-			return 0, err
+}
+
+func (m *multiStreamSpeedMeter) currentMbps() float64 {
+	start := atomic.LoadInt64(&m.startNano)
+	last := atomic.LoadInt64(&m.lastNano)
+	total := atomic.LoadInt64(&m.totalBytes)
+	if start <= 0 || last <= start || total <= 0 {
+		return 0
+	}
+	elapsed := time.Duration(last - start)
+	if elapsed >= 900*time.Millisecond {
+		steadyElapsed := elapsed - speedTestWarmupDuration
+		steadyBytes := total - atomic.LoadInt64(&m.warmupBytes)
+		if steadyElapsed > 0 && steadyBytes > 0 {
+			return mbpsFromBytes(steadyBytes, steadyElapsed)
 		}
-		bytesCount = int(n)
-	} else {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		if upload, ok := body.(*timedUploadReader); ok {
-			bytesCount = int(upload.BytesWritten())
+	}
+	return mbpsFromBytes(total, elapsed)
+}
+
+func measureMultiStreamDownload(client *http.Client, target string, duration time.Duration, totalLimit int64, sample speedSampleFunc) (float64, error) {
+	// Overall context includes handshake grace period so TTFB does not eat into transfer duration.
+	overallCtx, overallCancel := context.WithTimeout(context.Background(), duration+speedTestRequestExtraTimeout)
+	defer overallCancel()
+
+	meter := newMultiStreamSpeedMeter(duration, totalLimit, sample)
+	var stopOnce sync.Once
+	stopTransfer := func() {
+		stopOnce.Do(func() {
+			overallCancel()
+		})
+	}
+
+	// Cancel overall context once transfer duration elapses after first byte.
+	go func() {
+		select {
+		case <-meter.deadlineCh:
+			stopTransfer()
+		case <-overallCtx.Done():
 		}
+	}()
+
+	if sample != nil {
+		go func() {
+			ticker := time.NewTicker(speedProgressInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-overallCtx.Done():
+					return
+				case <-ticker.C:
+					if mbps := meter.currentMbps(); mbps > 0 {
+						sample(mbps)
+					}
+				}
+			}
+		}()
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		if upload, ok := body.(*timedUploadReader); ok && upload.BytesWritten() > 0 {
-			return mbpsFromBytes(upload.BytesWritten(), time.Since(start)), nil
+
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
+	for i := 0; i < speedTestStreams; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, 64*1024)
+			for {
+				if overallCtx.Err() != nil {
+					return
+				}
+				if totalLimit > 0 && atomic.LoadInt64(&meter.totalBytes) >= totalLimit {
+					stopTransfer()
+					return
+				}
+				req, err := http.NewRequestWithContext(overallCtx, http.MethodGet, target, nil)
+				if err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					errMu.Unlock()
+					return
+				}
+				resp, err := client.Do(req)
+				if err != nil {
+					errMu.Lock()
+					if firstErr == nil && overallCtx.Err() == nil {
+						firstErr = err
+					}
+					errMu.Unlock()
+					return
+				}
+				if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+					resp.Body.Close()
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("测速地址返回状态：%d", resp.StatusCode)
+					}
+					errMu.Unlock()
+					return
+				}
+				for {
+					n, readErr := resp.Body.Read(buf)
+					if n > 0 {
+						meter.record(int64(n))
+						if totalLimit > 0 && atomic.LoadInt64(&meter.totalBytes) >= totalLimit {
+							stopTransfer()
+							break
+						}
+					}
+					if readErr != nil {
+						break
+					}
+				}
+				resp.Body.Close()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if mbps := meter.currentMbps(); mbps > 0 {
+		return mbps, nil
+	}
+	if firstErr != nil {
+		return 0, firstErr
+	}
+	return 0, errors.New("测速未收到有效数据")
+}
+
+func measureMultiStreamUpload(client *http.Client, target string, duration time.Duration, totalLimit int64, sample speedSampleFunc) (float64, error) {
+	overallCtx, overallCancel := context.WithTimeout(context.Background(), duration+speedTestRequestExtraTimeout)
+	defer overallCancel()
+
+	chunkSize := 2 * 1000 * 1000
+	if totalLimit >= 100*1000*1000 {
+		chunkSize = 4 * 1000 * 1000
+	}
+	payload := make([]byte, chunkSize)
+
+	meter := newMultiStreamSpeedMeter(duration, totalLimit, sample)
+	var stopOnce sync.Once
+	stopTransfer := func() {
+		stopOnce.Do(func() {
+			overallCancel()
+		})
+	}
+	go func() {
+		select {
+		case <-meter.deadlineCh:
+			stopTransfer()
+		case <-overallCtx.Done():
 		}
-		return 0, fmt.Errorf("测速地址返回状态：%d", resp.StatusCode)
+	}()
+
+	if sample != nil {
+		go func() {
+			ticker := time.NewTicker(speedProgressInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-overallCtx.Done():
+					return
+				case <-ticker.C:
+					if mbps := meter.currentMbps(); mbps > 0 {
+						sample(mbps)
+					}
+				}
+			}
+		}()
 	}
-	if bytesCount <= 0 {
-		return 0, errors.New("测速未收到有效数据")
+
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
+	for i := 0; i < speedTestStreams; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				if overallCtx.Err() != nil {
+					return
+				}
+				if totalLimit > 0 && atomic.LoadInt64(&meter.totalBytes) >= totalLimit {
+					stopTransfer()
+					return
+				}
+				reader := &meteredSliceReader{data: payload, meter: meter}
+				req, err := http.NewRequestWithContext(overallCtx, http.MethodPost, target, reader)
+				if err != nil {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					errMu.Unlock()
+					return
+				}
+				req.Header.Set("Content-Type", "application/octet-stream")
+				req.ContentLength = int64(len(payload))
+				resp, err := client.Do(req)
+				if err != nil {
+					errMu.Lock()
+					if firstErr == nil && overallCtx.Err() == nil {
+						firstErr = err
+					}
+					errMu.Unlock()
+					return
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+				if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("测速地址返回状态：%d", resp.StatusCode)
+					}
+					errMu.Unlock()
+					return
+				}
+				if totalLimit > 0 && atomic.LoadInt64(&meter.totalBytes) >= totalLimit {
+					stopTransfer()
+					return
+				}
+			}
+		}()
 	}
-	seconds := time.Since(start).Seconds()
-	if seconds <= 0 {
-		return 0, errors.New("测速时间无效")
+	wg.Wait()
+
+	if mbps := meter.currentMbps(); mbps > 0 {
+		return mbps, nil
 	}
-	return float64(bytesCount) * 8 / seconds / 1000 / 1000, nil
+	if firstErr != nil {
+		return 0, firstErr
+	}
+	return 0, errors.New("上传测速未收到有效数据")
+}
+
+type meteredSliceReader struct {
+	data   []byte
+	offset int
+	meter  *multiStreamSpeedMeter
+}
+
+func (r *meteredSliceReader) Read(p []byte) (int, error) {
+	if r.offset >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[r.offset:])
+	r.offset += n
+	r.meter.record(int64(n))
+	return n, nil
 }
 
 func copyUntilDone(dst io.Writer, src io.Reader, ctx context.Context, start time.Time, sample speedSampleFunc) (int64, error) {

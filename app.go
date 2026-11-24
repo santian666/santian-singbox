@@ -4733,7 +4733,7 @@ func (a *App) StartBatchTest(raws []string, options BatchTestOptions) (result Ba
 		return BatchTestStartResult{}, errors.New("内核管理器未初始化")
 	}
 	metric := strings.ToLower(strings.TrimSpace(options.Metric))
-	if metric != "ping" && metric != "delay" && metric != "url" {
+	if metric != "ping" && metric != "delay" && metric != "url" && metric != "both" {
 		return BatchTestStartResult{}, errors.New("批量节点检测类型无效")
 	}
 	if metric == "url" {

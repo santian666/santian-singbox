@@ -1862,12 +1862,8 @@ var ia = ln((an, sn) => {
             </label>
           </div>
           <div class="tester-actions">
-            <button id="pasteTestNodes" class="ghost">剪贴板粘贴</button>
             <button id="batchDelayTest" class="primary">批量测试</button>
             <button id="stopBatchTest" class="ghost danger-action">停止测试</button>
-            <button id="filterDeadNodes" class="ghost" type="button" title="剔除所有测试失败或超时的无效节点">剔除失效</button>
-            <button id="copyWorkingNodes" class="ghost" type="button" title="复制所有测试可用节点的原始链接">复制可用</button>
-            <button id="saveBatchToGroup" class="ghost" type="button" title="将可用节点一键保存为新的独立节点分组">存为新分组</button>
             <button id="clearTestNodes" class="ghost">清空列表</button>
           </div>
         </section>
@@ -3907,68 +3903,6 @@ var ia = ln((an, sn) => {
     nr(`SanTian-ProxyMap-${rr()}.csv`, csv);
     P(`已导出 ${r.length} 个端口映射配置到 CSV`);
   }
-  function filterDeadNodes() {
-    if (!s.testNodes.length) {
-      P("暂无测试节点");
-      return;
-    }
-    const before = s.testNodes.length;
-    const alive = s.testNodes.filter(
-      (n) =>
-        n.urlDelayMs > 0 || n.pingMs > 0 || (!n.error && n.urlDelayMs === 0 && n.pingMs === 0 && n.status === "待测试"),
-    );
-    const deadCount = before - alive.length;
-    if (deadCount <= 0) {
-      P("当前列表中未发现失效节点");
-      return;
-    }
-    ((s.testNodes = alive), se(), P(`已成功剔除 ${deadCount} 个失效节点，剩余 ${s.testNodes.length} 个可用节点`));
-  }
-  async function copyWorkingNodes() {
-    if (!s.testNodes.length) {
-      P("暂无测试节点");
-      return;
-    }
-    const working = s.testNodes.filter((n) => n.urlDelayMs > 0 || n.pingMs > 0);
-    if (!working.length) {
-      P("未找到测试可用的节点，请先进行批量测试");
-      return;
-    }
-    const raws = working.map((n) => String(n.raw || "").trim()).filter(Boolean);
-    (await Le(raws.join("\n")), P(`已复制 ${raws.length} 个可用节点链接`));
-  }
-  async function saveBatchToGroup() {
-    if (!s.testNodes.length) {
-      P("暂无测试节点");
-      return;
-    }
-    const working = s.testNodes.filter((n) => n.urlDelayMs > 0 || n.pingMs > 0);
-    const targets = working.length > 0 ? working : s.testNodes;
-    const raws = targets.map((n) => String(n.raw || "").trim()).filter(Boolean);
-    if (!raws.length) {
-      P("暂无可保存的有效节点");
-      return;
-    }
-    const d = new Date(),
-      pad = (num) => String(num).padStart(2, "0");
-    const defaultName = `批量优选-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
-    const groupName = await Ot({
-      title: "存为新分组",
-      message: `将 ${raws.length} 个${working.length > 0 ? "已测试可用" : "测试"}节点保存为新分组：`,
-      value: defaultName,
-      okText: "创建并保存",
-    });
-    if (!groupName) return;
-    await H("saveBatchToGroup", "正在创建分组并导入节点", async () => {
-      const newGroup = await pn(groupName);
-      const gid = newGroup.id || "default";
-      await fn(raws.join("\n"), gid, true);
-      s.activeGroupId = gid;
-      await Me();
-      Tt("home");
-      P(`已成功创建分组【${groupName}】并导入 ${raws.length} 个节点！`);
-    });
-  }
   function te() {
     var n;
     const e = Boolean(s.busyKey);
@@ -3985,14 +3919,9 @@ var ia = ln((an, sn) => {
         (c("copyProxyMapSocks5").disabled = e || !it(((n = s.lastState) == null ? void 0 : n.nodes) || []).length),
       c("exportProxyMapCsv") &&
         (c("exportProxyMapCsv").disabled = e || !it(((n = s.lastState) == null ? void 0 : n.nodes) || []).length),
-      Y(pasteTestNodes, W("pasteTestNodes"), "\u8BFB\u53D6\u4E2D", "\u526A\u8D34\u677F\u7C98\u8D34"),
-      (c("pasteTestNodes").disabled = e),
       Y(c("batchDelayTest"), W("batchDelayTest") || s.batchTesting, "\u6D4B\u8BD5\u4E2D", "\u6279\u91CF\u6D4B\u8BD5"),
       (c("batchDelayTest").disabled = e || s.batchTesting),
       (c("stopBatchTest").disabled = !Jt()),
-      c("filterDeadNodes") && (c("filterDeadNodes").disabled = e || s.batchTesting || !s.testNodes.length),
-      c("copyWorkingNodes") && (c("copyWorkingNodes").disabled = e || s.batchTesting || !s.testNodes.length),
-      c("saveBatchToGroup") && (c("saveBatchToGroup").disabled = e || s.batchTesting || !s.testNodes.length),
       Y(c("startMTR"), s.mtrRunning, "\u8FD0\u884C\u4E2D", "\u5F00\u59CB"),
       c("startMTR") && (c("startMTR").disabled = e || s.mtrRunning),
       c("stopMTR") && (c("stopMTR").disabled = !s.mtrRunning),
@@ -6649,23 +6578,10 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
         c("speedDurationSec").value = String(Ye().durationSec);
       }),
       c("batchNetworkMode") && c("batchNetworkMode").addEventListener("change", () => {}),
-      c("pasteTestNodes").addEventListener("click", () =>
-        H("pasteTestNodes", "正在读取剪贴板", async () => {
-          const e = await dn();
-          if (!e.trim()) {
-            P("\u526A\u8D34\u677F\u6CA1\u6709\u8282\u70B9\u5185\u5BB9");
-            return;
-          }
-          ((c("testInput").value = e), await Vt(), P("\u5DF2\u4ECE\u526A\u8D34\u677F\u8BFB\u53D6"));
-        }),
-      ),
       c("batchDelayTest").addEventListener("click", () => Jr()),
       c("stopBatchTest").addEventListener("click", ea),
       c("copyProxyMapSocks5") && c("copyProxyMapSocks5").addEventListener("click", copyProxyMapSocks5),
       c("exportProxyMapCsv") && c("exportProxyMapCsv").addEventListener("click", exportProxyMapCsv),
-      c("filterDeadNodes") && c("filterDeadNodes").addEventListener("click", filterDeadNodes),
-      c("copyWorkingNodes") && c("copyWorkingNodes").addEventListener("click", copyWorkingNodes),
-      c("saveBatchToGroup") && c("saveBatchToGroup").addEventListener("click", saveBatchToGroup),
       c("clearTestNodes").addEventListener("click", () => {
         ((s.testRunId += 1),
           (s.testNodes = []),
@@ -6980,7 +6896,18 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
     const r = s.testNodes[evt.index];
     if (!r) return;
 
-    if (evt.phase === "delay") {
+    if (evt.phase === "ping") {
+      const O = evt.result || {};
+      if (evt.error) {
+        r.pingMs = -1;
+        if (!r.urlDelayMs) r.status = "Ping 失败";
+      } else {
+        r.pingAddress = O.pingAddress || r.address || "";
+        r.pingMs = O.pingMs || O.delayMs || 0;
+        r.status = "Ping " + r.pingMs + " ms";
+      }
+      ne();
+    } else if (evt.phase === "delay") {
       if (evt.error) {
         r.error = evt.error;
         if (s.currentBatchMetric === "ping") {
@@ -6997,6 +6924,7 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
           r.pingMs = O.pingMs || O.delayMs || 0;
           r.status = "Ping " + r.pingMs + " ms";
         } else {
+          if (O.pingMs > 0) r.pingMs = O.pingMs;
           r.urlDelayMs = O.urlDelayMs || O.delayMs || 0;
           r.status = "URL " + r.urlDelayMs + " ms";
         }
@@ -7047,19 +6975,14 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
     if (!(await Vt()) || !s.testNodes.length) return;
     const testOptions = await prepareBatchRawTest(s.testNodes);
     if (!testOptions) return;
-    const delayMetric = await showDelayMetricDialog({
-      title: "\u9009\u62E9\u6D4B\u8BD5\u65B9\u5F0F",
-      message: "\u8BF7\u9009\u62E9\u672C\u6B21\u6D4B\u8BD5\u7684\u5EF6\u8FDF\u7C7B\u578B\u3002",
-    });
-    if (!delayMetric) return;
-    testOptions.delayMetric = delayMetric;
+    testOptions.delayMetric = "both";
     const t = ++s.testRunId;
     s.currentRawTestOptions = testOptions;
     s.batchTesting = true;
     s.testStopRequested = false;
     s.testBusyKeys.clear();
     s.testBusyKey = "";
-    s.currentBatchMetric = delayMetric === "real" ? "delay" : "ping";
+    s.currentBatchMetric = "both";
     s.batchTestCompleted = 0;
     s.batchTestWorking = 0;
     s.batchTestTotal = s.testNodes.length;
@@ -7078,7 +7001,7 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
     ne();
     se(true);
 
-    const metric = delayMetric === "real" ? "delay" : "ping";
+    const metric = "both";
     const raws = s.testNodes.map((n) => n.raw);
 
     try {
