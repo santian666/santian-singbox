@@ -3475,13 +3475,13 @@ textarea {
 }
 
 .confirm-card {
-  width: min(460px, 100%);
+  width: min(322px, 100%);
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  gap: 12px;
-  padding: 18px 20px;
+  gap: 8px;
+  padding: 13px 14px;
   border: 1px solid rgba(219, 228, 239, 0.92);
-  border-radius: 10px;
+  border-radius: 9px;
   background: rgba(255, 255, 255, 0.98);
   box-shadow: 0 22px 54px rgba(15, 23, 42, 0.2);
   animation: confirm-in 0.18s ease both;
@@ -3495,25 +3495,25 @@ textarea {
 .confirm-content h2 {
   margin-top: 1px;
   color: #101828;
-  font-size: 15px;
+  font-size: 13.5px;
   font-weight: 750;
 }
 
 .confirm-content p {
-  margin-top: 8px;
+  margin-top: 5px;
   color: #344054;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 650;
   word-break: break-word;
   white-space: normal;
 }
 
 .confirm-content span {
-  margin-top: 5px;
+  margin-top: 4px;
   display: block;
   color: var(--muted);
-  font-size: 12px;
-  line-height: 1.5;
+  font-size: 11px;
+  line-height: 1.42;
   white-space: normal;
   overflow-wrap: anywhere;
 }
@@ -3521,15 +3521,16 @@ textarea {
 .confirm-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 8px;
+  gap: 6px;
   padding-top: 2px;
 }
 
 .confirm-actions button {
-  min-width: 72px;
-  min-height: 34px;
-  padding: 8px 14px;
-  border-radius: 8px;
+  min-width: 58px;
+  min-height: 28px;
+  padding: 5px 11px;
+  border-radius: 7px;
+  font-size: 12px;
 }
 
 .confirm-actions .danger {
@@ -3543,18 +3544,18 @@ textarea {
 }
 
 #confirmDialog .confirm-card {
-  width: min(420px, 100%);
-  gap: 16px;
-  padding: 20px 22px 18px;
+  width: min(296px, 100%);
+  gap: 11px;
+  padding: 14px 15px 12px;
   border-top: 3px solid rgba(217, 45, 32, 0.82);
 }
 
 #confirmDialog .confirm-content h2 {
-  font-size: 16px;
+  font-size: 14px;
 }
 
 #confirmDialog .confirm-actions {
-  padding-top: 12px;
+  padding-top: 8px;
   border-top: 1px solid var(--line);
 }
 
@@ -3575,22 +3576,22 @@ textarea {
 
 .subscription-update-card {
   position: relative;
-  width: min(520px, 100%);
-  padding: 18px 20px 16px;
+  width: min(364px, 100%);
+  padding: 13px 14px 12px;
 }
 
 .subscription-update-content {
-  padding-right: 34px;
+  padding-right: 28px;
 }
 
 .subscription-url-field {
-  margin-top: 12px;
+  margin-top: 8px;
 }
 
 .subscription-url-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
-  gap: 8px;
+  gap: 6px;
   align-items: center;
 }
 
@@ -3599,31 +3600,31 @@ textarea {
 }
 
 .subscription-url-row button {
-  min-height: 34px;
+  min-height: 28px;
 }
 
 .group-dialog-card {
-  width: min(430px, 100%);
+  width: min(302px, 100%);
 }
 
 .update-choice-card {
-  width: min(460px, 92vw);
+  width: min(322px, 92vw);
   display: block;
-  padding: 18px 20px;
-  border-radius: 12px;
+  padding: 13px 14px;
+  border-radius: 10px;
 }
 
 .update-choice-head {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 14px;
+  gap: 10px;
 }
 
 .update-choice-head h2 {
   margin: 0;
   color: #101828;
-  font-size: 16px;
+  font-size: 14px;
   font-weight: 750;
 }
 
@@ -3775,37 +3776,42 @@ body[data-theme="dark"] .update-choice-footer {
 }
 
 .test-mode-card {
-  width: min(560px, 100%);
+  width: min(392px, 100%);
 }
 
 .delay-metric-card {
-  width: min(520px, 100%);
+  width: min(364px, 100%);
 }
 
 .delay-metric-actions,
 .test-mode-actions {
   display: grid;
-  grid-template-columns: repeat(3, minmax(112px, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
   align-items: center;
 }
 
 .delay-metric-actions button,
 .test-mode-actions button {
   min-width: 0;
-  min-height: 34px;
-  padding: 7px 12px;
-  border-radius: 8px;
+  min-height: 28px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  font-size: 12px;
   white-space: nowrap;
   font-weight: 750;
 }
 
 .node-link-card {
   width: min(680px, 100%);
+  gap: 12px;
+  padding: 18px 20px;
 }
 
 .network-tool-card {
   width: min(640px, 100%);
+  gap: 12px;
+  padding: 18px 20px;
 }
 
 .network-tool-output {
@@ -3826,6 +3832,8 @@ body[data-theme="dark"] .update-choice-footer {
 .node-edit-card {
   width: min(760px, 100%);
   max-height: min(780px, calc(100vh - 48px));
+  gap: 12px;
+  padding: 18px 20px;
   grid-template-columns: minmax(0, 1fr);
   overflow: hidden;
 }
@@ -5284,9 +5292,9 @@ body[data-theme="dark"] .speedtest-metric-text {
 }
 
 .app-update-card {
-  width: min(460px, 100%);
-  padding: 20px 22px;
-  border-radius: 12px;
+  width: min(322px, 100%);
+  padding: 14px 15px;
+  border-radius: 10px;
   box-shadow: 0 20px 35px -8px rgba(15, 23, 42, 0.25), 0 0 1px rgba(15, 23, 42, 0.15);
 }
 
@@ -5294,19 +5302,19 @@ body[data-theme="dark"] .speedtest-metric-text {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 14px;
+  gap: 8px;
+  margin-bottom: 10px;
 }
 
 .app-update-badge {
   display: inline-block;
-  padding: 2px 8px;
-  font-size: 11px;
+  padding: 2px 7px;
+  font-size: 10.5px;
   font-weight: 700;
   color: #2563eb;
   background: #eff6ff;
   border-radius: 999px;
-  margin-bottom: 6px;
+  margin-bottom: 4px;
   border: 1px solid #bfdbfe;
 }
 
@@ -5318,7 +5326,7 @@ body[data-theme="dark"] .app-update-badge {
 
 .app-update-head h2 {
   margin: 0;
-  font-size: 17px;
+  font-size: 14.5px;
   font-weight: 750;
   color: #0f172a;
 }
