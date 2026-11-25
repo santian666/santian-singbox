@@ -3863,7 +3863,7 @@ func (a *App) ensureProxyHealthAsync(reason string) {
 }
 
 const (
-	proxyHealthFailThreshold      = 2
+	proxyHealthFailThreshold      = 10
 	proxyDegradedDelayThresholdMS = 1200
 )
 
@@ -4003,7 +4003,7 @@ func (a *App) ensureProxyHealth(reason string) {
 	a.setNetworkHealth(
 		"node_down",
 		"当前节点无法连接（防漏保护生效中）",
-		fmt.Sprintf("本机物理网络正常，但当前节点 [%s] 无响应（%v）。为避免真实环境暴露，已保持断网防漏锁定，请手动切换其他节点或重启内核。", selectedNodeLogName(state.Nodes, state.SelectedID), probeErr),
+		fmt.Sprintf("本机物理网络正常，但当前节点 [%s] 连续 %d 次探测无响应（%v）。为避免真实环境暴露，已保持断网防漏锁定，请手动切换其他节点或重启内核。", selectedNodeLogName(state.Nodes, state.SelectedID), fails, probeErr),
 		true,
 	)
 }
