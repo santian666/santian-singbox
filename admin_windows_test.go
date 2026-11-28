@@ -41,25 +41,13 @@ func TestResolveAdminRestartExeFallsBackToCurrentExe(t *testing.T) {
 	}
 }
 
-func TestAdminRestartScriptWaitsForParentBeforeStart(t *testing.T) {
-	root := t.TempDir()
-	exe := filepath.Join(root, "SanTian-Singbox.exe")
-	script, err := writeAdminRestartScript(root, exe, adminRestartArg+" "+adminTunHandoffArg, 4321)
-	if err != nil {
-		t.Fatal(err)
+func TestBuildAdminRestartParamsWaitsForParentWithoutBatchScript(t *testing.T) {
+	params := buildAdminRestartParams(adminRestartArg+" "+adminTunHandoffArg, 4321)
+	if !strings.HasPrefix(params, waitParentPIDArgPrefix+"4321 ") {
+		t.Fatalf("管理员直接提权参数应以 --wait-pid=4321 开头，got %q", params)
 	}
-	data, err := os.ReadFile(script)
-	if err != nil {
-		t.Fatal(err)
-	}
-	content := string(data)
-	waitIndex := strings.Index(content, "Get-Process -Id 4321")
-	startIndex := strings.Index(content, `start ""`)
-	if waitIndex < 0 || startIndex < 0 || waitIndex > startIndex {
-		t.Fatalf("管理员实例必须等待旧进程退出后再启动：%s", content)
-	}
-	if !strings.Contains(content, adminTunHandoffArg) {
-		t.Fatalf("管理员 TUN 交接参数未写入启动脚本：%s", content)
+	if !strings.Contains(params, adminRestartArg) || !strings.Contains(params, adminTunHandoffArg) {
+		t.Fatalf("管理员 TUN 交接参数缺失：%q", params)
 	}
 }
 

@@ -1604,9 +1604,9 @@ var ia = ln((an, sn) => {
                 <input id="autoStart" type="checkbox" />
                 <span>开机自启动</span>
               </label>
-              <label class="switch" title="代理节点故障或链路中断时自动拦截海外访问，防止真实 IP 裸奔泄露；国内应用（微信、网页等）保持 100% 畅通">
+              <label class="switch" title="开启完整 TUN 模式时启用 Windows 内核 WFP 动态内存防泄露（纯内存运行，断电重启自动释放不锁网），拦截非代理直连与非 TUN 的 DNS 泄露；内核意外退出时自动阻断外网防止真实 IP 暴露">
                 <input id="circuitBreaker" type="checkbox" />
-                <span>智能分流熔断（防裸奔）</span>
+                <span>内核级防泄露保护（TUN）</span>
               </label>
               <label class="switch" title="界面最小化到右下角托盘时，若遇到节点失联或内核异常自动弹出主窗口并闪烁任务栏">
                 <input id="faultPopupOnHidden" type="checkbox" checked />
@@ -2678,18 +2678,19 @@ var ia = ln((an, sn) => {
           C = Boolean(s.busyKey || s.testingGroupId),
           O = rawCountByGroup.get(r.id) || 0,
           D = r.id !== "default" && !C;
+        const gid = m(r.id);
         return `
-        <article class="group-card ${o ? "active" : ""} ${s.deletingGroupMode ? "delete-pick" : ""} ${D ? "draggable" : "fixed"}" data-group-open="${r.id}" draggable="${D ? "true" : "false"}">
+        <article class="group-card ${o ? "active" : ""} ${s.deletingGroupMode ? "delete-pick" : ""} ${D ? "draggable" : "fixed"}" data-group-open="${gid}" draggable="${D ? "true" : "false"}">
           <div class="group-main">
-            <strong title="${m(r.name)}" data-group-rename="${r.id}">${m(r.name)}</strong>
+            <strong title="${m(r.name)}" data-group-rename="${gid}">${m(r.name)}</strong>
             <span>${i} 个节点</span>
             <span class="traffic-pill">流量：${Ne(zt(r))}</span>
           </div>
           <div class="group-actions">
             <div class="group-buttons with-copy">
-              <button class="${S ? "is-busy" : ""}" data-group-copy="${r.id}" title="复制 ${O} 条链接" ${C ? "disabled" : ""}>${S ? "复制中" : "复制"}</button>
-              <button class="${u ? "is-busy" : ""}" data-group-test="${r.id}" ${i === 0 || C ? "disabled" : ""}>${u ? "测试中" : "测试"}</button>
-              <button class="${b ? "is-busy" : ""}" data-group-delete="${r.id}" ${r.id === "default" || C ? "disabled" : ""}>删除</button>
+              <button class="${S ? "is-busy" : ""}" data-group-copy="${gid}" title="复制 ${O} 条链接" ${C ? "disabled" : ""}>${S ? "复制中" : "复制"}</button>
+              <button class="${u ? "is-busy" : ""}" data-group-test="${gid}" ${i === 0 || C ? "disabled" : ""}>${u ? "测试中" : "测试"}</button>
+              <button class="${b ? "is-busy" : ""}" data-group-delete="${gid}" ${r.id === "default" || C ? "disabled" : ""}>删除</button>
             </div>
             <span class="rate-pill">上传 ${Ne(r.uploadRate)}/s / 下载 ${Ne(r.downloadRate)}/s</span>
           </div>
@@ -2725,7 +2726,7 @@ var ia = ln((an, sn) => {
         r.addEventListener("dragover", (i) => {
           if (!dragId || r.dataset.groupOpen === "default") return;
           i.preventDefault();
-          const o = n.querySelector(`[data-group-open="${dragId}"]`);
+          const o = n.querySelector(`[data-group-open="${CSS.escape(dragId)}"]`);
           if (!o || o === r) return;
           const u = r.getBoundingClientRect(),
             b = i.clientY > u.top + u.height / 2 || i.clientX > u.left + u.width / 2;
@@ -2894,11 +2895,12 @@ var ia = ln((an, sn) => {
           E = f.get(v.groupId || "default") || "默认分组",
           F = l ? `分组：${E} · ${B}` : B;
         const protoLabel = formatProtocolLabel(v.type);
+        const nid = m(v.id);
         return `
-        <article class="node ${l ? "" : "draggable"} ${w ? "selected" : ""}" data-node-open="${v.id}" draggable="${!l && !A ? "true" : "false"}">
+        <article class="node ${l ? "" : "draggable"} ${w ? "selected" : ""}" data-node-open="${nid}" draggable="${!l && !A ? "true" : "false"}">
           <span class="chip node-protocol" title="${m(protoLabel)}">${m(protoLabel)}</span>
           <div class="node-title">
-            <button class="node-name-copy" data-copy-node="${v.id}" title="${m(v.name)}" type="button">${m(v.name)}</button>
+            <button class="node-name-copy" data-copy-node="${nid}" title="${m(v.name)}" type="button">${m(v.name)}</button>
           </div>
           <div class="node-meta" title="${m(F)}">${m(F)}</div>
           <div class="node-stats">
@@ -2906,12 +2908,12 @@ var ia = ln((an, sn) => {
             <span class="node-traffic" title="${m(D)}">${m(D)}</span>
           </div>
           <div class="node-actions">
-            <button class="select ${w ? "selected-action" : ""} ${x ? "is-busy" : ""}" data-select="${v.id}" ${w || A ? "disabled" : ""}>${w ? "已选择" : x ? "选择中" : "选择"}</button>
-            <button class="${z ? "is-busy" : ""}" data-test="${v.id}" ${A ? "disabled" : ""}>${z ? "测试中" : "测试"}</button>
-            <button data-edit-node="${v.id}" ${A ? "disabled" : ""}>编辑</button>
-            <button data-share-node="${v.id}" ${A ? "disabled" : ""}>分享</button>
-            <button data-qr-node="${v.id}" ${A ? "disabled" : ""}>二维码</button>
-            <button class="${y ? "is-busy" : ""}" data-delete="${v.id}" ${A ? "disabled" : ""}>${y ? "删除中" : "删除"}</button>
+            <button class="select ${w ? "selected-action" : ""} ${x ? "is-busy" : ""}" data-select="${nid}" ${w || A ? "disabled" : ""}>${w ? "已选择" : x ? "选择中" : "选择"}</button>
+            <button class="${z ? "is-busy" : ""}" data-test="${nid}" ${A ? "disabled" : ""}>${z ? "测试中" : "测试"}</button>
+            <button data-edit-node="${nid}" ${A ? "disabled" : ""}>编辑</button>
+            <button data-share-node="${nid}" ${A ? "disabled" : ""}>分享</button>
+            <button data-qr-node="${nid}" ${A ? "disabled" : ""}>二维码</button>
+            <button class="${y ? "is-busy" : ""}" data-delete="${nid}" ${A ? "disabled" : ""}>${y ? "删除中" : "删除"}</button>
           </div>
         </article>
       `;
@@ -3156,7 +3158,7 @@ var ia = ln((an, sn) => {
         z = (A) => {
           if (!v) return;
           A.preventDefault();
-          const B = a.querySelector(`[data-node-open="${v}"]`);
+          const B = a.querySelector(`[data-node-open="${CSS.escape(v)}"]`);
           if (!B) return;
           const C = Array.from(a.querySelectorAll("[data-node-open]:not(.dragging)"));
           let D = null;
@@ -3365,40 +3367,20 @@ var ia = ln((an, sn) => {
       return;
     }
     e.className = "test-nodes";
-    const t = s.testNodes
-      .map((n, a) => {
-        const r = s.testBusyKeys.has(Wt(a)) || s.testBusyKey.startsWith(`${s.testRunId}:${a}:`),
-          i = `${n.address}:${n.port}`,
-          o = aa(n, r),
-          u = Boolean(n.error) || n.urlDelayMs < 0,
-          b = s.testBusyKey === Xt(a, "speed"),
-          S = Ie(n.pingMs, "ms"),
-          C = Ie(n.urlDelayMs, "ms"),
-          N = na(n.outboundIp),
-          O = Ie(n.downloadMbps, "Mbps"),
-          G = Ie(n.uploadMbps, "Mbps");
-        const protoLabel = formatProtocolLabel(n.type);
-        return `
-        <tr class="${r ? "testing-row" : ""}">
-          <td class="test-address"><span class="copy-value" data-copy-value="${m(i)}" title="点击复制 ${m(i)}">${m(i)}</span></td>
-          <td><span class="chip copy-value" data-copy-value="${m(protoLabel)}" title="点击复制 ${m(protoLabel)}">${m(protoLabel)}</span></td>
-          <td><span class="chip copy-value" data-copy-value="${m(n.country)}" title="点击复制 ${m(n.country)}">${m(n.country)}</span></td>
-          <td class="test-name"><strong class="copy-value" data-copy-value="${m(n.name)}" title="点击复制 ${m(n.name)}">${m(n.name)}</strong></td>
-          <td><span class="${Ae(n.pingMs)}" data-raw-retest="${a}" data-retest-metric="ping" title="${r || s.batchTesting ? "测试中" : "点击重新测试 Ping 延迟"}" style="cursor:${r || s.batchTesting ? "default" : "pointer"}">${m(S)}</span></td>
-          <td><span class="${Ae(n.urlDelayMs)}" data-raw-retest="${a}" data-retest-metric="url" title="${r || s.batchTesting ? "测试中" : "点击重新测试 URL 延迟"}" style="cursor:${r || s.batchTesting ? "default" : "pointer"}">${m(C)}</span></td>
-          <td><span class="${ra(n.outboundIp)} copy-value" data-copy-value="${m(N)}" title="点击复制 ${m(N)}">${m(N)}</span></td>
-          <td><span class="${Ae(n.downloadMbps)} copy-value" data-copy-value="${m(O)}" title="点击复制 ${m(O)}">${m(O)}</span></td>
-          <td><span class="${Ae(n.uploadMbps)} copy-value" data-copy-value="${m(G)}" title="点击复制 ${m(G)}">${m(G)}</span></td>
-          <td><span class="test-status ${u ? "bad" : ""} copy-value" data-copy-value="${m(o)}" title="点击复制 ${m(o)}">${m(o)}</span></td>
-          <td>
-            <div class="test-actions">
-              <button class="${b ? "is-busy" : ""}" data-raw-speed="${a}" ${r || s.batchTesting ? "disabled" : ""}>${b ? "测试中" : "测试"}</button>
-            </div>
-          </td>
-        </tr>
-      `;
-      })
-      .join("");
+    const rowHTMLs = s.testNodes.map((n, a) => {
+      const r = s.testBusyKeys.has(Wt(a)) || s.testBusyKey.startsWith(`${s.testRunId}:${a}:`),
+        i = `${n.address}:${n.port}`,
+        o = aa(n, r),
+        u = Boolean(n.error) || n.urlDelayMs < 0,
+        b = s.testBusyKey === Xt(a, "speed"),
+        S = Ie(n.pingMs, "ms"),
+        C = Ie(n.urlDelayMs, "ms"),
+        N = na(n.outboundIp),
+        O = Ie(n.downloadMbps, "Mbps"),
+        G = Ie(n.uploadMbps, "Mbps");
+      const protoLabel = formatProtocolLabel(n.type);
+      return `<tr class="${r ? "testing-row" : ""}" data-test-row="${a}"><td class="test-address"><span class="copy-value" data-copy-value="${m(i)}" title="点击复制 ${m(i)}">${m(i)}</span></td><td><span class="chip copy-value" data-copy-value="${m(protoLabel)}" title="点击复制 ${m(protoLabel)}">${m(protoLabel)}</span></td><td><span class="chip copy-value" data-copy-value="${m(n.country)}" title="点击复制 ${m(n.country)}">${m(n.country)}</span></td><td class="test-name"><strong class="copy-value" data-copy-value="${m(n.name)}" title="点击复制 ${m(n.name)}">${m(n.name)}</strong></td><td><span class="${Ae(n.pingMs)}" data-raw-retest="${a}" data-retest-metric="ping" title="${r || s.batchTesting ? "测试中" : "点击重新测试 Ping 延迟"}" style="cursor:${r || s.batchTesting ? "default" : "pointer"}">${m(S)}</span></td><td><span class="${Ae(n.urlDelayMs)}" data-raw-retest="${a}" data-retest-metric="url" title="${r || s.batchTesting ? "测试中" : "点击重新测试 URL 延迟"}" style="cursor:${r || s.batchTesting ? "default" : "pointer"}">${m(C)}</span></td><td><span class="${ra(n.outboundIp)} copy-value" data-copy-value="${m(N)}" title="点击复制 ${m(N)}">${m(N)}</span></td><td><span class="${Ae(n.downloadMbps)} copy-value" data-copy-value="${m(O)}" title="点击复制 ${m(O)}">${m(O)}</span></td><td><span class="${Ae(n.uploadMbps)} copy-value" data-copy-value="${m(G)}" title="点击复制 ${m(G)}">${m(G)}</span></td><td><span class="test-status ${u ? "bad" : ""} copy-value" data-copy-value="${m(o)}" title="点击复制 ${m(o)}">${m(o)}</span></td><td><div class="test-actions"><button class="${b ? "is-busy" : ""}" data-raw-speed="${a}" ${r || s.batchTesting ? "disabled" : ""}>${b ? "测试中" : "测试"}</button></div></td></tr>`;
+    });
     const sortIcon = (k) =>
       s.batchSortKey === k
         ? s.batchSortAsc
@@ -3419,7 +3401,7 @@ var ia = ln((an, sn) => {
             <th>状态</th>
             <th>操作</th>
           </tr>`;
-    // 只替换表头和表体，保留滚动容器 .test-table-wrap，测试过程中滚动位置不会被重置
+    // 只替换表头和变更行，保留滚动容器 .test-table-wrap，避免大批量测速每 150ms 全量重建 DOM
     let wrap = e.querySelector(":scope > .test-table-wrap");
     if (!wrap) {
       e.innerHTML = `
@@ -3438,7 +3420,22 @@ var ia = ln((an, sn) => {
       thead.innerHTML = headRow;
       thead.__sanTianHead = headRow;
     }
-    tbody.innerHTML = t;
+    const prevRows = tbody.__sanTianRowCache;
+    if (Array.isArray(prevRows) && prevRows.length === rowHTMLs.length && tbody.children.length === rowHTMLs.length) {
+      for (let idx = 0; idx < rowHTMLs.length; idx++) {
+        if (prevRows[idx] !== rowHTMLs[idx]) {
+          const tpl = document.createElement("tbody");
+          tpl.innerHTML = rowHTMLs[idx];
+          if (tpl.firstElementChild) {
+            tbody.replaceChild(tpl.firstElementChild, tbody.children[idx]);
+          }
+          prevRows[idx] = rowHTMLs[idx];
+        }
+      }
+    } else {
+      tbody.innerHTML = rowHTMLs.join("");
+      tbody.__sanTianRowCache = rowHTMLs;
+    }
     te();
   }
   // 测试表格的点击事件只在容器上绑定一次（事件委托），不再每次渲染给每一行重新绑定
@@ -3911,9 +3908,13 @@ var ia = ln((an, sn) => {
       return;
     }
     let csv = "\uFEFF序号,代理类型,代理主机,代理端口,代理账号,代理密码,节点备注\r\n";
-    r.forEach((m, idx) => {
-      const n = `"${String(m.node.name || "").replace(/"/g, '""')}"`;
-      csv += `${idx + 1},socks5,127.0.0.1,${m.port},,,${n}\r\n`;
+    r.forEach((item, idx) => {
+      let safeName = String(item.node.name || "");
+      if (/^[=+\-@\t\r]/.test(safeName)) {
+        safeName = "'" + safeName;
+      }
+      const n = `"${safeName.replace(/"/g, '""')}"`;
+      csv += `${idx + 1},socks5,127.0.0.1,${item.port},,,${n}\r\n`;
     });
     nr(`SanTian-ProxyMap-${rr()}.csv`, csv);
     P(`已导出 ${r.length} 个端口映射配置到 CSV`);
@@ -5619,252 +5620,6 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
       throw new Error("\u5BFC\u51FA\u63A5\u53E3\u672A\u5C31\u7EEA\uFF0C\u8BF7\u91CD\u542F\u5F00\u53D1\u6A21\u5F0F");
     return t.ExportGroupLinks(e);
   }
-  function Sr(e) {
-    return new Promise((t, n) => {
-      const a = new Image(),
-        r = 220;
-      ((a.onload = () => {
-        const i = document.createElement("canvas");
-        ((i.width = r), (i.height = r));
-        const o = i.getContext("2d");
-        ((o.fillStyle = "#fff"), o.fillRect(0, 0, r, r), o.drawImage(a, 0, 0, r, r));
-        const u = i.toDataURL("image/png").split(",")[1] || "";
-        t(_r(u));
-      }),
-        (a.onerror = () => n(new Error("二维码生成失败"))),
-        (a.src = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(Ut(e))}`));
-    });
-  }
-  function $r(e, t) {
-    const n = {};
-    return (
-      (n["[Content_Types].xml"] = pe(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-<Default Extension="xml" ContentType="application/xml"/>
-<Default Extension="png" ContentType="image/png"/>
-<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
-<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
-<Override PartName="/xl/drawings/drawing1.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>
-<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
-</Types>`)),
-      (n["_rels/.rels"] = pe(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
-</Relationships>`)),
-      (n["xl/_rels/workbook.xml.rels"] = pe(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
-<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
-</Relationships>`)),
-      (n["xl/workbook.xml"] = pe(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-<sheets><sheet name="${qt(Or(e))}" sheetId="1" r:id="rId1"/></sheets>
-</workbook>`)),
-      (n["xl/styles.xml"] = pe(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-<fonts count="1"><font><sz val="11"/><name val="Microsoft YaHei UI"/></font></fonts>
-<fills count="1"><fill><patternFill patternType="none"/></fill></fills>
-<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
-<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
-<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>
-</styleSheet>`)),
-      (n["xl/worksheets/sheet1.xml"] = pe(Pr(t))),
-      (n["xl/worksheets/_rels/sheet1.xml.rels"] = pe(`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing1.xml"/>
-</Relationships>`)),
-      (n["xl/drawings/drawing1.xml"] = pe(Er(t))),
-      (n["xl/drawings/_rels/drawing1.xml.rels"] = pe(Rr(t))),
-      t.forEach((a, r) => {
-        n[`xl/media/qr${r + 1}.png`] = a.qr;
-      }),
-      Ir(n)
-    );
-  }
-  function Pr(e) {
-    let n = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-<dimension ref="A1:C${e.length + 1}"/><sheetViews><sheetView workbookViewId="0"/></sheetViews>
-<sheetFormatPr defaultRowHeight="18"/><cols><col min="1" max="1" width="28" customWidth="1"/><col min="2" max="2" width="96" customWidth="1"/><col min="3" max="3" width="20" customWidth="1"/></cols><sheetData>`;
-    return (
-      (n += xt(1, ["名称", "链接", "二维码"], 18)),
-      e.forEach((a, r) => {
-        n += xt(r + 2, [a.name, a.link, ""], 92);
-      }),
-      (n +=
-        '</sheetData><drawing r:id="rId1"/><pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/></worksheet>'),
-      n
-    );
-  }
-  function xt(e, t, n) {
-    const a = t
-      .map((r, i) => `<c r="${String.fromCharCode(65 + i)}${e}" t="inlineStr"><is><t>${qt(r)}</t></is></c>`)
-      .join("");
-    return `<row r="${e}" ht="${n}" customHeight="1">${a}</row>`;
-  }
-  function Er(e) {
-    let n = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">`;
-    return (
-      e.forEach((a, r) => {
-        const i = r + 1,
-          o = r + 1;
-        n += `<xdr:oneCellAnchor><xdr:from><xdr:col>2</xdr:col><xdr:colOff>160000</xdr:colOff><xdr:row>${i}</xdr:row><xdr:rowOff>70000</xdr:rowOff></xdr:from><xdr:ext cx="${1047750}" cy="${1047750}"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="${o}" name="QRCode ${o}"/><xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rId${o}"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:oneCellAnchor>`;
-      }),
-      (n += "</xdr:wsDr>"),
-      n
-    );
-  }
-  function Rr(e) {
-    let t =
-      '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">';
-    return (
-      e.forEach((n, a) => {
-        const r = a + 1;
-        t += `<Relationship Id="rId${r}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/qr${r}.png"/>`;
-      }),
-      `${t}</Relationships>`
-    );
-  }
-  function Ir(e) {
-    const t = new TextEncoder(),
-      n = [],
-      a = [];
-    let r = 0;
-    Object.entries(e).forEach(([u, b]) => {
-      const S = t.encode(u),
-        C = b instanceof Uint8Array ? b : new Uint8Array(b),
-        N = Ar(C);
-      (n.push(
-        Qe(67324752, [
-          [20, 2],
-          [0, 2],
-          [0, 2],
-          [0, 2],
-          [0, 2],
-          [N, 4],
-          [C.length, 4],
-          [C.length, 4],
-          [S.length, 2],
-          [0, 2],
-        ]),
-        S,
-        C,
-      ),
-        a.push({ nameBytes: S, fileBytes: C, crc: N, offset: r }),
-        (r += 30 + S.length + C.length));
-    });
-    const i = r;
-    a.forEach((u) => {
-      (n.push(
-        Qe(33639248, [
-          [20, 2],
-          [20, 2],
-          [0, 2],
-          [0, 2],
-          [0, 2],
-          [0, 2],
-          [u.crc, 4],
-          [u.fileBytes.length, 4],
-          [u.fileBytes.length, 4],
-          [u.nameBytes.length, 2],
-          [0, 2],
-          [0, 2],
-          [0, 2],
-          [0, 2],
-          [0, 4],
-          [u.offset, 4],
-        ]),
-        u.nameBytes,
-      ),
-        (r += 46 + u.nameBytes.length));
-    });
-    const o = r - i;
-    return (
-      n.push(
-        Qe(101010256, [
-          [0, 2],
-          [0, 2],
-          [a.length, 2],
-          [a.length, 2],
-          [o, 4],
-          [i, 4],
-          [0, 2],
-        ]),
-      ),
-      Br(n)
-    );
-  }
-  function Qe(e, t) {
-    const n = 4 + t.reduce((o, [, u]) => o + u, 0),
-      a = new Uint8Array(n),
-      r = new DataView(a.buffer);
-    r.setUint32(0, e, !0);
-    let i = 4;
-    return (
-      t.forEach(([o, u]) => {
-        (u === 2 ? r.setUint16(i, o, !0) : r.setUint32(i, o >>> 0, !0), (i += u));
-      }),
-      a
-    );
-  }
-  function Ar(e) {
-    let t = -1;
-    for (const n of e) t = (t >>> 8) ^ Cr[(t ^ n) & 255];
-    return (t ^ -1) >>> 0;
-  }
-  const Cr = Array.from({ length: 256 }, (e, t) => {
-    let n = t;
-    for (let a = 0; a < 8; a += 1) n = n & 1 ? 3988292384 ^ (n >>> 1) : n >>> 1;
-    return n >>> 0;
-  });
-  function Br(e) {
-    const t = e.reduce((r, i) => r + i.length, 0),
-      n = new Uint8Array(t);
-    let a = 0;
-    return (
-      e.forEach((r) => {
-        (n.set(r, a), (a += r.length));
-      }),
-      n
-    );
-  }
-  function pe(e) {
-    return new TextEncoder().encode(e);
-  }
-  function Nr(e) {
-    let t = "";
-    for (let n = 0; n < e.length; n += 32768) t += String.fromCharCode(...e.subarray(n, n + 32768));
-    return btoa(t);
-  }
-  function _r(e) {
-    const t = atob(e),
-      n = new Uint8Array(t.length);
-    for (let a = 0; a < t.length; a += 1) n[a] = t.charCodeAt(a);
-    return n;
-  }
-  function qt(e) {
-    return String(e != null ? e : "")
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;");
-  }
-  function Dr(e) {
-    return (
-      String(e || "分组名称")
-        .replace(/[\\/:*?"<>|]/g, "_")
-        .trim() || "分组名称"
-    );
-  }
-  function Or(e) {
-    return (
-      String(e || "分组名称")
-        .replace(/[\\/?*[\]:]/g, "_")
-        .slice(0, 31) || "分组名称"
-    );
-  }
   function updateDirectDomainsVisibility() {
     const e = ke(s.selectedMode) === "rule",
       t = c("directDomains"),
@@ -7275,7 +7030,8 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
       .replaceAll("&", "&amp;")
       .replaceAll("<", "&lt;")
       .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;");
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
   }
   function nn(e) {
     return String(e || "")
@@ -7366,7 +7122,14 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
     dlg.classList.remove("hidden");
     if (btnConfirm) btnConfirm.focus();
 
+    const onKey = (ev) => {
+      if (ev.key === "Escape" && (!btnConfirm || !btnConfirm.disabled)) {
+        closeDialog(true);
+      }
+    };
+
     const closeDialog = (userDismissed = false) => {
+      window.removeEventListener("keydown", onKey);
       dlg.classList.add("hidden");
       if (userDismissed) {
         appUpdateDismissedThisSession = true;
@@ -7375,13 +7138,6 @@ ${(t == null ? void 0 : t.address) || ""}:${(t == null ? void 0 : t.port) || ""}
 
     if (btnCancel) btnCancel.onclick = () => closeDialog(true);
     if (btnClose) btnClose.onclick = () => closeDialog(true);
-
-    const onKey = (ev) => {
-      if (ev.key === "Escape" && (!btnConfirm || !btnConfirm.disabled)) {
-        closeDialog(true);
-        window.removeEventListener("keydown", onKey);
-      }
-    };
     window.addEventListener("keydown", onKey);
 
     if (btnConfirm) {

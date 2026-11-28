@@ -1,14 +1,19 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
 	"strings"
+
+	"golang.org/x/sys/windows/registry"
 )
 
-const autoStartName = "SanTian-Singbox"
-const runRegistryPath = `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+const (
+	autoStartName        = "SanTian-Singbox"
+	autoStartRunKeyPath  = `Software\Microsoft\Windows\CurrentVersion\Run`
+)
 
 func syncAutoStart(enabled bool) error {
 	if runtime.GOOS != "windows" {
@@ -19,19 +24,29 @@ func syncAutoStart(enabled bool) error {
 		if err != nil {
 			return fmt.Errorf("获取程序路径失败：%w", err)
 		}
-		if strings.HasSuffix(strings.ToLower(exe), "-test.exe") {
+		if isBootCleanupTestBinary(exe) {
 			return nil
 		}
-		value := fmt.Sprintf(`"%s" %s`, exe, adminRestartArg)
-		if _, err := runCommandOutput("reg", "add", runRegistryPath, "/v", autoStartName, "/t", "REG_SZ", "/d", value, "/f"); err != nil {
+		key, _, err := registry.CreateKey(registry.CURRENT_USER, autoStartRunKeyPath, registry.SET_VALUE)
+		if err != nil {
+			return fmt.Errorf("设置开机自启动失败：%w", err)
+		}
+		defer key.Close()
+		value := fmt.Sprintf(`"%s" %s`, strings.TrimSpace(exe), adminRestartArg)
+		if err := key.SetStringValue(autoStartName, value); err != nil {
 			return fmt.Errorf("设置开机自启动失败：%w", err)
 		}
 		return nil
 	}
-	if _, err := runCommandOutput("reg", "query", runRegistryPath, "/v", autoStartName); err != nil {
-		return nil
+	key, err := registry.OpenKey(registry.CURRENT_USER, autoStartRunKeyPath, registry.SET_VALUE)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("关闭开机自启动失败：%w", err)
 	}
-	if _, err := runCommandOutput("reg", "delete", runRegistryPath, "/v", autoStartName, "/f"); err != nil {
+	defer key.Close()
+	if err := key.DeleteValue(autoStartName); err != nil && !errors.Is(err, registry.ErrNotExist) {
 		return fmt.Errorf("关闭开机自启动失败：%w", err)
 	}
 	return nil

@@ -2,6 +2,8 @@ package main
 
 import (
 	"archive/zip"
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -127,20 +129,30 @@ func TestIsValidUpdateZip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !isValidUpdateZip(validZipPath, fi.Size()) {
-		t.Errorf("isValidUpdateZip failed for valid zip")
+	rawBytes, err := os.ReadFile(validZipPath)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !isValidUpdateZip(validZipPath, 0) {
+	sum := sha256.Sum256(rawBytes)
+	validDigest := "sha256:" + hex.EncodeToString(sum[:])
+
+	if !isValidUpdateZip(validZipPath, fi.Size(), validDigest) {
+		t.Errorf("isValidUpdateZip failed for valid zip with matching SHA-256")
+	}
+	if !isValidUpdateZip(validZipPath, 0, "") {
 		t.Errorf("isValidUpdateZip failed for valid zip with expectedSize=0")
 	}
-	if isValidUpdateZip(validZipPath, fi.Size()+100) {
+	if isValidUpdateZip(validZipPath, fi.Size(), "sha256:0000000000000000000000000000000000000000000000000000000000000000") {
+		t.Errorf("isValidUpdateZip should fail when SHA-256 digest mismatches")
+	}
+	if isValidUpdateZip(validZipPath, fi.Size()+100, "") {
 		t.Errorf("isValidUpdateZip should fail when expected size mismatches")
 	}
 
 	// 2. Corrupt zip
 	corruptZipPath := filepath.Join(tmpDir, "corrupt.zip")
 	_ = os.WriteFile(corruptZipPath, []byte("not-a-zip"), 0644)
-	if isValidUpdateZip(corruptZipPath, 0) {
+	if isValidUpdateZip(corruptZipPath, 0, "") {
 		t.Errorf("isValidUpdateZip should fail for corrupt zip")
 	}
 }
@@ -177,7 +189,7 @@ func TestCheckUpdateRequiresProxyPort(t *testing.T) {
 }
 
 func TestDownloadUpdateAssetRequiresProxyPort(t *testing.T) {
-	err := downloadUpdateAsset("https://example.com/test.zip", "test.zip", 0, 100, nil)
+	err := downloadUpdateAsset("https://github.com/santian666/santian-singbox/releases/download/v7.0.31/test.zip", "test.zip", 0, 100, "", nil)
 	if err == nil {
 		t.Fatalf("expected error when proxyPort is 0, got nil")
 	}

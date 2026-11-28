@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
@@ -15,14 +16,42 @@ import (
 )
 
 var (
-	killSwitchMu     sync.Mutex
-	killSwitchActive bool
+	killSwitchMu                 sync.Mutex
+	killSwitchActive             bool
+	killSwitchRulesVerifiedClean bool
+
+	validFirewallPolicyRE = regexp.MustCompile(`^(?i)(BlockInbound|AllowInbound),(BlockOutbound|AllowOutbound)$`)
+	validFirewallProfiles = map[string]bool{
+		"domain":  true,
+		"private": true,
+		"public":  true,
+	}
 
 	runFirewallCommand = func(name string, args ...string) (string, error) {
 		return runCommandOutput(name, args...)
 	}
 	checkAdminPrivileges = hasAdminPrivileges
 )
+
+func systemBinaryPath(exeName string) string {
+	sysRoot := strings.TrimSpace(os.Getenv("SystemRoot"))
+	if sysRoot == "" {
+		sysRoot = `C:\Windows`
+	}
+	return filepath.Join(sysRoot, "System32", exeName)
+}
+
+func netshExePath() string {
+	return systemBinaryPath("netsh.exe")
+}
+
+func sanitizeFirewallPolicy(policy string) string {
+	policy = strings.TrimSpace(policy)
+	if validFirewallPolicyRE.MatchString(policy) {
+		return policy
+	}
+	return "blockinbound,allowoutbound"
+}
 
 func parseFirewallPolicy(output string) string {
 	re := regexp.MustCompile(`(?i)(BlockInbound|AllowInbound)\s*,\s*(BlockOutbound|AllowOutbound)`)
@@ -34,8 +63,10 @@ func parseFirewallPolicy(output string) string {
 }
 
 func queryFirewallPolicy(profile string) string {
-	cmd := fmt.Sprintf("netsh advfirewall show %sprofile firewallpolicy", profile)
-	out, err := runFirewallCommand("cmd", "/c", cmd)
+	if !validFirewallProfiles[strings.ToLower(strings.TrimSpace(profile))] {
+		return "BlockInbound,AllowOutbound"
+	}
+	out, err := runFirewallCommand(netshExePath(), "advfirewall", "show", profile+"profile", "firewallpolicy")
 	if err != nil {
 		return "BlockInbound,AllowOutbound"
 	}
@@ -47,12 +78,16 @@ func queryFirewallPolicy(profile string) string {
 }
 
 func restoreProfilePolicy(profile, policy string, logger *Logger) error {
-	policy = strings.TrimSpace(policy)
-	if policy == "" {
-		policy = "blockinbound,allowoutbound"
+	profile = strings.ToLower(strings.TrimSpace(profile))
+	if !validFirewallProfiles[profile] {
+		return fmt.Errorf("无效防火墙配置档：%q", profile)
 	}
-	cmd := fmt.Sprintf("netsh advfirewall set %sprofile firewallpolicy %s", profile, policy)
-	if _, err := runFirewallCommand("cmd", "/c", cmd); err != nil {
+	rawPolicy := strings.TrimSpace(policy)
+	safePolicy := sanitizeFirewallPolicy(rawPolicy)
+	if rawPolicy != "" && !validFirewallPolicyRE.MatchString(rawPolicy) && logger != nil {
+		logger.Warn("检测到异常防火墙策略值，已按安全默认值回退：%s", profile)
+	}
+	if _, err := runFirewallCommand(netshExePath(), "advfirewall", "set", profile+"profile", "firewallpolicy", safePolicy); err != nil {
 		if logger != nil {
 			logger.Error("恢复 %s 防火墙策略失败: %v", profile, err)
 		}
@@ -66,7 +101,7 @@ func restorePolicies(policy KillSwitchProfilePolicy, logger *Logger) error {
 		if logger != nil {
 			logger.Warn("Kill Switch 状态文件损坏或字段缺失，回退使用默认策略 blockinbound,allowoutbound 恢复网络")
 		}
-		_, err := runFirewallCommand("cmd", "/c", "netsh advfirewall set allprofiles firewallpolicy blockinbound,allowoutbound")
+		_, err := runFirewallCommand(netshExePath(), "advfirewall", "set", "allprofiles", "firewallpolicy", "blockinbound,allowoutbound")
 		return err
 	}
 	var firstErr error
@@ -86,9 +121,9 @@ func restorePolicies(policy KillSwitchProfilePolicy, logger *Logger) error {
 }
 
 func hasRule(suffix string) bool {
-	cmd := fmt.Sprintf(`netsh advfirewall firewall show rule name="%s%s"`, killSwitchRulePrefix, suffix)
-	out, err := runFirewallCommand("cmd", "/c", cmd)
-	return err == nil && strings.Contains(out, killSwitchRulePrefix+suffix)
+	ruleName := killSwitchRulePrefix + suffix
+	out, err := runFirewallCommand(netshExePath(), "advfirewall", "firewall", "show", "rule", "name="+ruleName)
+	return err == nil && strings.Contains(out, ruleName)
 }
 
 func hasCoreAppLANRules() bool {
@@ -113,6 +148,23 @@ func enableKillSwitch(root string, logger *Logger, corePath string, appPath stri
 		return errors.New("缺少管理员权限")
 	}
 
+	corePath = strings.TrimSpace(corePath)
+	if corePath == "" {
+		if logger != nil {
+			logger.Error("缺少代理核心路径，中止启用 Windows 防火墙阻断以防锁死核心出网")
+		}
+		return errors.New("缺少代理核心路径")
+	}
+	appPath = strings.TrimSpace(appPath)
+	if appPath == "" {
+		appPath, _ = os.Executable()
+		appPath = strings.TrimSpace(appPath)
+	}
+	if appPath == "" {
+		return errors.New("缺少主程序路径")
+	}
+
+	killSwitchRulesVerifiedClean = false
 	stateFile := killSwitchStatePath(root)
 
 	// 1. 读取并保存原始策略，防止二次开启把“已阻断”覆盖为原始策略
@@ -165,7 +217,7 @@ func enableKillSwitch(root string, logger *Logger, corePath string, appPath stri
 	if err != nil {
 		return err
 	}
-	if err := atomicWriteFile(stateFile, stateBytes, 0644); err != nil {
+	if err := atomicWriteFile(stateFile, stateBytes, 0600); err != nil {
 		if logger != nil {
 			logger.Error("写入 Kill Switch 状态文件失败，中止阻断以防整机断网: %v", err)
 		}
@@ -188,37 +240,38 @@ func enableKillSwitch(root string, logger *Logger, corePath string, appPath stri
 		_ = os.Remove(stateFile)
 	}
 
-	// 3. 添加白名单放行规则（Core, App, LAN 必须成功，任意失败即回滚；DHCP 失败记 Warn 不阻断）
-	// 放行核心 sing-box.exe
-	if corePath != "" {
-		cmd := fmt.Sprintf(`netsh advfirewall firewall add rule name="%sCore" dir=out action=allow program="%s" enable=yes profile=any`, killSwitchRulePrefix, corePath)
-		if _, err := runFirewallCommand("cmd", "/c", cmd); err != nil {
-			cleanupOnFailure(false)
-			if logger != nil {
-				logger.Error("添加核心放行规则失败: %v，已回滚", err)
-			}
-			return fmt.Errorf("添加核心放行规则失败: %w", err)
+	// 3. 添加白名单放行规则（直接调用 System32\netsh.exe 参数切片，彻底杜绝 cmd /c 注入）
+	if _, err := runFirewallCommand(netshExePath(),
+		"advfirewall", "firewall", "add", "rule",
+		"name="+killSwitchRulePrefix+"Core",
+		"dir=out", "action=allow", "program="+corePath, "enable=yes", "profile=any",
+	); err != nil {
+		cleanupOnFailure(false)
+		if logger != nil {
+			logger.Error("添加核心放行规则失败: %v，已回滚", err)
 		}
+		return fmt.Errorf("添加核心放行规则失败: %w", err)
 	}
 
-	// 放行主程序 SanTian-Singbox.exe
-	if appPath == "" {
-		appPath, _ = os.Executable()
-	}
-	if appPath != "" {
-		cmd := fmt.Sprintf(`netsh advfirewall firewall add rule name="%sApp" dir=out action=allow program="%s" enable=yes profile=any`, killSwitchRulePrefix, appPath)
-		if _, err := runFirewallCommand("cmd", "/c", cmd); err != nil {
-			cleanupOnFailure(false)
-			if logger != nil {
-				logger.Error("添加主程序放行规则失败: %v，已回滚", err)
-			}
-			return fmt.Errorf("添加主程序放行规则失败: %w", err)
+	if _, err := runFirewallCommand(netshExePath(),
+		"advfirewall", "firewall", "add", "rule",
+		"name="+killSwitchRulePrefix+"App",
+		"dir=out", "action=allow", "program="+appPath, "enable=yes", "profile=any",
+	); err != nil {
+		cleanupOnFailure(false)
+		if logger != nil {
+			logger.Error("添加主程序放行规则失败: %v，已回滚", err)
 		}
+		return fmt.Errorf("添加主程序放行规则失败: %w", err)
 	}
 
-	// 放行局域网 & 回环
-	lanCmd := fmt.Sprintf(`netsh advfirewall firewall add rule name="%sLAN" dir=out action=allow remoteip=127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,::1,fe80::/10 enable=yes profile=any`, killSwitchRulePrefix)
-	if _, err := runFirewallCommand("cmd", "/c", lanCmd); err != nil {
+	if _, err := runFirewallCommand(netshExePath(),
+		"advfirewall", "firewall", "add", "rule",
+		"name="+killSwitchRulePrefix+"LAN",
+		"dir=out", "action=allow",
+		"remoteip=127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,::1,fe80::/10",
+		"enable=yes", "profile=any",
+	); err != nil {
 		cleanupOnFailure(false)
 		if logger != nil {
 			logger.Error("添加局域网放行规则失败: %v，已回滚", err)
@@ -226,17 +279,21 @@ func enableKillSwitch(root string, logger *Logger, corePath string, appPath stri
 		return fmt.Errorf("添加局域网放行规则失败: %w", err)
 	}
 
-	// 放行 DHCP (UDP 67/68) - 失败只记 Warn，不中断流程
-	dhcpCmd := fmt.Sprintf(`netsh advfirewall firewall add rule name="%sDHCP" dir=out action=allow protocol=udp localport=68 remoteport=67 enable=yes profile=any`, killSwitchRulePrefix)
-	if _, err := runFirewallCommand("cmd", "/c", dhcpCmd); err != nil {
+	if _, err := runFirewallCommand(netshExePath(),
+		"advfirewall", "firewall", "add", "rule",
+		"name="+killSwitchRulePrefix+"DHCP",
+		"dir=out", "action=allow", "protocol=udp", "localport=68", "remoteport=67",
+		"enable=yes", "profile=any",
+	); err != nil {
 		if logger != nil {
 			logger.Warn("添加 DHCP 放行规则失败（不阻断流程）: %v", err)
 		}
 	}
 
 	// 4. 将防火墙默认出站策略设为阻断 (BlockOutbound)
-	policyCmd := "netsh advfirewall set allprofiles firewallpolicy blockinbound,blockoutbound"
-	if _, err := runFirewallCommand("cmd", "/c", policyCmd); err != nil {
+	if _, err := runFirewallCommand(netshExePath(),
+		"advfirewall", "set", "allprofiles", "firewallpolicy", "blockinbound,blockoutbound",
+	); err != nil {
 		cleanupOnFailure(true)
 		if logger != nil {
 			logger.Error("设置防火墙出站阻断失败: %v，已回滚", err)
@@ -246,7 +303,7 @@ func enableKillSwitch(root string, logger *Logger, corePath string, appPath stri
 
 	killSwitchActive = true
 	if logger != nil {
-		if stateOut, stateErr := runFirewallCommand("cmd", "/c", "netsh advfirewall show allprofiles state"); stateErr == nil && isAnyFirewallProfileOff(stateOut) {
+		if stateOut, stateErr := runFirewallCommand(netshExePath(), "advfirewall", "show", "allprofiles", "state"); stateErr == nil && isAnyFirewallProfileOff(stateOut) {
 			logger.Warn("【防泄露保护警告】检测到 Windows 防火墙存在已关闭的配置档（State OFF），Kill Switch 出站阻断可能不会生效，建议在系统设置中开启 Windows 防火墙！")
 		}
 		logger.Info("【防泄露保护 (Kill Switch)】已激活：除代理核心与局域网外，所有直连出站已被防火墙安全阻断！")
@@ -268,10 +325,18 @@ func disableKillSwitch(root string, logger *Logger) error {
 
 	stateFile := killSwitchStatePath(root)
 	stateExists := fileExists(stateFile)
+
+	// 内存短路：已核验无残留规则、当前未激活且无状态文件时直接返回，避免 10s 健康巡检空跑 netsh 子进程
+	if !stateExists && !killSwitchActive && killSwitchRulesVerifiedClean {
+		return nil
+	}
+
 	rulesExist := hasAnyKillSwitchRule()
 
-	// 只有状态文件存在、或者能检测到 SanTianKillSwitch_* 规则时才执行恢复；否则什么都不做、直接返回
+	// 只有状态文件存在、或者能检测到 SanTianKillSwitch_* 规则时才执行恢复；否则同步清除内存状态并直接返回
 	if !stateExists && !rulesExist {
+		killSwitchActive = false
+		killSwitchRulesVerifiedClean = true
 		return nil
 	}
 
@@ -313,6 +378,7 @@ func disableKillSwitch(root string, logger *Logger) error {
 
 	wasActive := killSwitchActive
 	killSwitchActive = false
+	killSwitchRulesVerifiedClean = true
 	if wasActive && logger != nil {
 		logger.Info("【防泄露保护 (Kill Switch)】已解除，系统网络恢复正常直连。")
 	}
@@ -323,8 +389,7 @@ func removeKillSwitchRules() error {
 	rules := []string{"Core", "App", "LAN", "DHCP", "DNS"}
 	for _, r := range rules {
 		ruleName := killSwitchRulePrefix + r
-		cmd := fmt.Sprintf(`netsh advfirewall firewall delete rule name="%s"`, ruleName)
-		_, _ = runFirewallCommand("cmd", "/c", cmd)
+		_, _ = runFirewallCommand(netshExePath(), "advfirewall", "firewall", "delete", "rule", "name="+ruleName)
 	}
 	return nil
 }

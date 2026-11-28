@@ -11,7 +11,17 @@ import (
 	"testing"
 )
 
+func allowTestLoopbackSubscription(t *testing.T) {
+	t.Helper()
+	prev := allowLocalSubscriptionForTest
+	allowLocalSubscriptionForTest = true
+	t.Cleanup(func() {
+		allowLocalSubscriptionForTest = prev
+	})
+}
+
 func TestFetchSubscriptionRejectsOversizedContent(t *testing.T) {
+	allowTestLoopbackSubscription(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", strconv.Itoa(maxSubscriptionBytes+1))
 		w.WriteHeader(http.StatusOK)
@@ -50,6 +60,7 @@ func TestFetchSubscriptionRetriesTransientProxyFailureBeforeDirect(t *testing.T)
 }
 
 func TestUpdateSubscriptionGroupReplacesOnlyTargetGroup(t *testing.T) {
+	allowTestLoopbackSubscription(t)
 	body := `proxies:
   - name: new-a
     type: trojan
@@ -136,6 +147,7 @@ func TestUpdateSubscriptionGroupRejectsManualGroup(t *testing.T) {
 }
 
 func TestUpdateSubscriptionGroupWithURLSavesNewURL(t *testing.T) {
+	allowTestLoopbackSubscription(t)
 	oldServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`proxies: []`))
 	}))
@@ -179,6 +191,7 @@ func TestUpdateSubscriptionGroupWithURLSavesNewURL(t *testing.T) {
 }
 
 func TestUpdateSubscriptionGroupDoesNotAutoSelectWhenEmpty(t *testing.T) {
+	allowTestLoopbackSubscription(t)
 	body := `proxies:
   - name: new-a
     type: trojan
@@ -217,6 +230,7 @@ func TestUpdateSubscriptionGroupDoesNotAutoSelectWhenEmpty(t *testing.T) {
 }
 
 func TestImportSubscriptionDoesNotAutoSelectFirstNode(t *testing.T) {
+	allowTestLoopbackSubscription(t)
 	body := `proxies:
   - name: first-sub-node
     type: trojan

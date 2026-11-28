@@ -31,17 +31,66 @@ const (
 	subscriptionProxyRetryWait = 300 * time.Millisecond
 )
 
+var allowLocalSubscriptionForTest = false
+
+func isDisallowedSubscriptionIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if allowLocalSubscriptionForTest && ip.IsLoopback() {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified()
+}
+
+func validateSubscriptionURL(rawURL string) (*url.URL, error) {
+	parsed, err := url.ParseRequestURI(strings.TrimSpace(rawURL))
+	if err != nil {
+		return nil, errors.New("订阅链接无效")
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "https" && scheme != "http" {
+		return nil, errors.New("订阅链接仅支持 HTTP/HTTPS 协议")
+	}
+	host := strings.ToLower(strings.TrimSpace(parsed.Hostname()))
+	if host == "" {
+		return nil, errors.New("订阅链接缺少主机地址")
+	}
+	if !allowLocalSubscriptionForTest && (host == "localhost" || strings.HasSuffix(host, ".localhost")) {
+		return nil, errors.New("拒绝访问本机回环订阅地址")
+	}
+	if ip := net.ParseIP(host); ip != nil && isDisallowedSubscriptionIP(ip) {
+		return nil, errors.New("拒绝访问本机或内网私网订阅地址")
+	}
+	return parsed, nil
+}
+
+func sanitizeSubscriptionErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		safeURL := redactSensitiveLogText(urlErr.URL)
+		if u, perr := url.Parse(urlErr.URL); perr == nil && u.Host != "" {
+			safeURL = u.Scheme + "://" + u.Host + u.Path
+		}
+		return fmt.Errorf("%s %s: %w", urlErr.Op, safeURL, urlErr.Err)
+	}
+	return errors.New(redactSensitiveLogText(err.Error()))
+}
+
 func FetchSubscription(ctx context.Context, subURL string, proxyPort int) (SubscriptionResult, error) {
 	subURL = strings.TrimSpace(subURL)
 	if subURL == "" {
 		return SubscriptionResult{}, errors.New("订阅链接不能为空")
 	}
-	if _, err := url.ParseRequestURI(subURL); err != nil {
-		return SubscriptionResult{}, errors.New("订阅链接无效")
+	if _, err := validateSubscriptionURL(subURL); err != nil {
+		return SubscriptionResult{}, err
 	}
 	body, headers, mode, err := fetchSubscriptionWithFallback(ctx, subURL, proxyPort)
 	if err != nil {
-		return SubscriptionResult{}, err
+		return SubscriptionResult{}, sanitizeSubscriptionErr(err)
 	}
 	result := ParseSubscriptionContent(body, subURL, headers)
 	result.Mode = mode
@@ -125,25 +174,63 @@ func parseSubscriptionPayload(content, sourceURL string) ([]Node, []NodeGroup, [
 }
 
 func fetchSubscriptionBody(ctx context.Context, subURL string, proxyPort int) (string, http.Header, string, error) {
+	initialParsed, err := validateSubscriptionURL(subURL)
+	if err != nil {
+		return "", nil, "direct", err
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
 	defer transport.CloseIdleConnections()
-	client := &http.Client{Timeout: 18 * time.Second, Transport: transport}
 	mode := "direct"
 	if proxyPort > 0 {
 		proxyURL, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d", proxyPort))
 		transport.Proxy = http.ProxyURL(proxyURL)
 		mode = "proxy"
+	} else {
+		baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+		transport.DialContext = func(dialCtx context.Context, network, addr string) (net.Conn, error) {
+			host, port, splitErr := net.SplitHostPort(addr)
+			if splitErr != nil {
+				return nil, splitErr
+			}
+			ips, lookupErr := net.DefaultResolver.LookupIPAddr(dialCtx, host)
+			if lookupErr != nil || len(ips) == 0 {
+				return nil, fmt.Errorf("解析订阅主机失败：%w", lookupErr)
+			}
+			for _, ipAddr := range ips {
+				if isDisallowedSubscriptionIP(ipAddr.IP) {
+					return nil, errors.New("拒绝连接解析到本机或内网的订阅地址")
+				}
+			}
+			return baseDialer.DialContext(dialCtx, network, net.JoinHostPort(ips[0].IP.String(), port))
+		}
+	}
+	client := &http.Client{
+		Timeout:   18 * time.Second,
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return errors.New("订阅重定向次数过多")
+			}
+			nextParsed, verr := validateSubscriptionURL(req.URL.String())
+			if verr != nil {
+				return verr
+			}
+			if strings.EqualFold(initialParsed.Scheme, "https") && !strings.EqualFold(nextParsed.Scheme, "https") {
+				return errors.New("拒绝订阅链接从 HTTPS 降级重定向到 HTTP")
+			}
+			return nil
+		},
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, subURL, nil)
 	if err != nil {
-		return "", nil, mode, err
+		return "", nil, mode, sanitizeSubscriptionErr(err)
 	}
 	req.Header.Set("User-Agent", "ClashforWindows/0.20 GoSingBox")
 	req.Header.Set("Accept", "*/*")
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", nil, mode, err
+		return "", nil, mode, sanitizeSubscriptionErr(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -283,7 +370,8 @@ func buildClashSS(proxy map[string]interface{}) string {
 	method := stringFromAny(proxy["cipher"])
 	password := stringFromAny(proxy["password"])
 	main := base64.RawURLEncoding.EncodeToString([]byte(method + ":" + password))
-	return fmt.Sprintf("ss://%s@%s:%d#%s", main, stringFromAny(proxy["server"]), intFromAny(proxy["port"]), url.QueryEscape(stringFromAny(proxy["name"])))
+	hostPort := net.JoinHostPort(stringFromAny(proxy["server"]), strconv.Itoa(intFromAny(proxy["port"])))
+	return fmt.Sprintf("ss://%s@%s#%s", main, hostPort, url.QueryEscape(stringFromAny(proxy["name"])))
 }
 
 func buildClashVMess(proxy map[string]interface{}) (string, error) {
@@ -363,7 +451,8 @@ func buildClashStandardURL(scheme string, proxy map[string]interface{}, user str
 			q.Set("serviceName", serviceName)
 		}
 	}
-	return fmt.Sprintf("%s://%s@%s:%d?%s#%s", scheme, url.PathEscape(user), stringFromAny(proxy["server"]), intFromAny(proxy["port"]), q.Encode(), url.QueryEscape(stringFromAny(proxy["name"])))
+	hostPort := net.JoinHostPort(stringFromAny(proxy["server"]), strconv.Itoa(intFromAny(proxy["port"])))
+	return fmt.Sprintf("%s://%s@%s?%s#%s", scheme, url.PathEscape(user), hostPort, q.Encode(), url.QueryEscape(stringFromAny(proxy["name"])))
 }
 
 func buildClashTUIC(proxy map[string]interface{}) string {
@@ -376,7 +465,8 @@ func buildClashTUIC(proxy map[string]interface{}) string {
 	if isTruthy(proxy["skip-cert-verify"]) {
 		q.Set("allowInsecure", "1")
 	}
-	return fmt.Sprintf("tuic://%s:%s@%s:%d?%s#%s", url.PathEscape(user), url.PathEscape(password), stringFromAny(proxy["server"]), intFromAny(proxy["port"]), q.Encode(), url.QueryEscape(stringFromAny(proxy["name"])))
+	hostPort := net.JoinHostPort(stringFromAny(proxy["server"]), strconv.Itoa(intFromAny(proxy["port"])))
+	return fmt.Sprintf("tuic://%s:%s@%s?%s#%s", url.PathEscape(user), url.PathEscape(password), hostPort, q.Encode(), url.QueryEscape(stringFromAny(proxy["name"])))
 }
 
 func buildClashSOCKS(proxy map[string]interface{}) string {
@@ -390,14 +480,15 @@ func buildClashSOCKS(proxy map[string]interface{}) string {
 		}
 		auth += "@"
 	}
-	return fmt.Sprintf("socks5://%s%s:%d#%s", auth, stringFromAny(proxy["server"]), intFromAny(proxy["port"]), url.QueryEscape(stringFromAny(proxy["name"])))
+	hostPort := net.JoinHostPort(stringFromAny(proxy["server"]), strconv.Itoa(intFromAny(proxy["port"])))
+	return fmt.Sprintf("socks5://%s%s#%s", auth, hostPort, url.QueryEscape(stringFromAny(proxy["name"])))
 }
 
 func parseClashHTTP(proxy map[string]interface{}) (Node, error) {
 	host := stringFromAny(proxy["server"])
 	port := intFromAny(proxy["port"])
-	if host == "" || port == 0 {
-		return Node{}, errors.New("HTTP 节点缺少地址或端口")
+	if host == "" || port < 1 || port > 65535 {
+		return Node{}, errors.New("HTTP 节点缺少有效地址或端口")
 	}
 	outbound := map[string]interface{}{
 		"type":        "http",

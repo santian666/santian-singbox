@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -162,10 +163,10 @@ func normalizeSettings(settings *Settings) {
 		settings.Mode = "rule"
 	}
 	enforceProxyEntryExclusivity(settings)
-	if settings.MixedPort == 0 {
+	if settings.MixedPort < 1 || settings.MixedPort > 65535 {
 		settings.MixedPort = 20808
 	}
-	if settings.ProxyMapStartPort == 0 {
+	if settings.ProxyMapStartPort < 1 || settings.ProxyMapStartPort > 65535 {
 		settings.ProxyMapStartPort = defaultProxyMapPort
 	}
 	settings.ProxyMapGroupIDs = normalizeProxyMapGroupIDs(settings.ProxyMapGroupIDs, settings.ProxyMapGroupID)
@@ -262,13 +263,7 @@ type SingBoxManager struct {
 	proxyMapStartPort      int
 	proxyMapPortCount      int
 	runtimeOutboundTags    map[string]struct{}
-	blockLogCount          int
-	lastBlockLogAt         time.Time
-	recentBlockedTargets   map[string]time.Time
-	remoteLogCount         int
-	lastRemoteLogAt        time.Time
-	localCloseLogCount     int
-	lastLocalCloseLogAt    time.Time
+	clashAPISecret         string
 	missingFakeIPLogCount  int
 	lastMissingFakeIPLogAt time.Time
 	runningDirectDNS       string
@@ -278,7 +273,38 @@ type SingBoxManager struct {
 	cachedTunActive        bool
 	hasCachedConfigMode    bool
 	coreMissingUntil       time.Time
+	coreVersionFailedUntil time.Time
 	onUnexpectedExit       func(error)
+}
+
+func newRandomClashSecret() string {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())))
+		return hex.EncodeToString(sum[:])
+	}
+	return hex.EncodeToString(raw[:])
+}
+
+func (m *SingBoxManager) clashSecret() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.clashAPISecret == "" {
+		m.clashAPISecret = newRandomClashSecret()
+	}
+	return m.clashAPISecret
+}
+
+func (m *SingBoxManager) applyClashAuth(req *http.Request) {
+	if req == nil || m == nil {
+		return
+	}
+	if secret := m.clashSecret(); secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
 }
 
 type TrafficSnapshot struct {
@@ -300,11 +326,12 @@ func NewSingBoxManager(rootDir, corePath, config, cachePath string, logger *Logg
 		}
 	}
 	return &SingBoxManager{
-		rootDir:   rootDir,
-		corePath:  corePath,
-		cachePath: cachePath,
-		config:    config,
-		logger:    logger,
+		rootDir:        rootDir,
+		corePath:       corePath,
+		cachePath:      cachePath,
+		config:         config,
+		logger:         logger,
+		clashAPISecret: newRandomClashSecret(),
 	}
 }
 
@@ -392,12 +419,18 @@ func (m *SingBoxManager) HealthCheck(settings Settings) error {
 }
 
 func (m *SingBoxManager) pingClashAPI() error {
+	req, err := http.NewRequest(http.MethodGet, "http://"+clashAPIAddress+"/configs", nil)
+	if err != nil {
+		return err
+	}
+	m.applyClashAuth(req)
 	client := http.Client{Transport: clashAPIHTTPTransport, Timeout: 2500 * time.Millisecond}
-	resp, err := client.Get("http://" + clashAPIAddress + "/configs")
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("内核控制接口不可用：%w", err)
 	}
-	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	_ = resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("内核控制接口异常：HTTP %d", resp.StatusCode)
 	}
@@ -442,6 +475,7 @@ func (m *SingBoxManager) selectOutbound(tag string, fast bool) error {
 	if err != nil {
 		return err
 	}
+	m.applyClashAuth(req)
 	if !fast {
 		return doClashAPIOnce(req, 1500*time.Millisecond)
 	}
@@ -457,6 +491,7 @@ func (m *SingBoxManager) currentOutbound(fast bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	m.applyClashAuth(req)
 	var data []byte
 	if fast {
 		data, err = doClashAPIBytesOnce(req, 700*time.Millisecond)
@@ -575,6 +610,7 @@ func (m *SingBoxManager) SetMode(mode string) error {
 	if err != nil {
 		return err
 	}
+	m.applyClashAuth(req)
 	applyErr := doClashAPIFast(req)
 	confirmErr := confirmModeSelection(wanted, m.currentMode, 1200*time.Millisecond, 80*time.Millisecond)
 	if confirmErr == nil {
@@ -600,6 +636,7 @@ func (m *SingBoxManager) currentMode() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	m.applyClashAuth(req)
 	data, err := doClashAPIBytesOnce(req, 500*time.Millisecond)
 	if err != nil {
 		return "", err
@@ -650,6 +687,7 @@ func (m *SingBoxManager) CloseConnections() error {
 	if err != nil {
 		return err
 	}
+	m.applyClashAuth(req)
 	return doClashAPIFast(req)
 }
 
@@ -662,6 +700,7 @@ func (m *SingBoxManager) CloseConnection(id string) error {
 	if err != nil {
 		return err
 	}
+	m.applyClashAuth(req)
 	return doClashAPIFast(req)
 }
 
@@ -670,6 +709,7 @@ func (m *SingBoxManager) FetchConnections() (ConnectionsSnapshot, error) {
 	if err != nil {
 		return ConnectionsSnapshot{}, err
 	}
+	m.applyClashAuth(req)
 	data, err := doClashAPIBytesFast(req)
 	if err != nil {
 		return ConnectionsSnapshot{}, err
@@ -748,6 +788,7 @@ func (m *SingBoxManager) StreamTraffic(ctx context.Context, onSample func(Traffi
 	if err != nil {
 		return err
 	}
+	m.applyClashAuth(req)
 	streamTransport := &http.Transport{
 		DisableKeepAlives:     true,
 		ResponseHeaderTimeout: 2 * time.Second,
@@ -893,6 +934,7 @@ func (m *SingBoxManager) FlushDNS() error {
 	if err != nil {
 		return err
 	}
+	m.applyClashAuth(req)
 	return doClashAPIFast(req)
 }
 
@@ -908,18 +950,9 @@ func newClashAPIRequest(method string, url string, payload []byte) (*http.Reques
 	return req, nil
 }
 
-func doClashAPI(req *http.Request) error {
-	_, err := doClashAPIBytes(req)
-	return err
-}
-
 func doClashAPIFast(req *http.Request) error {
 	_, err := doClashAPIBytesWithRetry(req, 1200*time.Millisecond, 500*time.Millisecond, 60*time.Millisecond)
 	return err
-}
-
-func doClashAPIBytes(req *http.Request) ([]byte, error) {
-	return doClashAPIBytesWithRetry(req, 3*time.Second, 1500*time.Millisecond, 150*time.Millisecond)
 }
 
 func doClashAPIBytesFast(req *http.Request) ([]byte, error) {
@@ -954,12 +987,15 @@ func doClashAPIBytesOnce(req *http.Request, timeout time.Duration) ([]byte, erro
 		return nil, err
 	}
 	defer resp.Body.Close()
-	limit := int64(1 << 20)
+	limit := int64(8 << 20)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		limit = 512
 	}
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, limit))
+	data, readErr := io.ReadAll(io.LimitReader(resp.Body, limit))
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if readErr != nil {
+			return nil, readErr
+		}
 		return data, nil
 	}
 	message := strings.TrimSpace(string(data))
@@ -988,8 +1024,11 @@ func doClashAPIBytesWithRetry(req *http.Request, totalTimeout time.Duration, req
 		resp, err := client.Do(tryReq)
 		if err == nil {
 			if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-				data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+				data, readErr := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 				_ = resp.Body.Close()
+				if readErr != nil {
+					return nil, readErr
+				}
 				return data, nil
 			}
 			data, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
@@ -1041,31 +1080,55 @@ func isRetryableNetworkError(err error) bool {
 
 func (m *SingBoxManager) CoreVersion() string {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.coreVer != "" {
-		return m.coreVer
+		ver := m.coreVer
+		m.mu.Unlock()
+		return ver
 	}
-	if !m.coreMissingUntil.IsZero() && time.Now().Before(m.coreMissingUntil) {
+	now := time.Now()
+	if !m.coreMissingUntil.IsZero() && now.Before(m.coreMissingUntil) {
+		m.mu.Unlock()
+		return "未安装"
+	}
+	if !m.coreVersionFailedUntil.IsZero() && now.Before(m.coreVersionFailedUntil) {
+		m.mu.Unlock()
+		return "未知"
+	}
+	corePath := m.corePath
+	rootDir := m.rootDir
+	m.mu.Unlock()
+
+	if _, err := os.Stat(corePath); err != nil {
+		m.mu.Lock()
+		m.coreMissingUntil = time.Now().Add(5 * time.Second)
+		m.mu.Unlock()
 		return "未安装"
 	}
 
-	if _, err := os.Stat(m.corePath); err != nil {
-		m.coreMissingUntil = time.Now().Add(5 * time.Second)
-		return "未安装"
-	}
-	m.coreMissingUntil = time.Time{}
 	ctx, cancel := context.WithTimeout(context.Background(), coreVersionTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, m.corePath, "version")
-	cmd.Dir = m.rootDir
+	cmd := exec.CommandContext(ctx, corePath, "version")
+	cmd.Dir = rootDir
 	hideCommandWindow(cmd)
 	out, err := cmd.Output()
-	version := "未知"
 	if err != nil {
-		return version
+		m.mu.Lock()
+		m.coreMissingUntil = time.Time{}
+		m.coreVersionFailedUntil = time.Now().Add(10 * time.Second)
+		m.mu.Unlock()
+		return "未知"
 	}
-	version = strings.TrimSpace(strings.Split(string(out), "\n")[0])
-	m.coreVer = version
+	version := strings.TrimSpace(strings.Split(string(out), "\n")[0])
+	m.mu.Lock()
+	m.coreMissingUntil = time.Time{}
+	m.coreVersionFailedUntil = time.Time{}
+	if version != "" {
+		m.coreVer = version
+	}
+	m.mu.Unlock()
+	if version == "" {
+		return "未知"
+	}
 	return version
 }
 
@@ -1078,7 +1141,16 @@ func (m *SingBoxManager) CoreUpdateStatus() (latest string, available bool) {
 	m.mu.Lock()
 	latest = m.latestCoreVer
 	checkedAt := m.latestCoreCheckedAt
-	shouldCheck := !m.latestCoreChecking && (latest == "" || time.Since(checkedAt) >= time.Hour)
+	shouldCheck := false
+	if !m.latestCoreChecking {
+		if checkedAt.IsZero() {
+			shouldCheck = true
+		} else if latest == "" {
+			shouldCheck = time.Since(checkedAt) >= 15*time.Minute
+		} else {
+			shouldCheck = time.Since(checkedAt) >= time.Hour
+		}
+	}
 	if shouldCheck {
 		m.latestCoreChecking = true
 	}
@@ -1087,7 +1159,8 @@ func (m *SingBoxManager) CoreUpdateStatus() (latest string, available bool) {
 	if shouldCheck {
 		go m.refreshCoreUpdateStatus()
 	}
-	return latest, normalizeCoreVersionTag(latest) != current
+	latestTag := normalizeCoreVersionTag(latest)
+	return latest, latestTag != "" && latestTag != current
 }
 
 func (m *SingBoxManager) refreshCoreUpdateStatus() {
@@ -1349,17 +1422,24 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(m.config), 0755); err != nil {
+	if exp, ok := config["experimental"].(map[string]interface{}); ok {
+		if clashAPI, ok := exp["clash_api"].(map[string]interface{}); ok {
+			if secret := m.clashSecret(); secret != "" {
+				clashAPI["secret"] = secret
+			}
+		}
+	}
+	if err := os.MkdirAll(filepath.Dir(m.config), 0700); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(m.cachePath), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(m.cachePath), 0700); err != nil {
 		return err
 	}
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(m.config, data, 0644); err != nil {
+	if err := os.WriteFile(m.config, data, 0600); err != nil {
 		return err
 	}
 	externalProxyCount := 0
@@ -1863,12 +1943,27 @@ func (m *SingBoxManager) tryAutoRepairOutboundConfig(initialErr error, selected 
 				}
 			}
 		}
+		if routeMap, ok := cfg["route"].(map[string]interface{}); ok {
+			if rules, ok := routeMap["rules"].([]interface{}); ok {
+				filtered := make([]interface{}, 0, len(rules))
+				for _, r := range rules {
+					if rMap, ok := r.(map[string]interface{}); ok && stringFromAny(rMap["outbound"]) == badTag {
+						continue
+					}
+					filtered = append(filtered, r)
+				}
+				routeMap["rules"] = filtered
+			}
+		}
+		if m.runtimeOutboundTags != nil {
+			delete(m.runtimeOutboundTags, badTag)
+		}
 
 		newData, err := json.MarshalIndent(cfg, "", "  ")
 		if err != nil {
 			break
 		}
-		if err := atomicWriteFile(m.config, newData, 0644); err != nil {
+		if err := atomicWriteFile(m.config, newData, 0600); err != nil {
 			break
 		}
 
@@ -1887,13 +1982,22 @@ func (m *SingBoxManager) tryAutoRepairOutboundConfig(initialErr error, selected 
 }
 
 func (m *SingBoxManager) pipeLog(cancel <-chan struct{}, reader io.Reader) {
-	scanner := bufio.NewScanner(reader)
-	for scanner.Scan() {
-		select {
-		case <-cancel:
+	bufReader := bufio.NewReaderSize(reader, 64*1024)
+	for {
+		line, err := bufReader.ReadString('\n')
+		if len(line) > 0 {
+			if len(line) > 16*1024 {
+				line = line[:16*1024] + "...(truncated)"
+			}
+			select {
+			case <-cancel:
+				return
+			default:
+				m.logSingboxLine(line)
+			}
+		}
+		if err != nil {
 			return
-		default:
-			m.logSingboxLine(scanner.Text())
 		}
 	}
 }
@@ -1984,74 +2088,11 @@ func extractBlockTarget(text string) string {
 	return ""
 }
 
-func (m *SingBoxManager) shouldLogBlockTarget(target string) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.recentBlockedTargets == nil {
-		m.recentBlockedTargets = make(map[string]time.Time)
-	}
-	now := time.Now()
-	if len(m.recentBlockedTargets) > 100 {
-		for k, t := range m.recentBlockedTargets {
-			if now.Sub(t) > time.Minute {
-				delete(m.recentBlockedTargets, k)
-			}
-		}
-	}
-	if last, ok := m.recentBlockedTargets[target]; ok && now.Sub(last) < 3*time.Second {
-		return false
-	}
-	m.recentBlockedTargets[target] = now
-	return true
-}
-
 func isSingboxRemoteNodeOpenConnectionError(text string) bool {
 	lower := strings.ToLower(text)
 	return strings.Contains(lower, "connection download closed: remote: open connection to ") &&
 		strings.Contains(lower, " using outbound/") &&
 		(strings.Contains(lower, "lookup ") || strings.Contains(lower, "dial tcp ") || strings.Contains(lower, "i/o timeout"))
-}
-
-func (m *SingBoxManager) shouldLogBlockSummary() (int, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	now := time.Now()
-	m.blockLogCount++
-	if m.lastBlockLogAt.IsZero() || now.Sub(m.lastBlockLogAt) >= 30*time.Second {
-		count := m.blockLogCount
-		m.blockLogCount = 0
-		m.lastBlockLogAt = now
-		return count, true
-	}
-	return 0, false
-}
-
-func (m *SingBoxManager) shouldLogRemoteNodeSummary() (int, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	now := time.Now()
-	m.remoteLogCount++
-	if m.lastRemoteLogAt.IsZero() || now.Sub(m.lastRemoteLogAt) >= 30*time.Second {
-		count := m.remoteLogCount
-		m.remoteLogCount = 0
-		m.lastRemoteLogAt = now
-		return count, true
-	}
-	return 0, false
-}
-
-func (m *SingBoxManager) shouldLogLocalClientCloseSummary() (int, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	now := time.Now()
-	m.localCloseLogCount++
-	if m.lastLocalCloseLogAt.IsZero() || now.Sub(m.lastLocalCloseLogAt) >= 30*time.Second {
-		count := m.localCloseLogCount
-		m.localCloseLogCount = 0
-		m.lastLocalCloseLogAt = now
-		return count, true
-	}
-	return 0, false
 }
 
 func (m *SingBoxManager) shouldLogMissingFakeIPSummary() (int, bool) {
@@ -2265,8 +2306,9 @@ func buildSingBoxConfig(state PersistState, selected Node, cachePath string, inc
 		"experimental": map[string]interface{}{
 			"cache_file": cacheFileConfig,
 			"clash_api": map[string]interface{}{
-				"external_controller": clashAPIAddress,
-				"default_mode":        clashMode(settings.Mode),
+				"external_controller":        clashAPIAddress,
+				"default_mode":               clashMode(settings.Mode),
+				"access_control_allow_origin": []string{},
 			},
 		},
 	}
@@ -2300,14 +2342,6 @@ func configModeSummary(state PersistState) ConfigMode {
 		}
 	}
 	return summary
-}
-
-func (m *SingBoxManager) RuntimeConfigMode(fallbackMode string) (ConfigMode, error) {
-	config, err := m.readRuntimeConfig()
-	if err != nil {
-		return ConfigMode{}, err
-	}
-	return configModeFromConfig(config, fallbackMode), nil
 }
 
 func (m *SingBoxManager) ValidateRuntimeSettings(settings Settings) error {
@@ -2607,15 +2641,17 @@ func (m *SingBoxManager) fetchTrafficTotal() (TrafficSnapshot, error) {
 	if err != nil {
 		return TrafficSnapshot{}, err
 	}
+	m.applyClashAuth(req)
 	resp, err := client.Do(req)
 	if err != nil {
 		return TrafficSnapshot{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		return TrafficSnapshot{}, fmt.Errorf("读取流量失败：HTTP %d", resp.StatusCode)
 	}
-	decoder := json.NewDecoder(resp.Body)
+	decoder := json.NewDecoder(io.LimitReader(resp.Body, 8<<20))
 	var total TrafficSnapshot
 	if err := readTrafficTotals(decoder, &total); err != nil {
 		return TrafficSnapshot{}, err
@@ -2782,17 +2818,6 @@ func (m *SingBoxManager) ensureRuleSets(settings Settings) error {
 	return fmt.Errorf("本地规则缓存缺失：%s，请先点击“更新规则”", strings.Join(missing, "、"))
 }
 
-func (m *SingBoxManager) UpdateRuleSets(settings Settings) (int, error) {
-	targetVersion, err := m.ruleUpdateTargetVersion(settings)
-	if err != nil {
-		return 0, err
-	}
-	if m.localRuleSetsCurrent(settings, targetVersion) {
-		return 0, m.writeRuleSetVersion(settings, targetVersion)
-	}
-	return m.updateRuleSets(settings, targetVersion)
-}
-
 func (m *SingBoxManager) UpdateRuleSetsIfNeeded(settings Settings) (RuleUpdateResult, error) {
 	normalizeSettings(&settings)
 	targetVersion, err := m.ruleUpdateTargetVersion(settings)
@@ -2820,46 +2845,6 @@ func (m *SingBoxManager) UpdateRuleSetsIfNeeded(settings Settings) (RuleUpdateRe
 		return RuleUpdateResult{Count: count, Version: targetVersion}, err
 	}
 	return RuleUpdateResult{Count: count, Latest: count == 0, Version: targetVersion}, nil
-}
-
-func (m *SingBoxManager) RuleSetBackups(settings Settings) ([]ruleSetBackup, error) {
-	normalizeSettings(&settings)
-	defs := rulePresetDefs[settings.RuleSource]
-	backups := make([]ruleSetBackup, 0, len(defs))
-	for _, def := range defs {
-		target := ruleSetLocalPath(m.cachePath, def.FileName)
-		item := ruleSetBackup{path: target}
-		data, err := os.ReadFile(target)
-		if err == nil {
-			item.exists = true
-			item.data = append([]byte(nil), data...)
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return nil, err
-		}
-		backups = append(backups, item)
-	}
-	return backups, nil
-}
-
-func (m *SingBoxManager) RestoreRuleSetBackups(backups []ruleSetBackup) error {
-	for _, item := range backups {
-		if strings.TrimSpace(item.path) == "" {
-			continue
-		}
-		if item.exists {
-			if err := os.MkdirAll(filepath.Dir(item.path), 0755); err != nil {
-				return err
-			}
-			if err := atomicWriteFile(item.path, item.data, 0644); err != nil {
-				return err
-			}
-			continue
-		}
-		if err := os.Remove(item.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-	return nil
 }
 
 func (m *SingBoxManager) updateRuleSets(settings Settings, version string) (int, error) {
@@ -3156,11 +3141,11 @@ func ruleSetVersionPath(cachePath string, source string) string {
 
 func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		_ = os.Chmod(dir, 0777)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
 	}
 	if fi, err := os.Stat(path); err == nil && fi.Mode()&0200 == 0 {
-		_ = os.Chmod(path, 0666)
+		_ = os.Chmod(path, 0600)
 	}
 	tmp, err := os.CreateTemp(dir, filepath.Base(path)+"-tmp-*")
 	if err == nil {
@@ -3184,7 +3169,7 @@ func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
 			_ = tmp.Close()
 		}
 	}
-	_ = os.Chmod(path, 0666)
+	_ = os.Chmod(path, 0600)
 	return os.WriteFile(path, data, perm)
 }
 
@@ -3942,13 +3927,6 @@ func normalizeAutoDNSPlan(plan autoDNSPlan) autoDNSPlan {
 	return plan
 }
 
-func probeBestRemoteDNS(candidates []dnsProbeCandidate) (dnsProbeCandidate, int64, bool) {
-	if len(candidates) == 0 {
-		return dnsProbeCandidate{}, 0, false
-	}
-	return candidates[0], 0, true
-}
-
 func buildDNSConfig(settings Settings, final string, dnsPlan autoDNSPlan, includeRemoteRuleSets bool, nodes []Node) map[string]interface{} {
 	return buildDNSConfigForSelected(settings, final, dnsPlan, includeRemoteRuleSets, nodes, Node{})
 }
@@ -4482,23 +4460,6 @@ func terminateProcess(cmd *exec.Cmd) error {
 	return cmd.Process.Signal(syscall.SIGTERM)
 }
 
-func findAvailableMixedPort(preferred int) (int, error) {
-	if preferred < 1024 || preferred > 65535 {
-		preferred = 20808
-	}
-	for port := preferred; port <= 65535; port++ {
-		if isTCPPortFree("127.0.0.1", port) {
-			return port, nil
-		}
-	}
-	for port := 1024; port < preferred; port++ {
-		if isTCPPortFree("127.0.0.1", port) {
-			return port, nil
-		}
-	}
-	return 0, errors.New("未找到可用本地代理端口，请关闭占用端口的程序后重试")
-}
-
 func isTCPPortFree(host string, port int) bool {
 	listener, err := net.Listen("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
@@ -4601,10 +4562,36 @@ func verifyLocalProxyConnectivityURLs(port int, timeout time.Duration, probeURLs
 	return fmt.Errorf("代理无法访问验证地址：%s", strings.Join(failures, "；"))
 }
 
+func deepCloneValue(value interface{}) interface{} {
+	switch v := value.(type) {
+	case map[string]interface{}:
+		return cloneMap(v)
+	case []interface{}:
+		out := make([]interface{}, len(v))
+		for i, item := range v {
+			out[i] = deepCloneValue(item)
+		}
+		return out
+	case []string:
+		return append([]string(nil), v...)
+	case []map[string]interface{}:
+		out := make([]map[string]interface{}, len(v))
+		for i, item := range v {
+			out[i] = cloneMap(item)
+		}
+		return out
+	default:
+		return value
+	}
+}
+
 func cloneMap(src map[string]interface{}) map[string]interface{} {
+	if src == nil {
+		return map[string]interface{}{}
+	}
 	dst := make(map[string]interface{}, len(src))
 	for key, value := range src {
-		dst[key] = value
+		dst[key] = deepCloneValue(value)
 	}
 	return dst
 }
@@ -5115,6 +5102,9 @@ func httpGetBytesFromOptions(options []coreDownloadOption, timeout time.Duration
 }
 
 func openHTTPDownload(rawURL, proxyURL string, timeout time.Duration) (*http.Response, func(), error) {
+	if err := validateUpdateDownloadURL(rawURL); err != nil {
+		return nil, nil, err
+	}
 	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, nil, err
@@ -5122,7 +5112,11 @@ func openHTTPDownload(rawURL, proxyURL string, timeout time.Duration) (*http.Res
 	req.Header.Set("User-Agent", "GoSingBox")
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
-	client := &http.Client{Timeout: timeout, Transport: transport}
+	client := &http.Client{
+		Timeout:       timeout,
+		Transport:     transport,
+		CheckRedirect: trustedUpdateRedirectCheck,
+	}
 	if strings.TrimSpace(proxyURL) != "" {
 		proxyParsed, err := url.Parse(proxyURL)
 		if err != nil {
@@ -5144,6 +5138,10 @@ type extractedCoreResult struct {
 	companionFiles []string
 }
 
+var allowedCoreCompanionDLLs = map[string]bool{
+	"libcronet.dll": true,
+}
+
 func extractCore(zipPath, dstDir string) (extractedCoreResult, error) {
 	reader, err := zip.OpenReader(zipPath)
 	if err != nil {
@@ -5153,12 +5151,15 @@ func extractCore(zipPath, dstDir string) (extractedCoreResult, error) {
 
 	var result extractedCoreResult
 	for _, file := range reader.File {
+		if file.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
 		if file.FileInfo().IsDir() {
 			continue
 		}
 		base := filepath.Base(file.Name)
 		isCore := base == exeName("sing-box")
-		isDll := strings.HasSuffix(strings.ToLower(base), ".dll")
+		isDll := allowedCoreCompanionDLLs[strings.ToLower(base)]
 		if !isCore && !isDll {
 			continue
 		}

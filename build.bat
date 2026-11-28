@@ -51,7 +51,6 @@ del /q "build\bin\data\gui\cache.db" >nul 2>nul
 del /q "build\bin\logs\*.log" >nul 2>nul
 del /q "build\bin\logs\app.log" >nul 2>nul
 del /q "build\bin\logs\gui\*.log" >nul 2>nul
-del /q "build\bin\logs\web\*.log" >nul 2>nul
 del /q "build\bin\start.bat" >nul 2>nul
 
 set "OUT=dist\SanTian-Singbox"

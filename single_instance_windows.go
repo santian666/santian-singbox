@@ -1,6 +1,7 @@
 package main
 
 import (
+	"runtime"
 	"sync"
 
 	"golang.org/x/sys/windows"
@@ -21,7 +22,10 @@ func acquireSingleInstanceLock() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	handle, err := windows.CreateMutex(nil, true, name)
+	sa, sd := restrictedLocalIPCSecurityAttributes()
+	handle, err := windows.CreateMutex(sa, true, name)
+	runtime.KeepAlive(sd)
+	runtime.KeepAlive(sa)
 	if err == windows.ERROR_ALREADY_EXISTS {
 		if handle != 0 {
 			_ = windows.CloseHandle(handle)

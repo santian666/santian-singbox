@@ -12,7 +12,17 @@ import (
 	"time"
 )
 
+func allowTestDownloadURLs(t *testing.T) {
+	t.Helper()
+	prev := validateUpdateDownloadURL
+	validateUpdateDownloadURL = func(string) error { return nil }
+	t.Cleanup(func() {
+		validateUpdateDownloadURL = prev
+	})
+}
+
 func TestHTTPGetBytesRejectsOversizedBody(t *testing.T) {
+	allowTestDownloadURLs(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(strings.Repeat("x", 33)))
 	}))
@@ -33,6 +43,7 @@ func TestCoreCandidateTimeoutAllowsWindowsSecurityScan(t *testing.T) {
 }
 
 func TestDownloadCoreAssetRetriesTransientLocalProxyFailure(t *testing.T) {
+	allowTestDownloadURLs(t)
 	var attempts atomic.Int32
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		if attempts.Add(1) == 1 {
@@ -60,6 +71,7 @@ func TestDownloadCoreAssetRetriesTransientLocalProxyFailure(t *testing.T) {
 }
 
 func TestHTTPGetBytesFromOptionsUsesLocalProxy(t *testing.T) {
+	allowTestDownloadURLs(t)
 	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("rule-data"))
 	}))

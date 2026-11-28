@@ -5,10 +5,29 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 )
+
+var (
+	logRedactBearerRE   = regexp.MustCompile(`(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;"]+`)
+	logRedactQueryKeyRE = regexp.MustCompile(`(?i)([?&](?:token|key|secret|password|pass|pwd|auth|uuid|sig|signature)=)[^&\s"']+`)
+	logRedactKVSecretRE = regexp.MustCompile(`(?i)("?(?:password|private_key|secret|auth_str)"?\s*[:=]\s*"?)[^",\s}]+`)
+	logRedactUserinfoRE = regexp.MustCompile(`(?i)((?:trojan|vless|vmess|ss|hysteria2|hy2|tuic|socks5?|https?|anytls|wireguard|naive(?:\+(?:https|quic))?)://)([^/\s@]+)@`)
+)
+
+func redactSensitiveLogText(text string) string {
+	if text == "" {
+		return text
+	}
+	text = logRedactBearerRE.ReplaceAllString(text, `${1}[REDACTED]`)
+	text = logRedactQueryKeyRE.ReplaceAllString(text, `${1}[REDACTED]`)
+	text = logRedactKVSecretRE.ReplaceAllString(text, `${1}[REDACTED]`)
+	text = logRedactUserinfoRE.ReplaceAllString(text, `${1}[REDACTED]@`)
+	return text
+}
 
 const (
 	logBufferLimit = 800
@@ -31,10 +50,10 @@ type Logger struct {
 }
 
 func NewLogger(path string) *Logger {
-	_ = os.MkdirAll(filepath.Dir(path), 0755)
+	_ = os.MkdirAll(filepath.Dir(path), 0700)
 	logger := &Logger{path: path, transient: isTempLogPath(path)}
 	if !logger.transient {
-		file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 		if err != nil {
 			return logger
 		}
@@ -90,7 +109,7 @@ func (l *Logger) RecentLogs(limit int) []LogMessage {
 }
 
 func (l *Logger) add(level, format string, args ...interface{}) {
-	text := stripANSI(fmt.Sprintf(format, args...))
+	text := redactSensitiveLogText(stripANSI(fmt.Sprintf(format, args...)))
 	now := time.Now()
 	msg := LogMessage{
 		Time:  now.Format("15:04:05"),
@@ -125,7 +144,7 @@ func (l *Logger) writeFileLocked(now time.Time, level, text string) {
 		l.rotateFileLocked()
 	}
 	if l.writer == nil {
-		file, err := os.OpenFile(l.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		file, err := os.OpenFile(l.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 		if err != nil {
 			return
 		}

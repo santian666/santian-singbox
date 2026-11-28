@@ -1,10 +1,14 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,6 +16,21 @@ import (
 )
 
 const defaultGroupID = "default"
+
+var safeEntityIDRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+func isSafeEntityID(id string) bool {
+	return safeEntityIDRE.MatchString(id)
+}
+
+func sanitizeEntityID(prefix, raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if isSafeEntityID(trimmed) {
+		return trimmed
+	}
+	sum := sha256.Sum256([]byte(prefix + "|" + raw))
+	return prefix + "-" + hex.EncodeToString(sum[:8])
+}
 
 func normalizeGroupID(id string) string {
 	id = strings.TrimSpace(id)
@@ -578,7 +597,7 @@ func (s *Store) FlushTraffic() error {
 
 func (s *Store) saveLocked() error {
 	dir := filepath.Dir(s.path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return err
 	}
 	data, err := json.Marshal(s.state)
@@ -589,7 +608,7 @@ func (s *Store) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	if err := writeFileAtomic(s.path, encrypted, 0644); err != nil {
+	if err := writeFileAtomic(s.path, encrypted, 0600); err != nil {
 		return err
 	}
 	if err := s.saveSelectionLocked(); err != nil {
@@ -600,6 +619,7 @@ func (s *Store) saveLocked() error {
 }
 
 func (s *Store) saveSelectionLocked() error {
+	atomic.AddUint64(&s.selectionSeq, 1)
 	s.selectionWriteMu.Lock()
 	defer s.selectionWriteMu.Unlock()
 	return writeSelectionFile(s.selectionPath, s.state.SelectedID)
@@ -610,18 +630,18 @@ func writeSelectionFile(path string, selectedID string) error {
 	if err != nil {
 		return err
 	}
-	return writeFileAtomic(path, encrypted, 0644)
+	return writeFileAtomic(path, encrypted, 0600)
 }
 
 func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		_ = os.Chmod(dir, 0777)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return err
 	}
 
-	// 1. 若目标文件已存在，先清除可能的只读属性，防止因只读报错 Access is denied
+	// 1. 若目标文件已存在且只读，恢复当前用户可写权限（避免 0666/0777 过宽权限）
 	if fi, err := os.Stat(path); err == nil && fi.Mode()&0200 == 0 {
-		_ = os.Chmod(path, 0666)
+		_ = os.Chmod(path, 0600)
 	}
 
 	// 2. 优先尝试无 "." 前缀的临时文件原子写入（避免被杀毒软件/360防勒索拦截）
@@ -651,10 +671,9 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	}
 
 	// 3. 降级方案：若创建临时文件被系统/杀毒软件拦截（Access is denied）或重命名失败，直接覆写目标文件
-	_ = os.Chmod(path, 0666)
+	_ = os.Chmod(path, 0600)
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
 	if err != nil {
-		_ = os.Chmod(path, 0666)
 		return os.WriteFile(path, data, perm)
 	}
 	defer f.Close()
@@ -668,7 +687,7 @@ func replaceFileWithRetry(src, dst string, retries int) error {
 	var lastErr error
 	for i := 0; i < retries; i++ {
 		if fi, err := os.Stat(dst); err == nil && fi.Mode()&0200 == 0 {
-			_ = os.Chmod(dst, 0666)
+			_ = os.Chmod(dst, 0600)
 		}
 		if err := os.Rename(src, dst); err == nil {
 			return nil
@@ -680,16 +699,18 @@ func replaceFileWithRetry(src, dst string, retries int) error {
 	return lastErr
 }
 
-
 func cloneState(state PersistState) PersistState {
 	nodes := make([]Node, len(state.Nodes))
-	copy(nodes, state.Nodes)
+	for i, node := range state.Nodes {
+		node.Outbound = cloneMap(node.Outbound)
+		nodes[i] = node
+	}
 	groups := make([]NodeGroup, len(state.Groups))
 	copy(groups, state.Groups)
-	appProxyTargets := make([]AppProxyTarget, len(state.Settings.AppProxyTargets))
-	copy(appProxyTargets, state.Settings.AppProxyTargets)
 	settings := state.Settings
-	settings.AppProxyTargets = appProxyTargets
+	settings.AppProxyTargets = append([]AppProxyTarget(nil), state.Settings.AppProxyTargets...)
+	settings.ProxyMapGroupIDs = append([]string(nil), state.Settings.ProxyMapGroupIDs...)
+	settings.ExternalProxyEndpoints = append([]ExternalProxyEndpoint(nil), state.Settings.ExternalProxyEndpoints...)
 	return PersistState{
 		Nodes:      nodes,
 		Groups:     groups,
@@ -704,11 +725,18 @@ func (s *Store) normalizeLocked() {
 	}
 	groups := make([]NodeGroup, 0, len(s.state.Groups)+1)
 	groupIDs := map[string]bool{}
+	groupIDRemap := map[string]string{}
 	hasDefault := false
 	for _, group := range s.state.Groups {
-		if group.ID == "" {
+		rawID := strings.TrimSpace(group.ID)
+		if rawID == "" {
 			continue
 		}
+		safeID := sanitizeEntityID("grp", rawID)
+		if rawID != safeID {
+			groupIDRemap[rawID] = safeID
+		}
+		group.ID = safeID
 		if group.Name == "" {
 			group.Name = "未命名组"
 		}
@@ -733,11 +761,17 @@ func (s *Store) normalizeLocked() {
 	s.state.Groups = groups
 	proxyMapGroupIDs := make([]string, 0, len(s.state.Settings.ProxyMapGroupIDs))
 	for _, groupID := range s.state.Settings.ProxyMapGroupIDs {
+		if mapped, ok := groupIDRemap[groupID]; ok {
+			groupID = mapped
+		}
 		if groupIDs[groupID] {
 			proxyMapGroupIDs = append(proxyMapGroupIDs, groupID)
 		}
 	}
 	s.state.Settings.ProxyMapGroupIDs = proxyMapGroupIDs
+	if mapped, ok := groupIDRemap[s.state.Settings.ProxyMapGroupID]; ok {
+		s.state.Settings.ProxyMapGroupID = mapped
+	}
 	if len(proxyMapGroupIDs) > 0 {
 		s.state.Settings.ProxyMapGroupID = proxyMapGroupIDs[0]
 	} else if s.state.Settings.ProxyMapGroupID != "" && !groupIDs[s.state.Settings.ProxyMapGroupID] {
@@ -745,7 +779,23 @@ func (s *Store) normalizeLocked() {
 	}
 
 	selectedExists := false
+	nodeIDSeen := map[string]bool{}
 	for i := range s.state.Nodes {
+		rawNodeID := s.state.Nodes[i].ID
+		safeNodeID := sanitizeEntityID("node", rawNodeID)
+		if nodeIDSeen[safeNodeID] {
+			safeNodeID = sanitizeEntityID("node", fmt.Sprintf("%s#%d", rawNodeID, i))
+		}
+		nodeIDSeen[safeNodeID] = true
+		if rawNodeID != safeNodeID {
+			if s.state.SelectedID == rawNodeID {
+				s.state.SelectedID = safeNodeID
+			}
+			s.state.Nodes[i].ID = safeNodeID
+		}
+		if mapped, ok := groupIDRemap[s.state.Nodes[i].GroupID]; ok {
+			s.state.Nodes[i].GroupID = mapped
+		}
 		if s.state.Nodes[i].GroupID == "" || !groupIDs[s.state.Nodes[i].GroupID] {
 			s.state.Nodes[i].GroupID = defaultGroupID
 		}

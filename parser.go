@@ -106,6 +106,9 @@ func parseJSONOutbound(raw string) (Node, error) {
 		return Node{}, errors.New("JSON 节点缺少 type 或 server")
 	}
 	port := intFromAny(outbound["server_port"])
+	if port < 1 || port > 65535 {
+		return Node{}, errors.New("JSON 节点端口无效 (1-65535)")
+	}
 	name, _ := outbound["tag"].(string)
 	if name == "" {
 		name = fmt.Sprintf("%s-%s:%d", typ, server, port)
@@ -128,7 +131,7 @@ func parseShadowsocks(raw string) (Node, error) {
 		}
 	}
 	if user == "" {
-		decoded, err := decodeBase64URL(strings.TrimPrefix(raw, "ss://"))
+		decoded, err := decodeBase64URL(stripSchemePrefixFold(raw, "ss://"))
 		if err == nil {
 			hash := strings.Index(decoded, "#")
 			if hash >= 0 {
@@ -169,7 +172,7 @@ func parseShadowsocks(raw string) (Node, error) {
 }
 
 func parseVMess(raw string) (Node, error) {
-	body := strings.TrimPrefix(raw, "vmess://")
+	body := stripSchemePrefixFold(raw, "vmess://")
 	decoded, err := decodeBase64URL(body)
 	if err != nil {
 		return Node{}, err
@@ -181,8 +184,8 @@ func parseVMess(raw string) (Node, error) {
 	host := stringFromAny(data["add"])
 	port, _ := strconv.Atoi(stringFromAny(data["port"]))
 	uuid := stringFromAny(data["id"])
-	if host == "" || port == 0 || uuid == "" {
-		return Node{}, errors.New("VMess 节点缺少地址、端口或 UUID")
+	if host == "" || port < 1 || port > 65535 || uuid == "" {
+		return Node{}, errors.New("VMess 节点缺少有效地址、端口或 UUID")
 	}
 	name := stringFromAny(data["ps"])
 	if name == "" {
@@ -271,7 +274,9 @@ func parseTrojan(raw string) (Node, error) {
 }
 
 func parseHysteria2(raw string) (Node, error) {
-	raw = strings.Replace(raw, "hy2://", "hysteria2://", 1)
+	if strings.HasPrefix(strings.ToLower(raw), "hy2://") {
+		raw = "hysteria2://" + raw[len("hy2://"):]
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return Node{}, err
@@ -517,9 +522,14 @@ func parseWireGuard(raw string) (Node, error) {
 }
 
 func parseNaive(raw string) (Node, error) {
-	quicScheme := strings.HasPrefix(strings.ToLower(strings.TrimSpace(raw)), "naive+quic://")
-	normalized := strings.Replace(raw, "naive+https://", "naive://", 1)
-	normalized = strings.Replace(normalized, "naive+quic://", "naive://", 1)
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	quicScheme := strings.HasPrefix(lower, "naive+quic://")
+	normalized := raw
+	if strings.HasPrefix(lower, "naive+https://") {
+		normalized = "naive://" + strings.TrimSpace(raw)[len("naive+https://"):]
+	} else if quicScheme {
+		normalized = "naive://" + strings.TrimSpace(raw)[len("naive+quic://"):]
+	}
 	u, err := url.Parse(normalized)
 	if err != nil {
 		return Node{}, err
@@ -1004,9 +1014,18 @@ func intFromAny(value interface{}) int {
 	}
 }
 
-func trimForLog(value string) string {
-	if len(value) <= 48 {
-		return value
+func stripSchemePrefixFold(raw, prefix string) string {
+	if len(raw) >= len(prefix) && strings.EqualFold(raw[:len(prefix)], prefix) {
+		return raw[len(prefix):]
 	}
-	return value[:48] + "..."
+	return raw
+}
+
+func trimForLog(value string) string {
+	safe := redactSensitiveLogText(value)
+	runes := []rune(safe)
+	if len(runes) <= 48 {
+		return safe
+	}
+	return string(runes[:48]) + "..."
 }

@@ -42,7 +42,7 @@ func TestCircuitBreakerPreventsDisablingTunOnFailure(t *testing.T) {
 		logger: NewLogger(filepath.Join(t.TempDir(), "test.log")),
 	}
 
-	app.disableTunAfterStartFailure(settings, errors.New("simulated tun timeout"))
+	app.recordTunStartFailureNoFallback(settings, errors.New("simulated tun timeout"))
 
 	// TUN must NOT be turned off (which would expose traffic to physical NIC), and active circuit breaker must stay disabled
 	currentSettings := store.Snapshot().Settings
@@ -77,7 +77,7 @@ func TestCircuitBreakerDisabledDisablesTunOnFailure(t *testing.T) {
 		logger: NewLogger(filepath.Join(t.TempDir(), "test.log")),
 	}
 
-	app.disableTunAfterStartFailure(settings, errors.New("simulated tun timeout"))
+	app.recordTunStartFailureNoFallback(settings, errors.New("simulated tun timeout"))
 
 	// Even when CircuitBreaker is false, TUN must NOT auto-disable to direct (prevents real IP leak)
 	currentSettings := store.Snapshot().Settings

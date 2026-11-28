@@ -9,11 +9,21 @@ import (
 	"errors"
 	"io"
 	"os"
+	"runtime"
+	"strings"
 )
 
-const encryptedPrefix = "GSB1:"
+const (
+	encryptedPrefix      = "GSB1:"
+	dpapiEncryptedPrefix = "GSB2:"
+)
 
-func encryptBytes(data []byte) ([]byte, error) {
+func encryptBytes(plain []byte) ([]byte, error) {
+	if runtime.GOOS == "windows" {
+		if sealed, err := dpapiProtect(plain); err == nil {
+			return []byte(dpapiEncryptedPrefix + base64.StdEncoding.EncodeToString(sealed)), nil
+		}
+	}
 	block, err := aes.NewCipher(localKey())
 	if err != nil {
 		return nil, err
@@ -26,13 +36,20 @@ func encryptBytes(data []byte) ([]byte, error) {
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return nil, err
 	}
-	sealed := gcm.Seal(nonce, nonce, data, nil)
+	sealed := gcm.Seal(nonce, nonce, plain, nil)
 	return []byte(encryptedPrefix + base64.StdEncoding.EncodeToString(sealed)), nil
 }
 
 func decryptBytes(data []byte) ([]byte, error) {
 	text := string(data)
-	if len(text) < len(encryptedPrefix) || text[:len(encryptedPrefix)] != encryptedPrefix {
+	if strings.HasPrefix(text, dpapiEncryptedPrefix) {
+		raw, err := base64.StdEncoding.DecodeString(text[len(dpapiEncryptedPrefix):])
+		if err != nil {
+			return nil, err
+		}
+		return dpapiUnprotect(raw)
+	}
+	if !strings.HasPrefix(text, encryptedPrefix) {
 		return data, nil
 	}
 	raw, err := base64.StdEncoding.DecodeString(text[len(encryptedPrefix):])

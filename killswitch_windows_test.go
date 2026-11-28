@@ -15,6 +15,7 @@ import (
 func resetFirewallMocks() {
 	killSwitchMu.Lock()
 	killSwitchActive = false
+	killSwitchRulesVerifiedClean = false
 	killSwitchMu.Unlock()
 	runFirewallCommand = func(name string, args ...string) (string, error) {
 		return runCommandOutput(name, args...)

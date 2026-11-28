@@ -102,14 +102,6 @@ func DisableSystemProxy() error {
 	return nil
 }
 
-func systemProxyEnabled() (bool, error) {
-	if runtime.GOOS != "windows" {
-		return false, nil
-	}
-	settings, err := readSystemProxySettings()
-	return settings.enabled, err
-}
-
 func systemProxyEnabledForPort(port int) (bool, error) {
 	if runtime.GOOS != "windows" {
 		return false, nil
@@ -121,10 +113,33 @@ func systemProxyEnabledForPort(port int) (bool, error) {
 	if !settings.enabled {
 		return false, nil
 	}
-	server := strings.ToLower(settings.server)
+	return proxyServerMatchesLocalPort(settings.server, port), nil
+}
+
+func proxyServerMatchesLocalPort(server string, port int) bool {
+	if port <= 0 || port > 65535 {
+		return false
+	}
 	target := "127.0.0.1:" + strconv.Itoa(port)
 	localTarget := "localhost:" + strconv.Itoa(port)
-	return strings.Contains(server, target) || strings.Contains(server, localTarget), nil
+	for _, entry := range strings.Split(strings.ToLower(strings.TrimSpace(server)), ";") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if _, rhs, ok := strings.Cut(entry, "="); ok {
+			entry = strings.TrimSpace(rhs)
+		}
+		entry = strings.TrimPrefix(entry, "http://")
+		entry = strings.TrimPrefix(entry, "https://")
+		entry = strings.TrimPrefix(entry, "socks://")
+		entry = strings.TrimPrefix(entry, "socks5://")
+		entry = strings.TrimRight(entry, "/")
+		if entry == target || entry == localTarget {
+			return true
+		}
+	}
+	return false
 }
 
 type systemProxySettings struct {
@@ -169,17 +184,6 @@ func readSystemProxySettings() (systemProxySettings, error) {
 		bypass:        bypass,
 		autoConfigURL: autoConfigURL,
 	}, nil
-}
-
-func systemProxyConfiguredForPort(port int) (bool, error) {
-	if runtime.GOOS != "windows" {
-		return false, nil
-	}
-	issue, err := systemProxyConfigurationIssueForPort(port)
-	if err != nil {
-		return false, err
-	}
-	return issue == "", nil
 }
 
 func systemProxyConfigurationIssueForPort(port int) (string, error) {
@@ -279,27 +283,6 @@ func systemProxyBypass() string {
 	return strings.Join(items, ";")
 }
 
-func NotifyProxyChange() error {
-	if runtime.GOOS != "windows" {
-		return nil
-	}
-	wininet := syscall.NewLazyDLL("wininet.dll")
-	internetSetOption := wininet.NewProc("InternetSetOptionW")
-	if err := wininet.Load(); err != nil {
-		return errors.New("系统代理变更通知失败")
-	}
-	const (
-		internetOptionSettingsChanged = 39
-		internetOptionRefresh         = 37
-	)
-	changed, _, _ := internetSetOption.Call(0, uintptr(internetOptionSettingsChanged), 0, 0)
-	refreshed, _, _ := internetSetOption.Call(0, uintptr(internetOptionRefresh), 0, 0)
-	if changed == 0 || refreshed == 0 {
-		return errors.New("系统代理变更通知失败")
-	}
-	return nil
-}
-
 func setWinINetProxy(server string, bypass string) error {
 	return setWinINetConnectionProxy(proxyTypeDirect|proxyTypeProxy, server, bypass)
 }
@@ -335,12 +318,23 @@ type internetPerConnOptionList struct {
 	options     uintptr
 }
 
+var (
+	proxyWininetDLL         = windows.NewLazySystemDLL("wininet.dll")
+	procInternetSetOptionW  = proxyWininetDLL.NewProc("InternetSetOptionW")
+	procInternetQueryOptW   = proxyWininetDLL.NewProc("InternetQueryOptionW")
+	proxyKernel32DLL        = windows.NewLazySystemDLL("kernel32.dll")
+	procGlobalFree          = proxyKernel32DLL.NewProc("GlobalFree")
+	proxyRasapi32DLL        = windows.NewLazySystemDLL("rasapi32.dll")
+	procRasEnumEntriesW     = proxyRasapi32DLL.NewProc("RasEnumEntriesW")
+	proxyUser32DLL          = windows.NewLazySystemDLL("user32.dll")
+	procSendNotifyMessageW  = proxyUser32DLL.NewProc("SendNotifyMessageW")
+)
+
 func setWinINetConnectionProxy(flags uint32, server string, bypass string) error {
-	wininet := syscall.NewLazyDLL("wininet.dll")
-	internetSetOption := wininet.NewProc("InternetSetOptionW")
-	if err := wininet.Load(); err != nil {
+	if err := proxyWininetDLL.Load(); err != nil {
 		return errors.New("系统代理变更通知失败")
 	}
+	internetSetOption := procInternetSetOptionW
 	options := []internetPerConnOption{{option: internetPerConnFlags, value: uintptr(flags)}}
 	serverPtr, err := syscall.UTF16PtrFromString(server)
 	if err != nil {
@@ -449,11 +443,10 @@ func setRASWinINetConnectionProxy(flags uint32, server string, bypass string) er
 	if len(connections) == 0 {
 		return nil
 	}
-	wininet := syscall.NewLazyDLL("wininet.dll")
-	internetSetOption := wininet.NewProc("InternetSetOptionW")
-	if err := wininet.Load(); err != nil {
+	if err := proxyWininetDLL.Load(); err != nil {
 		return errors.New("加载 WinINet 失败")
 	}
+	internetSetOption := procInternetSetOptionW
 	var firstErr error
 	for _, connection := range connections {
 		connectionPtr, err := syscall.UTF16PtrFromString(connection)
@@ -476,7 +469,7 @@ func setRASWinINetConnectionProxy(flags uint32, server string, bypass string) er
 	return refreshErr
 }
 
-func setWinINetConnectionProxyForName(internetSetOption *syscall.LazyProc, connection uintptr, flags uint32, server string, bypass string) error {
+func setWinINetConnectionProxyForName(internetSetOption *windows.LazyProc, connection uintptr, flags uint32, server string, bypass string) error {
 	options := []internetPerConnOption{{option: internetPerConnFlags, value: uintptr(flags)}}
 	serverPtr, err := syscall.UTF16PtrFromString(server)
 	if err != nil {
@@ -503,11 +496,10 @@ func setWinINetConnectionProxyForName(internetSetOption *syscall.LazyProc, conne
 }
 
 func readWinINetConnectionProxy() (winINetProxySettings, error) {
-	wininet := syscall.NewLazyDLL("wininet.dll")
-	internetQueryOption := wininet.NewProc("InternetQueryOptionW")
-	if err := wininet.Load(); err != nil {
+	if err := proxyWininetDLL.Load(); err != nil {
 		return winINetProxySettings{}, errors.New("加载 WinINet 失败")
 	}
+	internetQueryOption := procInternetQueryOptW
 	options := []internetPerConnOption{
 		{option: internetPerConnFlags},
 		{option: internetPerConnProxyServer},
@@ -568,9 +560,7 @@ func freeWinINetString(option *internetPerConnOption) {
 	if value == nil {
 		return
 	}
-	kernel32 := syscall.NewLazyDLL("kernel32.dll")
-	globalFree := kernel32.NewProc("GlobalFree")
-	_, _, _ = globalFree.Call(uintptr(value))
+	_, _, _ = procGlobalFree.Call(uintptr(value))
 	option.value = 0
 }
 
@@ -582,11 +572,10 @@ type rasEntryName struct {
 }
 
 func rasConnectionNames() ([]string, error) {
-	rasapi := syscall.NewLazyDLL("rasapi32.dll")
-	rasEnumEntries := rasapi.NewProc("RasEnumEntriesW")
-	if err := rasapi.Load(); err != nil {
+	if err := proxyRasapi32DLL.Load(); err != nil {
 		return nil, errors.New("加载 RAS 连接接口失败")
 	}
+	rasEnumEntries := procRasEnumEntriesW
 	entrySize := uint32(unsafe.Sizeof(rasEntryName{}))
 	entries := make([]rasEntryName, 1)
 	entries[0].size = entrySize
@@ -639,7 +628,7 @@ func rasConnectionNames() ([]string, error) {
 	return names, nil
 }
 
-func setWinINetOptionsForConnection(internetSetOption *syscall.LazyProc, connection uintptr, options []internetPerConnOption) error {
+func setWinINetOptionsForConnection(internetSetOption *windows.LazyProc, connection uintptr, options []internetPerConnOption) error {
 	list := internetPerConnOptionList{
 		size:        uint32(unsafe.Sizeof(internetPerConnOptionList{})),
 		connection:  connection,
@@ -654,7 +643,7 @@ func setWinINetOptionsForConnection(internetSetOption *syscall.LazyProc, connect
 	return nil
 }
 
-func refreshWinINetProxy(internetSetOption *syscall.LazyProc) error {
+func refreshWinINetProxy(internetSetOption *windows.LazyProc) error {
 	changed, _, _ := internetSetOption.Call(0, uintptr(internetOptionSettingsChanged), 0, 0)
 	refreshed, _, _ := internetSetOption.Call(0, uintptr(internetOptionRefresh), 0, 0)
 	if changed == 0 || refreshed == 0 {
@@ -665,9 +654,7 @@ func refreshWinINetProxy(internetSetOption *syscall.LazyProc) error {
 }
 
 func broadcastSystemProxyChange() {
-	user32 := syscall.NewLazyDLL("user32.dll")
-	sendNotifyMessage := user32.NewProc("SendNotifyMessageW")
-	if err := user32.Load(); err != nil {
+	if err := proxyUser32DLL.Load(); err != nil {
 		return
 	}
 	setting, err := syscall.UTF16PtrFromString(`Software\Microsoft\Windows\CurrentVersion\Internet Settings`)
@@ -678,7 +665,7 @@ func broadcastSystemProxyChange() {
 		hwndBroadcast   = 0xffff
 		wmSettingChange = 0x001a
 	)
-	_, _, _ = sendNotifyMessage.Call(
+	_, _, _ = procSendNotifyMessageW.Call(
 		hwndBroadcast,
 		wmSettingChange,
 		0,

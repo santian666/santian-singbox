@@ -59,6 +59,7 @@ func getCachedPhysicalInterface() (uint32, net.IP) {
 		globalPhysicalIfCache.updatedAt = time.Now()
 		return ifIndex, localIP
 	}
+	globalPhysicalIfCache.info = physicalInterfaceInfo{}
 	globalPhysicalIfCache.updatedAt = time.Now()
 	return 0, nil
 }
@@ -201,8 +202,28 @@ func newDirectPhysicalDialerForTarget(targetIP net.IP, timeout time.Duration) *n
 		return dialer
 	}
 	ifIndex, localIP := getCachedPhysicalInterface()
-	if localIP != nil {
+	if localIP != nil && (targetIP == nil || (targetIP.To4() != nil) == (localIP.To4() != nil)) {
 		dialer.LocalAddr = &net.TCPAddr{
+			IP: localIP,
+		}
+	}
+	if ifIndex > 0 {
+		dialer.Control = func(network, address string, c syscall.RawConn) error {
+			return c.Control(func(fd uintptr) {
+				bindSocketToInterface(fd, ifIndex)
+			})
+		}
+	}
+	return dialer
+}
+
+func newDirectPhysicalUDPDialer(timeout time.Duration) *net.Dialer {
+	dialer := &net.Dialer{
+		Timeout: timeout,
+	}
+	ifIndex, localIP := getCachedPhysicalInterface()
+	if localIP != nil {
+		dialer.LocalAddr = &net.UDPAddr{
 			IP: localIP,
 		}
 	}
@@ -225,12 +246,14 @@ func bindSocketToInterface(fd uintptr, ifIndex uint32) {
 	if ifIndex == 0 {
 		return
 	}
-	var idx [4]byte
-	binary.BigEndian.PutUint32(idx[:], ifIndex)
-	// IPPROTO_IP = 0, IP_UNICAST_IF = 31 (RFC/Winsock ws2ipdef.h)
-	_ = windows.Setsockopt(windows.Handle(fd), windows.IPPROTO_IP, 31, &idx[0], 4)
-	// IPPROTO_IPV6 = 41, IPV6_UNICAST_IF = 31
-	_ = windows.Setsockopt(windows.Handle(fd), 41, 31, &idx[0], 4)
+	// IP_UNICAST_IF (IPv4) requires network byte order (big-endian) on Winsock
+	var idxBE [4]byte
+	binary.BigEndian.PutUint32(idxBE[:], ifIndex)
+	_ = windows.Setsockopt(windows.Handle(fd), windows.IPPROTO_IP, 31, &idxBE[0], 4)
+	// IPV6_UNICAST_IF (IPv6) requires host byte order (little-endian) on Winsock
+	var idxLE [4]byte
+	binary.LittleEndian.PutUint32(idxLE[:], ifIndex)
+	_ = windows.Setsockopt(windows.Handle(fd), 41, 31, &idxLE[0], 4)
 }
 
 var directPublicDNSServers = []string{
@@ -257,23 +280,26 @@ func resolveViaDoH(ctx context.Context, host string) (string, error) {
 		"https://dns.alidns.com/resolve?name=" + url.QueryEscape(host) + "&type=1",
 		"https://doh.pub/resolve?name=" + url.QueryEscape(host) + "&type=1",
 	}
-	client := &http.Client{
-		Timeout: 1500 * time.Millisecond,
-		Transport: &http.Transport{
-			Proxy: nil,
-			DialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
-				hostPart, portPart, err := net.SplitHostPort(addr)
-				if err == nil {
-					if hostPart == "dns.alidns.com" {
-						addr = net.JoinHostPort("223.5.5.5", portPart)
-					} else if hostPart == "doh.pub" {
-						addr = net.JoinHostPort("1.12.12.12", portPart)
-					}
+	transport := &http.Transport{
+		Proxy:             nil,
+		DisableKeepAlives: true,
+		DialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
+			hostPart, portPart, err := net.SplitHostPort(addr)
+			if err == nil {
+				if hostPart == "dns.alidns.com" {
+					addr = net.JoinHostPort("223.5.5.5", portPart)
+				} else if hostPart == "doh.pub" {
+					addr = net.JoinHostPort("1.12.12.12", portPart)
 				}
-				dialer := newDirectPhysicalDialer(1500 * time.Millisecond)
-				return dialer.DialContext(dialCtx, network, addr)
-			},
+			}
+			dialer := newDirectPhysicalDialer(1500 * time.Millisecond)
+			return dialer.DialContext(dialCtx, network, addr)
 		},
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{
+		Timeout:   1500 * time.Millisecond,
+		Transport: transport,
 	}
 	type res struct {
 		ip  string
@@ -296,7 +322,7 @@ func resolveViaDoH(ctx context.Context, host string) (string, error) {
 				ch <- res{err: err}
 				return
 			}
-			body, err := io.ReadAll(resp.Body)
+			body, err := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
 			_ = resp.Body.Close()
 			if err != nil || resp.StatusCode != http.StatusOK {
 				ch <- res{err: errors.New("DoH 请求异常")}
@@ -375,7 +401,7 @@ func resolveDirectPhysicalIP(ctx context.Context, host string) (string, error) {
 }
 
 func resolveViaPhysicalDNS(ctx context.Context, host string) (string, error) {
-	dialer := newDirectPhysicalDialer(2 * time.Second)
+	dialer := newDirectPhysicalUDPDialer(2 * time.Second)
 	for _, dnsAddr := range directPublicDNSServers {
 		dnsCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		r := &net.Resolver{

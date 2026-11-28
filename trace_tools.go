@@ -16,14 +16,16 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
+	"golang.org/x/sys/windows"
 )
 
 var (
-	ansiEscapePattern = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
+	ansiEscapePattern         = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
+	dnsapiDLL                 = windows.NewLazySystemDLL("dnsapi.dll")
+	dnsFlushResolverCacheProc = dnsapiDLL.NewProc("DnsFlushResolverCache")
 )
 
 func (a *App) ToolStatus() (result map[string]ToolStatus) {
@@ -105,18 +107,17 @@ func (a *App) flushDnsTool() NetworkToolResult {
 	successCount := 0
 
 	// 1. Win32 API 原生刷新 DNS 解析器缓存
-	if dnsapi := syscall.NewLazyDLL("dnsapi.dll"); dnsapi != nil {
-		if proc := dnsapi.NewProc("DnsFlushResolverCache"); proc != nil {
-			r1, _, _ := proc.Call()
-			if r1 != 0 {
-				steps = append(steps, "✔ Windows 系统 DNS 解析缓存已通过 Win32 API 立即清空 (DnsFlushResolverCache)")
-				successCount++
-			}
+	if err := dnsapiDLL.Load(); err == nil {
+		r1, _, _ := dnsFlushResolverCacheProc.Call()
+		if r1 != 0 {
+			steps = append(steps, "✔ Windows 系统 DNS 解析缓存已通过 Win32 API 立即清空 (DnsFlushResolverCache)")
+			successCount++
 		}
 	}
 
 	// 2. PowerShell Clear-DnsClientCache
-	psOut, psErr := runCommandOutput("powershell", "-NoProfile", "-Command", "Clear-DnsClientCache")
+	psExe := systemBinaryPath(`WindowsPowerShell\v1.0\powershell.exe`)
+	psOut, psErr := runCommandOutput(psExe, "-NoProfile", "-Command", "Clear-DnsClientCache")
 	if psErr == nil {
 		steps = append(steps, "✔ Windows DNS 客户端缓存已清空 (Clear-DnsClientCache)")
 		successCount++
@@ -137,23 +138,14 @@ func (a *App) flushDnsTool() NetworkToolResult {
 	// 4. sing-box 内核 DNS 缓存与连接池清理
 	kernelCleared := false
 	if a.manager != nil && a.manager.Running() {
-		// 4a. Clash API POST /dns/flush
-		client := http.Client{Timeout: 1200 * time.Millisecond}
-		req, _ := http.NewRequest(http.MethodPost, "http://"+clashAPIAddress+"/dns/flush", nil)
-		if resp, err := client.Do(req); err == nil {
-			resp.Body.Close()
-			if resp.StatusCode < 400 {
-				kernelCleared = true
-			}
+		if err := a.manager.FlushDNS(); err == nil {
+			kernelCleared = true
 		}
-		// 4b. Clash API DELETE /connections (释放所有旧连接，迫使应用重新解析域名并建连)
-		reqDel, _ := http.NewRequest(http.MethodDelete, "http://"+clashAPIAddress+"/connections", nil)
-		if resp, err := client.Do(reqDel); err == nil {
-			resp.Body.Close()
+		if err := a.manager.CloseConnections(); err == nil {
 			steps = append(steps, "✔ sing-box 内核活动连接池已释放 (迫使应用重新解析域名并建连)")
 			kernelCleared = true
 		}
-		// 4c. 清理 FakeIP 残留 TCP 僵尸连接
+		// 清理 FakeIP 残留 TCP 僵尸连接
 		closeStaleFakeIPTCPConnections(a.logger)
 		steps = append(steps, "✔ 历史 FakeIP 僵尸 TCP 连接已清理")
 	}
@@ -184,7 +176,7 @@ func (a *App) clearProxySettings() NetworkToolResult {
 		steps = append(steps, "✔ 已成功关闭 Windows 系统代理并通知 WinINet/浏览器生效")
 	}
 	if hasAdminPrivileges() {
-		out, err := runCommandOutput("cmd", "/d", "/c", "chcp 65001>nul & netsh winhttp reset proxy")
+		out, err := runCommandOutput(netshExePath(), "winhttp", "reset", "proxy")
 		if err == nil {
 			steps = append(steps, "✔ WinHTTP 系统底层代理已重置 (直连)")
 		} else {
@@ -193,11 +185,16 @@ func (a *App) clearProxySettings() NetworkToolResult {
 	} else {
 		steps = append(steps, "ℹ 当前为普通权限，已跳过 WinHTTP 服务重置（如需重置 WinHTTP 请以管理员身份运行）")
 	}
-	if a.store != nil {
+	if a.store != nil && a.lockProxyOperation(2*time.Second) {
 		state := a.store.Snapshot()
+		changed := false
 		if state.Settings.SystemProxy {
 			state.Settings.SystemProxy = false
 			_ = a.store.UpdateSettings(state.Settings)
+			changed = true
+		}
+		a.proxyOpMu.Unlock()
+		if changed {
 			a.emitState()
 			steps = append(steps, "✔ 客户端界面系统代理开关已同步关闭")
 		}
@@ -210,23 +207,19 @@ func (a *App) clearProxySettings() NetworkToolResult {
 	}
 }
 
-func (a *App) repairProxyResidual() NetworkToolResult {
-	var steps []string
-	a.disableAllKillSwitches()
-	if err := DisableSystemProxy(); err != nil {
-		steps = append(steps, fmt.Sprintf("⚠ 清理系统代理失败：%v", err))
-	} else {
-		steps = append(steps, "✔ 系统代理设置已关闭并通知系统生效")
+func clearProxyEnvironmentVariables(includeNoProxy bool) {
+	names := "'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy'"
+	if includeNoProxy {
+		names += ",'NO_PROXY','no_proxy'"
 	}
-	// 清理代理环境变量
-	envScript := `
+	envScript := fmt.Sprintf(`
 $envKey = 'HKCU:\Environment'
-foreach ($name in 'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy') {
+foreach ($name in %s) {
   Remove-ItemProperty -Path $envKey -Name $name -ErrorAction SilentlyContinue
 }
 if ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent().IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
   $sysKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
-  foreach ($name in 'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy') {
+  foreach ($name in %s) {
     Remove-ItemProperty -Path $sysKey -Name $name -ErrorAction SilentlyContinue
   }
 }
@@ -237,8 +230,19 @@ public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wP
 "@ -ErrorAction SilentlyContinue
   [Win32.NativeMethods]::SendMessageTimeout([IntPtr]0xffff, 0x001A, [UIntPtr]::Zero, "Environment", 2, 2000, [ref][UIntPtr]::Zero) | Out-Null
 } catch {}
-`
-	_, _ = runCommandOutput("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", envScript)
+`, names, names)
+	_, _ = runCommandOutput(systemBinaryPath(`WindowsPowerShell\v1.0\powershell.exe`), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", envScript)
+}
+
+func (a *App) repairProxyResidual() NetworkToolResult {
+	var steps []string
+	a.disableAllKillSwitches()
+	if err := DisableSystemProxy(); err != nil {
+		steps = append(steps, fmt.Sprintf("⚠ 清理系统代理失败：%v", err))
+	} else {
+		steps = append(steps, "✔ 系统代理设置已关闭并通知系统生效")
+	}
+	clearProxyEnvironmentVariables(false)
 	steps = append(steps, "✔ 用户的 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 环境变量已清理")
 	if hasAdminPrivileges() {
 		steps = append(steps, "✔ 系统级 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 环境变量已同步清理")
@@ -246,11 +250,11 @@ public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wP
 	steps = append(steps, "✔ 已广播 WM_SETTINGCHANGE 刷新系统全局环境变量")
 
 	// 清理 DNS
-	_, _ = runCommandOutput("cmd", "/d", "/c", "chcp 65001>nul & ipconfig /flushdns")
+	flushWindowsDNSCache(a.logger)
 	steps = append(steps, "✔ 系统 DNS 解析缓存已清理")
 
 	if hasAdminPrivileges() {
-		out, err := runCommandOutput("cmd", "/d", "/c", "chcp 65001>nul & netsh winhttp reset proxy")
+		out, err := runCommandOutput(netshExePath(), "winhttp", "reset", "proxy")
 		if err == nil {
 			steps = append(steps, "✔ WinHTTP 代理已重置")
 		} else {
@@ -258,11 +262,16 @@ public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wP
 		}
 	}
 
-	if a.store != nil {
+	if a.store != nil && a.lockProxyOperation(2*time.Second) {
 		state := a.store.Snapshot()
+		changed := false
 		if state.Settings.SystemProxy {
 			state.Settings.SystemProxy = false
 			_ = a.store.UpdateSettings(state.Settings)
+			changed = true
+		}
+		a.proxyOpMu.Unlock()
+		if changed {
 			a.emitState()
 		}
 	}
@@ -405,7 +414,7 @@ func (a *App) syncTimeTool() NetworkToolResult {
 
 	if netTime.IsZero() {
 		httpServers := []string{
-			"http://api.m.taobao.com/rest/api3.do?api=mtop.common.getTimestamp",
+			"https://api.m.taobao.com/rest/api3.do?api=mtop.common.getTimestamp",
 			"https://www.qualcomm.com",
 			"https://www.cloudflare.com",
 		}
@@ -413,7 +422,7 @@ func (a *App) syncTimeTool() NetworkToolResult {
 			t, err := queryHttpDate(url, 2*time.Second)
 			if err == nil {
 				netTime = t
-				timeSource = "HTTP Date (" + url + ")"
+				timeSource = "HTTPS Date (" + url + ")"
 				break
 			}
 		}
@@ -422,7 +431,7 @@ func (a *App) syncTimeTool() NetworkToolResult {
 	if netTime.IsZero() {
 		return NetworkToolResult{
 			Name:    "系统时间 NTP 校验与对时",
-			Command: "UDP 123 (NTP) & HTTP Date 校验",
+			Command: "UDP 123 (NTP) & HTTPS Date 校验",
 			Output:  fmt.Sprintf("未能从公共网络时间服务器获取到时间基准：%v\n请检查电脑当前直连网络连接。", queryErr),
 			Success: false,
 		}
@@ -435,7 +444,8 @@ func (a *App) syncTimeTool() NetworkToolResult {
 
 	resynced := false
 	if hasAdminPrivileges() {
-		cmdOut, cmdErr := runCommandOutput("cmd", "/d", "/c", "chcp 65001>nul & net start w32time & w32tm /resync /force")
+		_, _ = runCommandOutput(systemBinaryPath("net.exe"), "start", "w32time")
+		cmdOut, cmdErr := runCommandOutput(systemBinaryPath("w32tm.exe"), "/resync", "/force")
 		if cmdErr == nil {
 			steps = append(steps, "✔ 已通过 Windows 时间服务强制重新对时 (w32tm /resync /force)")
 			resynced = true
@@ -498,17 +508,21 @@ func queryNtpTime(server string, timeout time.Duration) (time.Time, error) {
 }
 
 func queryHttpDate(urlStr string, timeout time.Duration) (time.Time, error) {
+	transport := &http.Transport{
+		Proxy:             nil,
+		DisableKeepAlives: true,
+	}
+	defer transport.CloseIdleConnections()
 	client := http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			Proxy: nil,
-		},
+		Timeout:   timeout,
+		Transport: transport,
 	}
 	resp, err := client.Head(urlStr)
 	if err != nil {
 		return time.Time{}, err
 	}
-	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	_ = resp.Body.Close()
 	dateStr := resp.Header.Get("Date")
 	if dateStr == "" {
 		return time.Time{}, errors.New("无 Date 头部")
@@ -625,26 +639,7 @@ func (a *App) clearTerminalGitProxy() NetworkToolResult {
 	steps = append(steps, "✔ Git 全局配置 http.proxy 与 https.proxy 已清除 (git config --global --unset)")
 
 	// 2. PowerShell 清理环境变量
-	envScript := `
-$envKey = 'HKCU:\Environment'
-foreach ($name in 'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy','NO_PROXY','no_proxy') {
-  Remove-ItemProperty -Path $envKey -Name $name -ErrorAction SilentlyContinue
-}
-if ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent().IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-  $sysKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
-  foreach ($name in 'HTTP_PROXY','HTTPS_PROXY','ALL_PROXY','http_proxy','https_proxy','all_proxy','NO_PROXY','no_proxy') {
-    Remove-ItemProperty -Path $sysKey -Name $name -ErrorAction SilentlyContinue
-  }
-}
-try {
-  Add-Type -Namespace Win32 -Name NativeMethods -MemberDefinition @"
-[DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);
-"@ -ErrorAction SilentlyContinue
-  [Win32.NativeMethods]::SendMessageTimeout([IntPtr]0xffff, 0x001A, [UIntPtr]::Zero, "Environment", 2, 2000, [ref][UIntPtr]::Zero) | Out-Null
-} catch {}
-`
-	_, _ = runCommandOutput("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", envScript)
+	clearProxyEnvironmentVariables(true)
 	steps = append(steps, "✔ 用户环境变量 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY 已清理")
 	if hasAdminPrivileges() {
 		steps = append(steps, "✔ 系统全局环境变量已同步清理")
@@ -664,17 +659,14 @@ public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wP
 func (a *App) fixFirewallRule() NetworkToolResult {
 	singboxPath := a.toolPath("sing-box")
 	var steps []string
+	netsh := netshExePath()
 
-	// Delete old rules
-	_, _ = runCommandOutput("cmd", "/d", "/c", `netsh advfirewall firewall delete rule name="SanTian SingBox" >nul 2>&1`)
-	_, _ = runCommandOutput("cmd", "/d", "/c", `netsh advfirewall firewall delete rule name="SanTian GUI" >nul 2>&1`)
+	// 直接通过参数切片调用 System32\netsh.exe，杜绝 cmd /c 注入
+	_, _ = runCommandOutput(netsh, "advfirewall", "firewall", "delete", "rule", "name=SanTian SingBox")
+	_, _ = runCommandOutput(netsh, "advfirewall", "firewall", "delete", "rule", "name=SanTian GUI")
 
-	// Inbound & Outbound for sing-box.exe
-	inCmd := fmt.Sprintf(`netsh advfirewall firewall add rule name="SanTian SingBox" dir=in action=allow program="%s" enable=yes profile=any`, singboxPath)
-	outCmd := fmt.Sprintf(`netsh advfirewall firewall add rule name="SanTian SingBox" dir=out action=allow program="%s" enable=yes profile=any`, singboxPath)
-
-	inOut, inErr := runCommandOutput("cmd", "/d", "/c", "chcp 65001>nul & "+inCmd)
-	outOut, outErr := runCommandOutput("cmd", "/d", "/c", "chcp 65001>nul & "+outCmd)
+	inOut, inErr := runCommandOutput(netsh, "advfirewall", "firewall", "add", "rule", "name=SanTian SingBox", "dir=in", "action=allow", "program="+singboxPath, "enable=yes", "profile=any")
+	outOut, outErr := runCommandOutput(netsh, "advfirewall", "firewall", "add", "rule", "name=SanTian SingBox", "dir=out", "action=allow", "program="+singboxPath, "enable=yes", "profile=any")
 
 	if inErr == nil && outErr == nil {
 		steps = append(steps, "✔ 已成功为 sing-box 内核建立入站允许防火墙规则 (SanTian SingBox)")
@@ -683,10 +675,8 @@ func (a *App) fixFirewallRule() NetworkToolResult {
 		steps = append(steps, fmt.Sprintf("⚠ 防火墙规则创建提示：%s %s", strings.TrimSpace(stripANSI(inOut)), strings.TrimSpace(stripANSI(outOut))))
 	}
 
-	// Inbound for current GUI process if executable exists
-	if exePath, err := os.Executable(); err == nil {
-		guiCmd := fmt.Sprintf(`netsh advfirewall firewall add rule name="SanTian GUI" dir=in action=allow program="%s" enable=yes profile=any`, exePath)
-		_, _ = runCommandOutput("cmd", "/d", "/c", "chcp 65001>nul & "+guiCmd)
+	if exePath, err := os.Executable(); err == nil && strings.TrimSpace(exePath) != "" {
+		_, _ = runCommandOutput(netsh, "advfirewall", "firewall", "add", "rule", "name=SanTian GUI", "dir=in", "action=allow", "program="+exePath, "enable=yes", "profile=any")
 		steps = append(steps, "✔ 已成功为主客户端界面程序添加防火墙入站允许规则 (SanTian GUI)")
 	}
 
@@ -695,7 +685,7 @@ func (a *App) fixFirewallRule() NetworkToolResult {
 
 	return NetworkToolResult{
 		Name:    "Windows 防火墙放行修复",
-		Command: inCmd + " & " + outCmd,
+		Command: "netsh advfirewall firewall add rule (SanTian SingBox / SanTian GUI)",
 		Output:  strings.Join(steps, "\n"),
 		Success: inErr == nil && outErr == nil,
 	}
@@ -749,38 +739,6 @@ if ($enabled.Count -gt 0) {
 
 func (a *App) runNetworkToolCommand(name string, command string, successText string) NetworkToolResult {
 	output, err := runCommandOutput("cmd", "/d", "/c", "chcp 65001>nul & "+command)
-	output = strings.TrimSpace(stripANSI(output))
-	result := NetworkToolResult{
-		Name:    name,
-		Command: command,
-		Output:  output,
-		Success: err == nil,
-	}
-	if result.Success && result.Output == "" {
-		result.Output = successText
-	}
-	if !result.Success {
-		result.ExitCode = 1
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			result.ExitCode = exitErr.ExitCode()
-		}
-		if result.Output == "" {
-			result.Output = err.Error()
-		}
-	}
-	if a.logger != nil {
-		if result.Success {
-			a.logger.Info("网络工具完成：%s", result.Name)
-		} else {
-			a.logger.Error("网络工具失败：%s，%s", result.Name, result.Output)
-		}
-	}
-	return result
-}
-
-func (a *App) runNetworkToolPowerShell(name string, command string, script string, successText string) NetworkToolResult {
-	prefix := `$OutputEncoding = [System.Text.UTF8Encoding]::new($false); [Console]::InputEncoding = [System.Text.Encoding]::UTF8; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; `
-	output, err := runCommandOutput("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", prefix+script)
 	output = strings.TrimSpace(stripANSI(output))
 	result := NetworkToolResult{
 		Name:    name,
@@ -1000,11 +958,14 @@ func (a *App) startMTR(options MTRStartOptions) (result MTRStartResult, err erro
 				port = 443
 			}
 		}
+		if port > 65535 {
+			return MTRStartResult{}, errors.New("MTR 端口超出有效范围 (1-65535)")
+		}
 		a.emitMTROutput(fmt.Sprintf("探测协议：TCP SYN (目标端口 %d)", port))
-		args = []string{"-4", "--tcp", "-p", strconv.Itoa(port), "--mtr", "--raw", "--no-color", "--queries", "1", "--ttl-time", "800", "--timeout", "1200", target}
+		args = []string{"-4", "--tcp", "-p", strconv.Itoa(port), "--mtr", "--raw", "--no-color", "--queries", "1", "--ttl-time", "800", "--timeout", "1200", "--", target}
 	} else {
 		a.emitMTROutput("探测协议：ICMP Socket")
-		args = []string{"-4", "--icmp-mode", "1", "--mtr", "--raw", "--no-color", "--queries", "1", "--ttl-time", "800", "--timeout", "1200", target}
+		args = []string{"-4", "--icmp-mode", "1", "--mtr", "--raw", "--no-color", "--queries", "1", "--ttl-time", "800", "--timeout", "1200", "--", target}
 	}
 	a.mtrMu.Lock()
 	if a.mtrCancel != nil {
@@ -1024,16 +985,6 @@ func (a *App) startMTR(options MTRStartOptions) (result MTRStartResult, err erro
 		a.runMTR(ctx, path, args, env)
 	})
 	return MTRStartResult{Command: command}, nil
-}
-
-func isWinDivertRuntimeError(output string) bool {
-	text := strings.ToLower(output)
-	return strings.Contains(text, "windivert") &&
-		(strings.Contains(text, "cannot find the path") ||
-			strings.Contains(text, "system cannot find the path") ||
-			strings.Contains(text, "无法打开 windivert") ||
-			strings.Contains(text, "没有管理员权限") ||
-			strings.Contains(text, "管理员权限"))
 }
 
 func normalizeMTRNetworkMode(mode string) string {
@@ -1099,16 +1050,20 @@ func (a *App) toolStatus(name string, args ...string) ToolStatus {
 	return status
 }
 
-func (a *App) runIperf3(ctx context.Context, path string, args []string, env []string) {
-	defer func() {
-		a.iperfMu.Lock()
-		a.iperfCancel = nil
-		a.iperfMu.Unlock()
-		a.emitIperfOutput("iperf3 已结束")
-	}()
+func (a *App) runStreamingTool(
+	ctx context.Context,
+	path string,
+	args []string,
+	dir string,
+	env []string,
+	emit func(string),
+	pipe func(io.Reader, chan<- struct{}),
+	onFinish func(),
+) {
+	defer onFinish()
 	cmd := exec.CommandContext(ctx, path, args...)
-	if strings.TrimSpace(a.root) != "" {
-		cmd.Dir = a.root
+	if strings.TrimSpace(dir) != "" {
+		cmd.Dir = dir
 	}
 	if len(env) > 0 {
 		cmd.Env = env
@@ -1116,32 +1071,42 @@ func (a *App) runIperf3(ctx context.Context, path string, args []string, env []s
 	hideCommandWindow(cmd)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		a.emitIperfOutput("读取输出失败：" + err.Error())
+		emit("读取输出失败：" + err.Error())
 		return
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		a.emitIperfOutput("读取错误输出失败：" + err.Error())
+		emit("读取错误输出失败：" + err.Error())
 		return
 	}
 	if err := cmd.Start(); err != nil {
-		a.emitIperfOutput("启动失败：" + err.Error())
+		emit("启动失败：" + err.Error())
 		return
 	}
 	done := make(chan struct{}, 2)
-	go a.pipeIperfOutput(stdout, done)
-	go a.pipeIperfOutput(stderr, done)
-	err = cmd.Wait()
-	if !waitOutputReaders(done, 2, 2*time.Second) {
-		a.emitIperfOutput("读取剩余输出超时，任务已结束")
+	go pipe(stdout, done)
+	go pipe(stderr, done)
+	// Per Go os/exec contract, drain StdoutPipe/StderrPipe BEFORE cmd.Wait()
+	if !waitOutputReaders(done, 2, 10*time.Minute) {
+		emit("读取剩余输出超时，任务已结束")
 	}
+	err = cmd.Wait()
 	if ctx.Err() == context.Canceled {
-		a.emitIperfOutput("已停止")
+		emit("已停止")
 		return
 	}
 	if err != nil {
-		a.emitIperfOutput("执行失败：" + err.Error())
+		emit("执行失败：" + err.Error())
 	}
+}
+
+func (a *App) runIperf3(ctx context.Context, path string, args []string, env []string) {
+	a.runStreamingTool(ctx, path, args, a.root, env, a.emitIperfOutput, a.pipeIperfOutput, func() {
+		a.iperfMu.Lock()
+		a.iperfCancel = nil
+		a.iperfMu.Unlock()
+		a.emitIperfOutput("iperf3 已结束")
+	})
 }
 
 func (a *App) pipeIperfOutput(reader io.Reader, done chan<- struct{}) {
@@ -1150,46 +1115,12 @@ func (a *App) pipeIperfOutput(reader io.Reader, done chan<- struct{}) {
 }
 
 func (a *App) runLocalSpeedtest(ctx context.Context, path string, args []string, env []string) {
-	defer func() {
+	a.runStreamingTool(ctx, path, args, a.root, env, a.emitLocalSpeedtestOutput, a.pipeLocalSpeedtestOutput, func() {
 		a.localSpeedtestMu.Lock()
 		a.localSpeedtestCancel = nil
 		a.localSpeedtestMu.Unlock()
 		a.emitLocalSpeedtestOutput("本地测速已结束")
-	}()
-	cmd := exec.CommandContext(ctx, path, args...)
-	if strings.TrimSpace(a.root) != "" {
-		cmd.Dir = a.root
-	}
-	cmd.Env = env
-	hideCommandWindow(cmd)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		a.emitLocalSpeedtestOutput("读取输出失败：" + err.Error())
-		return
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		a.emitLocalSpeedtestOutput("读取错误输出失败：" + err.Error())
-		return
-	}
-	if err := cmd.Start(); err != nil {
-		a.emitLocalSpeedtestOutput("启动失败：" + err.Error())
-		return
-	}
-	done := make(chan struct{}, 2)
-	go a.pipeLocalSpeedtestOutput(stdout, done)
-	go a.pipeLocalSpeedtestOutput(stderr, done)
-	err = cmd.Wait()
-	if !waitOutputReaders(done, 2, 2*time.Second) {
-		a.emitLocalSpeedtestOutput("读取剩余输出超时，任务已结束")
-	}
-	if ctx.Err() == context.Canceled {
-		a.emitLocalSpeedtestOutput("已停止")
-		return
-	}
-	if err != nil {
-		a.emitLocalSpeedtestOutput("执行失败：" + err.Error())
-	}
+	})
 }
 
 func (a *App) pipeLocalSpeedtestOutput(reader io.Reader, done chan<- struct{}) {
@@ -1237,46 +1168,12 @@ func parseLocalSpeedtestServers(output string) []LocalSpeedtestServer {
 }
 
 func (a *App) runMTR(ctx context.Context, path string, args []string, env []string) {
-	defer func() {
+	a.runStreamingTool(ctx, path, args, toolExecDir(path), env, a.emitMTROutput, a.pipeMTROutput, func() {
 		a.mtrMu.Lock()
 		a.mtrCancel = nil
 		a.mtrMu.Unlock()
 		a.emitMTROutput("MTR 已结束")
-	}()
-	cmd := exec.CommandContext(ctx, path, args...)
-	if dir := toolExecDir(path); dir != "" {
-		cmd.Dir = dir
-	}
-	cmd.Env = env
-	hideCommandWindow(cmd)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		a.emitMTROutput("读取输出失败：" + err.Error())
-		return
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		a.emitMTROutput("读取错误输出失败：" + err.Error())
-		return
-	}
-	if err := cmd.Start(); err != nil {
-		a.emitMTROutput("启动失败：" + err.Error())
-		return
-	}
-	done := make(chan struct{}, 2)
-	go a.pipeMTROutput(stdout, done)
-	go a.pipeMTROutput(stderr, done)
-	err = cmd.Wait()
-	if !waitOutputReaders(done, 2, 2*time.Second) {
-		a.emitMTROutput("读取剩余输出超时，任务已结束")
-	}
-	if ctx.Err() == context.Canceled {
-		a.emitMTROutput("已停止")
-		return
-	}
-	if err != nil {
-		a.emitMTROutput("执行失败：" + err.Error())
-	}
+	})
 }
 
 func (a *App) pipeMTROutput(reader io.Reader, done chan<- struct{}) {
@@ -1341,6 +1238,9 @@ func scanReaderChunks(reader io.Reader, emit func(string)) {
 					continue
 				}
 				pending.WriteByte(b)
+				if pending.Len() >= 64*1024 {
+					flush()
+				}
 			}
 		}
 		if err != nil {
@@ -1471,24 +1371,45 @@ func proxyNetworkEnv(env []string, proxyURL string) []string {
 	return append(result, "HTTP_PROXY="+proxyURL, "HTTPS_PROXY="+proxyURL, "ALL_PROXY="+proxyURL, "NO_PROXY=127.0.0.1,localhost")
 }
 
+var validHostnameRE = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$`)
+
+func isValidNetworkTargetHost(host string) bool {
+	host = strings.TrimSpace(host)
+	if host == "" || len(host) > 253 || strings.HasPrefix(host, "-") {
+		return false
+	}
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	return validHostnameRE.MatchString(host)
+}
+
 func parseIperfTarget(value string) (string, int, error) {
 	target := strings.TrimSpace(value)
 	if target == "" {
 		return "", 0, errors.New("请输入目标地址")
 	}
-	if len(target) > 253 || strings.ContainsAny(target, " \t\r\n/\\") {
+	if len(target) > 260 || strings.ContainsAny(target, " \t\r\n/\\") {
 		return "", 0, errors.New("目标地址格式无效")
 	}
-	if host, portText, ok := strings.Cut(target, ":"); ok && !strings.Contains(host, ":") {
-		port, err := strconv.Atoi(portText)
-		if err != nil || port < 1 || port > 65535 {
+	// 纯 IPv4 / IPv6 地址
+	if net.ParseIP(target) != nil {
+		return target, 0, nil
+	}
+	// 支持 host:port 与 [ipv6]:port
+	if host, portText, err := net.SplitHostPort(target); err == nil {
+		port, perr := strconv.Atoi(strings.TrimSpace(portText))
+		if perr != nil || port < 1 || port > 65535 {
 			return "", 0, errors.New("目标端口无效")
 		}
 		host = strings.TrimSpace(host)
-		if host == "" {
+		if !isValidNetworkTargetHost(host) {
 			return "", 0, errors.New("目标地址格式无效")
 		}
 		return host, port, nil
+	}
+	if !isValidNetworkTargetHost(target) {
+		return "", 0, errors.New("目标地址格式无效")
 	}
 	return target, 0, nil
 }
@@ -1501,25 +1422,6 @@ func (a *App) toolPath(name string) string {
 	return filepath.Join(root, "bin", exeName(name))
 }
 
-func (a *App) initNextTrace(path string) error {
-	root := strings.TrimSpace(a.root)
-	if root == "" {
-		root = detectAppRoot()
-	}
-	if err := ensureEmbeddedBins(root, a.logger); err != nil {
-		return fmt.Errorf("初始化 NextTrace 运行文件失败：%s", err.Error())
-	}
-	dir := toolExecDir(path)
-	output, err := runToolWithTimeout(path, dir, 15*time.Second, "--init")
-	if err != nil {
-		return fmt.Errorf("初始化 NextTrace 失败：%s", firstNonEmpty(trimForLog(output), err.Error()))
-	}
-	if status := nextTraceRuntimeStatus(path); status != "已就绪" {
-		return fmt.Errorf("初始化 NextTrace 失败：WinDivert %s", status)
-	}
-	return nil
-}
-
 func toolExecDir(path string) string {
 	dir := filepath.Dir(strings.TrimSpace(path))
 	if dir == "." {
@@ -1528,25 +1430,11 @@ func toolExecDir(path string) string {
 	return dir
 }
 
-func nextTraceRuntimeStatus(path string) string {
-	dir := filepath.Dir(path)
-	missing := make([]string, 0, 2)
-	for _, name := range []string{"WinDivert.dll", "WinDivert64.sys"} {
-		if !fileExists(filepath.Join(dir, name)) {
-			missing = append(missing, name)
-		}
-	}
-	if len(missing) == 0 {
-		return "已就绪"
-	}
-	return "缺少 " + strings.Join(missing, "、")
-}
-
 func validateMTRTarget(target string) error {
 	if target == "" {
 		return errors.New("请输入 MTR 目标")
 	}
-	if len(target) > 253 || strings.ContainsAny(target, " \t\r\n/\\") {
+	if !isValidNetworkTargetHost(target) {
 		return errors.New("MTR 目标格式无效")
 	}
 	return nil

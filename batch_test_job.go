@@ -262,7 +262,7 @@ func newBatchTestJobRunner(a *App, jobID string, total int, items []batchNodeTes
 			return testNodeMetricWithClient(base, client, "delay", nil, defaultSpeedTestConfig(), delayRuntime)
 		},
 		outboundInfo: func(ctx context.Context, client *http.Client) (string, string, error) {
-			return testOutboundInfo(client)
+			return testOutboundInfoContext(ctx, client)
 		},
 		compat: func(ctx context.Context, item batchNodeTestItem, metric string) (SpeedResult, error) {
 			if manager == nil {
@@ -972,7 +972,7 @@ func startBatchTempCore(ctx context.Context, m *SingBoxManager, nodes []Node, op
 	portWait := delayRuntimeFromOptions(options).portWait
 	portsReady := make(chan error, 1)
 	go func() {
-		_, err := waitDelayTestPorts("127.0.0.1", ports, portWait)
+		_, err := waitDelayTestPortsContext(ctx, "127.0.0.1", ports, portWait)
 		portsReady <- err
 	}()
 

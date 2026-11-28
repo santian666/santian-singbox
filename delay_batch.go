@@ -379,10 +379,17 @@ func (m *SingBoxManager) logDelayRetry(count, concurrency int) {
 }
 
 func waitDelayTestPorts(host string, ports []int, timeout time.Duration) (int, error) {
+	return waitDelayTestPortsContext(context.Background(), host, ports, timeout)
+}
+
+func waitDelayTestPortsContext(parent context.Context, host string, ports []int, timeout time.Duration) (int, error) {
 	if len(ports) == 0 {
 		return 0, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	jobs := make(chan int)
 	type portResult struct {
@@ -406,7 +413,11 @@ func waitDelayTestPorts(host string, ports []int, timeout time.Duration) (int, e
 	}
 	go func() {
 		for _, port := range ports {
-			jobs <- port
+			select {
+			case jobs <- port:
+			case <-ctx.Done():
+				break
+			}
 		}
 		close(jobs)
 		wg.Wait()
@@ -414,6 +425,7 @@ func waitDelayTestPorts(host string, ports []int, timeout time.Duration) (int, e
 	}()
 	for result := range results {
 		if result.err != nil {
+			cancel()
 			return result.port, result.err
 		}
 	}
@@ -422,6 +434,9 @@ func waitDelayTestPorts(host string, ports []int, timeout time.Duration) (int, e
 
 func waitDelayTestPort(ctx context.Context, host string, port int) error {
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if tcpPortOpen(host, port, 150*time.Millisecond) {
 			return nil
 		}

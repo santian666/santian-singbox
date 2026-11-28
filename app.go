@@ -80,7 +80,7 @@ type App struct {
 	tunStatusActive             bool
 	tunStatusText               string
 	quitMu                      sync.Mutex
-	quiting                     bool
+	quitting                    bool
 	allowClose                  bool
 	preserveProxySettingsOnExit bool
 	shutdownOnce                sync.Once
@@ -364,6 +364,7 @@ func (a *App) cleanupStartupResiduals(settings Settings, force bool, cleanupTun 
 			a.logger.Info("启动自检已解除残留 Kill Switch")
 		}
 	}
+	_ = os.Remove(filepath.Join(a.root, "data", "gui", "admin-restart.cmd"))
 }
 
 func (a *App) shutdown(ctx context.Context) {
@@ -499,12 +500,6 @@ func (a *App) stopRunningToolsForExit() {
 	}
 }
 
-func (a *App) cleanupForProcessExit(reason string) {
-	defer recoverPanic(a.logger, reason)
-	a.markClosingAllowed()
-	a.cleanupAllProxyEffects(reason)
-}
-
 func (a *App) requestQuit(reason string) {
 	if a.beginAsyncQuit(reason) {
 		return
@@ -521,11 +516,11 @@ func (a *App) shutdownForSignal(reason string) {
 
 func (a *App) beginAsyncQuit(reason string) bool {
 	a.quitMu.Lock()
-	if a.quiting || a.allowClose {
+	if a.quitting || a.allowClose {
 		a.quitMu.Unlock()
 		return false
 	}
-	a.quiting = true
+	a.quitting = true
 	a.quitMu.Unlock()
 
 	a.hideWindow()
@@ -546,7 +541,7 @@ func (a *App) beginAsyncQuit(reason string) bool {
 
 func (a *App) markClosingAllowed() {
 	a.quitMu.Lock()
-	a.quiting = true
+	a.quitting = true
 	a.allowClose = true
 	a.quitMu.Unlock()
 }
@@ -572,7 +567,7 @@ func (a *App) isCloseAllowed() bool {
 func (a *App) isQuitting() bool {
 	a.quitMu.Lock()
 	defer a.quitMu.Unlock()
-	return a.quiting
+	return a.quitting
 }
 
 func (a *App) stopProxyForUser() error {
@@ -673,10 +668,12 @@ func (a *App) State() (result RuntimeState) {
 	var appLatestVersion string
 	var appUpdateAvailable bool
 	var appReleaseNotes string
-	if a.manager != nil && a.manager.Running() && a.appUpdater != nil && a.appUpdater.lastInfo != nil {
-		appLatestVersion = a.appUpdater.lastInfo.LatestVersion
-		appUpdateAvailable = a.appUpdater.lastInfo.Available
-		appReleaseNotes = a.appUpdater.lastInfo.ReleaseNotes
+	if a.manager != nil && a.manager.Running() && a.appUpdater != nil {
+		if info, _ := a.appUpdater.LastInfo(); info != nil {
+			appLatestVersion = info.LatestVersion
+			appUpdateAvailable = info.Available
+			appReleaseNotes = info.ReleaseNotes
+		}
 	}
 	healthStatus, healthTitle, healthMessage, healthSeq := a.currentNetworkHealth()
 	exitIP, exitCountry, exitMismatch := a.currentExitInfo()
@@ -771,30 +768,6 @@ func (a *App) cacheTunStatus(configMode ConfigMode, active bool, status string) 
 	a.tunStatusText = status
 	a.tunStatusMu.Unlock()
 	return configMode, active, status
-}
-
-func (a *App) runtimeTunStatus(settings Settings) (bool, string) {
-	normalizeSettings(&settings)
-	if !effectiveTun(settings) {
-		return false, "TUN未开启"
-	}
-	if a == nil || a.manager == nil || !a.manager.Running() {
-		return false, "TUN未生效：内核未运行"
-	}
-	if _, tunIn, ok := a.manager.CachedRuntimeInfo(); ok {
-		if !tunIn {
-			return false, "TUN未生效：运行配置缺少TUN"
-		}
-		return true, "TUN已生效"
-	}
-	config, err := a.manager.readRuntimeConfig()
-	if err != nil {
-		return false, "TUN未生效：无法读取运行配置"
-	}
-	if !hasTunInbound(config) {
-		return false, "TUN未生效：运行配置缺少TUN"
-	}
-	return true, "TUN已生效"
 }
 
 func (a *App) withTraffic(nodes []Node, groups []NodeGroup, selectedID string) ([]Node, []NodeGroup, TrafficSnapshot) {
@@ -1344,6 +1317,9 @@ func (a *App) ImportSubscription(subURL string) (result map[string]interface{}, 
 	}
 
 	subURL = strings.TrimSpace(subURL)
+	// 在网络拉取完成后重新拍取最新状态快照，避免覆盖下载期间用户对其它分组/节点的修改（消除 TOCTOU）
+	state = a.store.Snapshot()
+	previous = state
 	removeGroups := map[string]bool{}
 	mergedGroups := make([]NodeGroup, 0, len(state.Groups)+len(groups))
 	for _, group := range state.Groups {
@@ -1366,9 +1342,13 @@ func (a *App) ImportSubscription(subURL string) (result map[string]interface{}, 
 		mergedNodes = append(mergedNodes, node)
 		exists[node.ID] = true
 	}
+	oldNodesByID := make(map[string]Node, len(state.Nodes))
+	for _, oldNode := range state.Nodes {
+		oldNodesByID[oldNode.ID] = oldNode
+	}
 	added := 0
 	for _, node := range subResult.Nodes {
-		if oldNode, ok := findNodeByID(state.Nodes, node.ID); ok {
+		if oldNode, ok := oldNodesByID[node.ID]; ok {
 			node.DelayMS = oldNode.DelayMS
 			node.LastTest = oldNode.LastTest
 			node.UploadTotal = oldNode.UploadTotal
@@ -2320,6 +2300,31 @@ func (a *App) PickAppProxyTarget(targetType string) (target AppProxyTarget, err 
 	}
 }
 
+func (a *App) exportLinkRowsToXLSX(dialogTitle, defaultBaseName, logLabel string, items []exportLinkRow) (string, error) {
+	defaultName := safeExportFileName(defaultBaseName) + ".xlsx"
+	path, err := wailsRuntime.SaveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
+		Title:           dialogTitle,
+		DefaultFilename: defaultName,
+		Filters: []wailsRuntime.FileFilter{
+			{DisplayName: "Excel 文件（含节点二维码） (*.xlsx)", Pattern: "*.xlsx"},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(path) == "" {
+		return "", nil
+	}
+	if ext := filepath.Ext(path); !strings.EqualFold(ext, ".xlsx") {
+		path = strings.TrimSuffix(path, ext) + ".xlsx"
+	}
+	if err := writeGroupLinksXLSXWithQR(path, items); err != nil {
+		return "", err
+	}
+	a.logger.Info("已导出%s Excel（含二维码）：%s", logLabel, path)
+	return path, nil
+}
+
 func (a *App) ExportGroupLinks(groupID string) (path string, err error) {
 	defer a.recoverError("导出节点组链接", &err)
 	if a.ctx == nil {
@@ -2354,28 +2359,7 @@ func (a *App) ExportGroupLinks(groupID string) (path string, err error) {
 	if len(items) == 0 {
 		return "", errors.New("当前分组没有可导出的节点")
 	}
-	defaultName := safeExportFileName(groupName) + ".xlsx"
-	path, err = wailsRuntime.SaveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
-		Title:           "导出当前分组 Excel",
-		DefaultFilename: defaultName,
-		Filters: []wailsRuntime.FileFilter{
-			{DisplayName: "Excel 文件（含节点二维码） (*.xlsx)", Pattern: "*.xlsx"},
-		},
-	})
-	if err != nil {
-		return "", err
-	}
-	if strings.TrimSpace(path) == "" {
-		return "", nil
-	}
-	if ext := filepath.Ext(path); !strings.EqualFold(ext, ".xlsx") {
-		path = strings.TrimSuffix(path, ext) + ".xlsx"
-	}
-	if err := writeGroupLinksXLSXWithQR(path, items); err != nil {
-		return "", err
-	}
-	a.logger.Info("已导出节点组 Excel（含二维码）：%s", path)
-	return path, nil
+	return a.exportLinkRowsToXLSX("导出当前分组 Excel", groupName, "节点组", items)
 }
 
 func (a *App) ExportNodesLinks(nodeIDs []string) (path string, err error) {
@@ -2411,28 +2395,7 @@ func (a *App) ExportNodesLinks(nodeIDs []string) (path string, err error) {
 	if len(items) == 0 {
 		return "", errors.New("选中节点没有可导出的节点")
 	}
-	defaultName := safeExportFileName("选中节点") + ".xlsx"
-	path, err = wailsRuntime.SaveFileDialog(a.ctx, wailsRuntime.SaveDialogOptions{
-		Title:           "导出选中节点 Excel",
-		DefaultFilename: defaultName,
-		Filters: []wailsRuntime.FileFilter{
-			{DisplayName: "Excel 文件（含节点二维码） (*.xlsx)", Pattern: "*.xlsx"},
-		},
-	})
-	if err != nil {
-		return "", err
-	}
-	if strings.TrimSpace(path) == "" {
-		return "", nil
-	}
-	if ext := filepath.Ext(path); !strings.EqualFold(ext, ".xlsx") {
-		path = strings.TrimSuffix(path, ext) + ".xlsx"
-	}
-	if err := writeGroupLinksXLSXWithQR(path, items); err != nil {
-		return "", err
-	}
-	a.logger.Info("已导出选中节点 Excel（含二维码）：%s", path)
-	return path, nil
+	return a.exportLinkRowsToXLSX("导出选中节点 Excel", "选中节点", "选中节点", items)
 }
 
 func (a *App) ParseTestNodes(text string) (result map[string]interface{}, err error) {
@@ -2523,6 +2486,16 @@ func (a *App) TestRawNodes(raws []string, metric string, options SpeedTestOption
 		node  Node
 	}
 	groups := make(map[SpeedTestOptions][]rawTestItem)
+	var cachedSettings Settings
+	hasSettings := false
+	if a.store != nil {
+		cachedSettings = a.store.Snapshot().Settings
+		normalizeSettings(&cachedSettings)
+		if cachedSettings.MixedPort > 0 && a.manager != nil {
+			a.manager.SetSOCKS5TestProxyPort(cachedSettings.MixedPort)
+		}
+		hasSettings = true
+	}
 	for index, raw := range raws {
 		results[index] = RawNodeTestResult{Index: index, Raw: raw}
 		nodes, parseErrs := ParseNodes(raw)
@@ -2536,7 +2509,10 @@ func (a *App) TestRawNodes(raws []string, metric string, options SpeedTestOption
 		}
 		node := nodes[0]
 		node.ID = fmt.Sprintf("raw-batch-%d-%s", index, node.ID)
-		nodeOptions := a.speedTestOptionsForCurrentSettings(options, node)
+		nodeOptions := options
+		if hasSettings {
+			nodeOptions = speedTestOptionsForNormalizedSettings(cachedSettings, options, node)
+		}
 		groups[nodeOptions] = append(groups[nodeOptions], rawTestItem{index: index, node: node})
 	}
 
@@ -2609,15 +2585,7 @@ func rawNodeMetricLabel(metric string) string {
 	}
 }
 
-func (a *App) speedTestOptionsForCurrentSettings(options SpeedTestOptions, node Node) SpeedTestOptions {
-	if a == nil || a.store == nil {
-		return options
-	}
-	settings := a.store.Snapshot().Settings
-	normalizeSettings(&settings)
-	if settings.MixedPort > 0 && a.manager != nil {
-		a.manager.SetSOCKS5TestProxyPort(settings.MixedPort)
-	}
+func speedTestOptionsForNormalizedSettings(settings Settings, options SpeedTestOptions, node Node) SpeedTestOptions {
 	if options.UseSystemProxy {
 		options.DirectOnly = false
 		options.PreferCore = false
@@ -2630,6 +2598,18 @@ func (a *App) speedTestOptionsForCurrentSettings(options SpeedTestOptions, node 
 	}
 	options.PreferCore = effectiveTun(settings) || isSOCKS5Node(node)
 	return options
+}
+
+func (a *App) speedTestOptionsForCurrentSettings(options SpeedTestOptions, node Node) SpeedTestOptions {
+	if a == nil || a.store == nil {
+		return options
+	}
+	settings := a.store.Snapshot().Settings
+	normalizeSettings(&settings)
+	if settings.MixedPort > 0 && a.manager != nil {
+		a.manager.SetSOCKS5TestProxyPort(settings.MixedPort)
+	}
+	return speedTestOptionsForNormalizedSettings(settings, options, node)
 }
 
 func (a *App) SaveSettings(settings Settings) (err error) {
@@ -2948,7 +2928,7 @@ func (a *App) restoreProxyState(previous PersistState) error {
 	return nil
 }
 
-func (a *App) disableTunAfterStartFailure(settings Settings, startErr error) {
+func (a *App) recordTunStartFailureNoFallback(settings Settings, startErr error) {
 	if a.store == nil {
 		return
 	}
@@ -2975,7 +2955,6 @@ func (a *App) setCircuitBreakerActive(active bool, reason string) {
 	a.circuitBreakerActive = false
 	a.circuitBreakerText = ""
 	a.circuitBreakerMu.Unlock()
-	_ = disableKillSwitch(a.root, a.logger)
 }
 
 func (a *App) isCircuitBreakerActive() bool {
@@ -2994,54 +2973,6 @@ func (a *App) circuitBreakerReason() string {
 	a.circuitBreakerMu.Lock()
 	defer a.circuitBreakerMu.Unlock()
 	return a.circuitBreakerText
-}
-
-const tunConnectivityFailThreshold = 3
-
-func (a *App) verifyTunConnectivityIfDue(port int) error {
-	now := time.Now()
-	cbActive := a.isCircuitBreakerActive()
-	a.healthMu.Lock()
-	if !cbActive && !a.lastTunConnectivityFailure.IsZero() && now.Sub(a.lastTunConnectivityFailure) < tunConnectivityFailureCache {
-		message := a.lastTunConnectivityError
-		a.healthMu.Unlock()
-		return errors.New(firstNonEmpty(message, "TUN 代理出网验证失败"))
-	}
-	interval := tunConnectivityCheckInterval
-	if cbActive {
-		interval = 5 * time.Second
-	} else if a.store != nil && a.store.Snapshot().Settings.AutoFailover {
-		interval = 15 * time.Second
-	}
-	if !a.lastTunConnectivityCheck.IsZero() && now.Sub(a.lastTunConnectivityCheck) < interval {
-		a.healthMu.Unlock()
-		return nil
-	}
-	a.healthMu.Unlock()
-	err := verifyLocalProxyConnectivity(port, tunConnectivityTimeout)
-	a.healthMu.Lock()
-	if err == nil {
-		a.lastTunConnectivityCheck = now
-		a.lastTunConnectivityFailure = time.Time{}
-		a.lastTunConnectivityError = ""
-		a.tunConnectivityConsecutiveFails = 0
-		a.healthMu.Unlock()
-		return nil
-	}
-	a.lastTunConnectivityCheck = time.Time{}
-	a.tunConnectivityConsecutiveFails++
-	fails := a.tunConnectivityConsecutiveFails
-	if !cbActive && fails < tunConnectivityFailThreshold {
-		a.healthMu.Unlock()
-		if a.logger != nil {
-			a.logger.Info("代理连通性探测第 %d/%d 次波动，暂保持连接不触发熔断：%v", fails, tunConnectivityFailThreshold, err)
-		}
-		return nil
-	}
-	a.lastTunConnectivityFailure = now
-	a.lastTunConnectivityError = err.Error()
-	a.healthMu.Unlock()
-	return err
 }
 
 func (a *App) markTunConnectivityHealthy(settings Settings) {
@@ -3500,8 +3431,10 @@ func (a *App) CheckAppUpdate(force bool) (result *AppUpdateInfo, err error) {
 		return nil, errors.New("proxy_not_running")
 	}
 
-	if !force && a.appUpdater.lastInfo != nil && time.Since(a.appUpdater.lastCheckAt) < 10*time.Minute {
-		return a.appUpdater.lastInfo, nil
+	if !force {
+		if lastInfo, lastAt := a.appUpdater.LastInfo(); lastInfo != nil && time.Since(lastAt) < 10*time.Minute {
+			return lastInfo, nil
+		}
 	}
 
 	proxyPort := 0
@@ -3516,166 +3449,6 @@ func (a *App) CheckAppUpdate(force bool) (result *AppUpdateInfo, err error) {
 		return nil, err
 	}
 	a.emitState()
-	return info, nil
-}
-
-func (a *App) ApplyAppUpdate() (result *AppUpdateInfo, err error) {
-	defer a.recoverError("执行软件更新", &err)
-	if a == nil || a.appUpdater == nil {
-		return nil, errors.New("软件更新管理器未初始化")
-	}
-	if a.manager == nil || !a.manager.Running() {
-		return nil, errors.New("请先开启代理后再执行客户端更新（开启代理可保证下载速度与连接稳定性）")
-	}
-	a.appUpdater.mu.Lock()
-	if a.appUpdater.isUpdating {
-		a.appUpdater.mu.Unlock()
-		return nil, errors.New("软件更新正在进行中，请勿重复操作")
-	}
-	a.appUpdater.isUpdating = true
-	a.appUpdater.mu.Unlock()
-
-	defer func() {
-		a.appUpdater.mu.Lock()
-		a.appUpdater.isUpdating = false
-		a.appUpdater.mu.Unlock()
-	}()
-
-	proxyPort := 0
-	if a.store != nil {
-		proxyPort = a.store.Snapshot().Settings.MixedPort
-	}
-	if proxyPort <= 0 {
-		proxyPort = 20808
-	}
-
-	info, err := a.appUpdater.CheckUpdate(proxyPort)
-	if err != nil {
-		return nil, err
-	}
-	if !info.Available || info.DownloadURL == "" {
-		return info, errors.New("未检测到可更新的版本下载包")
-	}
-
-	updatesDir := filepath.Join(a.root, "data", "updates")
-	_ = os.MkdirAll(updatesDir, 0755)
-	zipPath := filepath.Join(updatesDir, "update.zip")
-	targetVersionPath := filepath.Join(updatesDir, "target_version.txt")
-	stageDir := filepath.Join(updatesDir, "staging")
-
-	// 1. 检查本地是否已存在针对目标版本且完整有效的安装包（避免失败重试或重启软件后重复下载）
-	needDownload := true
-	savedVerBytes, _ := os.ReadFile(targetVersionPath)
-	savedVer := strings.TrimSpace(string(savedVerBytes))
-	if savedVer == info.LatestVersion && isValidUpdateZip(zipPath, info.AssetSize) {
-		needDownload = false
-		if a.logger != nil {
-			a.logger.Info("检测到已存在完整的更新包 (%s)，直接复用，免去重复下载", info.LatestVersion)
-		}
-		if a.ctx != nil {
-			wailsRuntime.EventsEmit(a.ctx, "app-update-progress", AppUpdateProgress{
-				Phase:       "downloading",
-				Percent:     100,
-				Bytes:       info.AssetSize,
-				Total:       info.AssetSize,
-				SpeedString: "本地缓存",
-				Message:     "已检测到本地完整安装包，校验通过，直接复用安装...",
-			})
-		}
-	}
-
-	if needDownload {
-		_ = os.RemoveAll(stageDir)
-		_ = os.MkdirAll(stageDir, 0755)
-		if a.logger != nil {
-			a.logger.Info("开始下载软件更新包：%s", info.DownloadURL)
-		}
-
-		onProgress := func(downloaded, total int64, speed string, percent float64) {
-			if a.ctx != nil {
-				wailsRuntime.EventsEmit(a.ctx, "app-update-progress", AppUpdateProgress{
-					Phase:       "downloading",
-					Percent:     percent,
-					Bytes:       downloaded,
-					Total:       total,
-					SpeedString: speed,
-					Message:     fmt.Sprintf("正在下载：%.1f%% (%s)", percent, speed),
-				})
-			}
-		}
-
-		if err := downloadUpdateAsset(info.DownloadURL, zipPath, proxyPort, info.AssetSize, onProgress); err != nil {
-			return nil, fmt.Errorf("下载更新包失败：%w", err)
-		}
-		_ = os.WriteFile(targetVersionPath, []byte(info.LatestVersion), 0644)
-	}
-
-	if a.ctx != nil {
-		wailsRuntime.EventsEmit(a.ctx, "app-update-progress", AppUpdateProgress{
-			Phase:   "extracting",
-			Percent: 100,
-			Message: "更新包就绪，正在解压更新文件...",
-		})
-	}
-	if a.logger != nil {
-		a.logger.Info("更新包已就绪，正在解压...")
-	}
-
-	_ = os.RemoveAll(stageDir)
-	_ = os.MkdirAll(stageDir, 0755)
-	if err := extractZipArchive(zipPath, stageDir); err != nil {
-		return nil, fmt.Errorf("解压更新包失败：%w", err)
-	}
-
-	exePath, err := os.Executable()
-	if err != nil {
-		exePath = filepath.Join(a.root, "SanTian-Singbox.exe")
-	}
-	exeName := filepath.Base(exePath)
-	extractedAppDir := locateExtractedAppDir(stageDir, exeName)
-
-	if a.ctx != nil {
-		wailsRuntime.EventsEmit(a.ctx, "app-update-progress", AppUpdateProgress{
-			Phase:   "applying",
-			Percent: 100,
-			Message: "准备就绪，正在进行原子级热替换并重启...",
-		})
-	}
-	if a.logger != nil {
-		a.logger.Info("开始执行原子级更新文件替换...")
-	}
-
-	// 1. 停止运行中工具与 sing-box 核心以释放 bin/ 目录下的二进制文件句柄
-	a.stopRunningToolsForExit()
-	if a.manager != nil && a.manager.Running() {
-		_ = a.Stop()
-		time.Sleep(300 * time.Millisecond)
-	}
-
-	// 2. 进程内原子级替换文件（重命名旧程序，拷贝新程序）
-	if err := performAtomicInPlaceUpdate(a.root, extractedAppDir, exePath); err != nil {
-		return nil, fmt.Errorf("原子更新失败：%w", err)
-	}
-
-	// 3. 直接通过系统标准 API 启动新程序
-	if err := launchNewAppProcess(exePath, a.root); err != nil {
-		return nil, fmt.Errorf("启动新版本程序失败：%w", err)
-	}
-
-	if a.logger != nil {
-		a.logger.Info("新版本程序已成功拉起，旧进程即将安全退出")
-	}
-
-	// 4. 旧进程安全退出
-	go func() {
-		time.Sleep(200 * time.Millisecond)
-		if a.ctx != nil {
-			wailsRuntime.Quit(a.ctx)
-		}
-		time.Sleep(200 * time.Millisecond)
-		os.Exit(0)
-	}()
-
 	return info, nil
 }
 
@@ -3739,7 +3512,7 @@ func (a *App) startLocked() error {
 	if err := a.manager.Start(state); err != nil {
 		a.logger.Error("启动失败：%v", err)
 		a.enableTunKillSwitchIfConfigured(state.Settings)
-		a.disableTunAfterStartFailure(state.Settings, err)
+		a.recordTunStartFailureNoFallback(state.Settings, err)
 		a.setNetworkHealth("core_down", "代理内核启动失败（防漏保护生效中）", fmt.Sprintf("sing-box 启动失败：%v。已保持断网防漏锁定，请切换节点或检查配置后重试。", err), true)
 		return err
 	}
@@ -3768,7 +3541,11 @@ func (a *App) prepareStartupPorts(state PersistState) error {
 		{name: "内核控制", port: clashAPIPort},
 	}
 	if settings.ProxyMap {
-		for index := range proxyMapNodesForSettings(state.Nodes, settings) {
+		mappedNodes := proxyMapNodesForSettings(state.Nodes, settings)
+		if err := validateProxyMapPorts(settings, len(mappedNodes)); err != nil {
+			return err
+		}
+		for index := range mappedNodes {
 			ports = append(ports, struct {
 				name string
 				port int
@@ -4386,6 +4163,8 @@ func (a *App) commitAutoFailoverCandidate(ctx context.Context, expectedSelectedI
 	_ = a.manager.CloseConnections()
 	time.Sleep(200 * time.Millisecond)
 	if err := verifyLocalProxyConnectivity(latest.Settings.MixedPort, 2500*time.Millisecond); err != nil {
+		// 校验失败时回滚回原节点 ID，避免下一候选节点误判为“用户手动切节点”而提前中止
+		_ = a.selectNodeLocked(expectedSelectedID)
 		return true, err
 	}
 	return true, nil
@@ -4594,6 +4373,10 @@ func (a *App) verifyActiveExitIPAsync(nodeID string, node Node, mixedPort int) {
 			a.logger.Info("【出口核验】节点 [%s (%s)] 实际出口：%s (%s)", node.Name, nodeOutboundTag(node), ip, country)
 		}
 		a.exitInfoMu.Lock()
+		if ctx.Err() != nil {
+			a.exitInfoMu.Unlock()
+			return
+		}
 		a.exitIP = ip
 		a.exitCountry = country
 		a.exitMismatch = mismatch
@@ -4966,7 +4749,7 @@ func (a *App) restartForDirectDNS() error {
 	a.persistTraffic()
 	if err := a.manager.Restart(state, effectiveTun(state.Settings)); err != nil {
 		a.logger.Error("直连 DNS 重启失败：%v", err)
-		a.disableTunAfterStartFailure(state.Settings, err)
+		a.recordTunStartFailureNoFallback(state.Settings, err)
 		a.emitState()
 		return err
 	}
@@ -5014,6 +4797,16 @@ func (a *App) StartBatchTest(raws []string, options BatchTestOptions) (result Ba
 
 	items := make([]batchNodeTestItem, 0, len(raws))
 	failed := 0
+	var batchSettings Settings
+	hasBatchSettings := false
+	if a.store != nil {
+		batchSettings = a.store.Snapshot().Settings
+		normalizeSettings(&batchSettings)
+		if batchSettings.MixedPort > 0 && a.manager != nil {
+			a.manager.SetSOCKS5TestProxyPort(batchSettings.MixedPort)
+		}
+		hasBatchSettings = true
+	}
 	for index, raw := range raws {
 		nodes, parseErrs := ParseNodes(raw)
 		if len(nodes) == 0 {
@@ -5033,11 +4826,15 @@ func (a *App) StartBatchTest(raws []string, options BatchTestOptions) (result Ba
 		}
 		node := nodes[0]
 		node.ID = fmt.Sprintf("raw-batch-%d-%s", index, node.ID)
+		nodeOpts := options.SpeedTestOptions
+		if hasBatchSettings {
+			nodeOpts = speedTestOptionsForNormalizedSettings(batchSettings, options.SpeedTestOptions, node)
+		}
 		items = append(items, batchNodeTestItem{
 			index:   index,
 			raw:     raw,
 			node:    node,
-			options: a.speedTestOptionsForCurrentSettings(options.SpeedTestOptions, node),
+			options: nodeOpts,
 		})
 	}
 

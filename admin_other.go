@@ -16,6 +16,8 @@ func restartAsAdmin(_ string) error {
 	return nil
 }
 
+func waitParentPIDFromArgs() {}
+
 func cleanupTunInterface(logger *Logger) {}
 func cleanupTunInterfaceWithSummary(logger *Logger) string { return "" }
 func ensureCleanTunBeforeStart(_ *Logger) {}

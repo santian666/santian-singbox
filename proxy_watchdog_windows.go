@@ -92,10 +92,20 @@ func parseProxyWatchdogOptions(args []string) (proxyWatchdogOptions, error) {
 func waitParentAndCleanupProxy(options proxyWatchdogOptions) error {
 	parent, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(options.ParentPID))
 	if err == nil {
-		_, waitErr := windows.WaitForSingleObject(parent, windows.INFINITE)
-		windows.CloseHandle(parent)
+		status, waitErr := windows.WaitForSingleObject(parent, windows.INFINITE)
+		_ = windows.CloseHandle(parent)
 		if waitErr != nil {
 			return waitErr
+		}
+		if status != windows.WAIT_OBJECT_0 {
+			return fmt.Errorf("等待父进程退出返回异常状态: %d", status)
+		}
+		return cleanupProxyAfterParentExit(options)
+	}
+	// 仅在父进程确实已不存在时才清理；若因权限不足（ERROR_ACCESS_DENIED）无法打开父进程句柄，切勿误杀在线代理
+	if !errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
+		if isWindowsProcessRunning(options.ParentPID) {
+			return fmt.Errorf("无法监听父进程 %d（权限受限）且进程仍在运行，跳过清理: %w", options.ParentPID, err)
 		}
 	}
 	return cleanupProxyAfterParentExit(options)

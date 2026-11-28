@@ -450,7 +450,17 @@ function boot() {
   }).catch(() => {});
   const nodes = qs("#nodes");
   if (nodes) {
-    new MutationObserver(() => renderBatchSelect()).observe(nodes, { childList: true, subtree: true });
+    let mutating = false;
+    const observer = new MutationObserver(() => {
+      if (mutating) return;
+      mutating = true;
+      try {
+        renderBatchSelect();
+      } finally {
+        mutating = false;
+      }
+    });
+    observer.observe(nodes, { childList: true, subtree: true });
   }
   let retries = 0;
   const timer = setInterval(() => {

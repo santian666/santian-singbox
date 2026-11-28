@@ -242,17 +242,6 @@ func normalizeSpeedTestOptions(options SpeedTestOptions) (speedTestConfig, error
 	}, nil
 }
 
-var clashAPITransport = &http.Transport{
-	Proxy: nil,
-	DialContext: (&net.Dialer{
-		Timeout:   3 * time.Second,
-		KeepAlive: 30 * time.Second,
-	}).DialContext,
-	MaxIdleConns:        128,
-	MaxIdleConnsPerHost: 64,
-	IdleConnTimeout:     60 * time.Second,
-}
-
 func (m *SingBoxManager) testNodeDelayViaClashAPI(tag string, testURL string, timeout time.Duration) (int, error) {
 	return m.testNodeDelayViaClashAPIContext(context.Background(), tag, testURL, timeout)
 }
@@ -294,12 +283,13 @@ func (m *SingBoxManager) testNodeDelayViaClashAPIContext(ctx context.Context, ta
 			url.QueryEscape(target),
 			timeoutMS,
 		)
-		client := http.Client{Transport: clashAPITransport, Timeout: timeout + 1200*time.Millisecond}
+		client := http.Client{Transport: clashAPIHTTPTransport, Timeout: timeout + 1200*time.Millisecond}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 		if err != nil {
 			lastErr = err
 			continue
 		}
+		m.applyClashAuth(req)
 		resp, err := client.Do(req)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -311,7 +301,7 @@ func (m *SingBoxManager) testNodeDelayViaClashAPIContext(ctx context.Context, ta
 			lastErr = err
 			continue
 		}
-		data, err := io.ReadAll(resp.Body)
+		data, err := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
 		_ = resp.Body.Close()
 		if err != nil {
 			lastErr = err
@@ -445,17 +435,29 @@ func (m *SingBoxManager) TestNodeMetricWithProgressAndOptions(node Node, metric 
 	if options.UseSystemProxy {
 		upstreamPort = m.getSOCKS5TestProxyPort()
 	}
-	configPath := filepath.Join(m.rootDir, "data", "delay-"+node.ID+".json")
+	dataDir := filepath.Join(m.rootDir, "data")
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		return SpeedResult{}, err
+	}
 	config := buildDelayConfigWithUpstream(node, port, upstreamPort)
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return SpeedResult{}, err
 	}
-	if err := os.MkdirAll(filepath.Dir(configPath), 0755); err != nil {
+	tmpFile, err := os.CreateTemp(dataDir, "delay-*.json")
+	if err != nil {
 		return SpeedResult{}, err
 	}
-	if err := os.WriteFile(configPath, data, 0644); err != nil {
-		return SpeedResult{}, err
+	configPath := tmpFile.Name()
+	_, writeErr := tmpFile.Write(data)
+	closeErr := tmpFile.Close()
+	if writeErr != nil {
+		_ = os.Remove(configPath)
+		return SpeedResult{}, writeErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(configPath)
+		return SpeedResult{}, closeErr
 	}
 	defer os.Remove(configPath)
 
@@ -682,12 +684,23 @@ func resolveTCPPingAddress(address string) (string, error) {
 	call.ip = resolved
 	call.err = err
 
-	// 2. 解析成功后写入缓存
+	// 2. 解析成功后写入缓存（带过期清理与 2048 条上限，防止内存无界增长）
 	if err == nil && resolved != "" {
+		now := time.Now()
 		tcpPingDNSCache.Lock()
+		if len(tcpPingDNSCache.items) >= 2048 {
+			for k, item := range tcpPingDNSCache.items {
+				if now.After(item.expiresAt) {
+					delete(tcpPingDNSCache.items, k)
+				}
+			}
+			if len(tcpPingDNSCache.items) >= 2048 {
+				tcpPingDNSCache.items = make(map[string]tcpPingDNSCacheItem, 256)
+			}
+		}
 		tcpPingDNSCache.items[key] = tcpPingDNSCacheItem{
 			ip:        resolved,
-			expiresAt: time.Now().Add(5 * time.Minute),
+			expiresAt: now.Add(5 * time.Minute),
 		}
 		tcpPingDNSCache.Unlock()
 	}
@@ -718,8 +731,14 @@ func testPingAddress(address string) (int, error) {
 	if address == "" {
 		return 0, errors.New("Ping 地址为空")
 	}
+	if strings.HasPrefix(address, "-") || strings.ContainsAny(address, " \t\r\n/\\;|&") {
+		return 0, errors.New("Ping 地址格式无效")
+	}
 	if resolved, err := resolveTCPPingAddress(address); err == nil && resolved != "" {
 		address = resolved
+	}
+	if strings.HasPrefix(address, "-") {
+		return 0, errors.New("Ping 地址格式无效")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel()
@@ -988,6 +1007,9 @@ func buildHTTPProxyURL(node Node) (*url.URL, error) {
 }
 
 func dialContextFromProxy(dialer proxy.Dialer) func(context.Context, string, string) (net.Conn, error) {
+	if cd, ok := dialer.(proxy.ContextDialer); ok {
+		return cd.DialContext
+	}
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
 		type dialResult struct {
 			conn net.Conn
@@ -1154,7 +1176,7 @@ func testCloudflareTraceGeo(client *http.Client) (string, string, error) {
 }
 
 func testCloudflareTraceGeoContext(ctx context.Context, client *http.Client) (string, string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://cp.cloudflare.com/cdn-cgi/trace", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://cp.cloudflare.com/cdn-cgi/trace", nil)
 	if err != nil {
 		return "", "", err
 	}
@@ -1534,8 +1556,11 @@ func measureMultiStreamDownload(client *http.Client, target string, duration tim
 		}
 	}()
 
+	var tickerDone chan struct{}
 	if sample != nil {
+		tickerDone = make(chan struct{})
 		go func() {
+			defer close(tickerDone)
 			ticker := time.NewTicker(speedProgressInterval)
 			defer ticker.Stop()
 			for {
@@ -1614,6 +1639,10 @@ func measureMultiStreamDownload(client *http.Client, target string, duration tim
 		}()
 	}
 	wg.Wait()
+	stopTransfer()
+	if tickerDone != nil {
+		<-tickerDone
+	}
 
 	if mbps := meter.currentMbps(); mbps > 0 {
 		return mbps, nil
@@ -1650,8 +1679,11 @@ func measureMultiStreamUpload(client *http.Client, target string, duration time.
 		}
 	}()
 
+	var tickerDone chan struct{}
 	if sample != nil {
+		tickerDone = make(chan struct{})
 		go func() {
+			defer close(tickerDone)
 			ticker := time.NewTicker(speedProgressInterval)
 			defer ticker.Stop()
 			for {
@@ -1723,6 +1755,10 @@ func measureMultiStreamUpload(client *http.Client, target string, duration time.
 		}()
 	}
 	wg.Wait()
+	stopTransfer()
+	if tickerDone != nil {
+		<-tickerDone
+	}
 
 	if mbps := meter.currentMbps(); mbps > 0 {
 		return mbps, nil
@@ -1749,94 +1785,12 @@ func (r *meteredSliceReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func copyUntilDone(dst io.Writer, src io.Reader, ctx context.Context, start time.Time, sample speedSampleFunc) (int64, error) {
-	buf := make([]byte, 32*1024)
-	var written int64
-	lastSample := time.Now()
-	for {
-		select {
-		case <-ctx.Done():
-			return written, nil
-		default:
-		}
-		n, err := src.Read(buf)
-		if n > 0 {
-			w, writeErr := dst.Write(buf[:n])
-			written += int64(w)
-			if writeErr != nil {
-				return written, writeErr
-			}
-			if w != n {
-				return written, io.ErrShortWrite
-			}
-			if sample != nil && time.Since(lastSample) >= speedProgressInterval {
-				sample(mbpsFromBytes(written, time.Since(start)))
-				lastSample = time.Now()
-			}
-		}
-		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) && written > 0 {
-				return written, nil
-			}
-			if err == io.EOF {
-				return written, nil
-			}
-			return written, err
-		}
-	}
-}
-
 func mbpsFromBytes(bytesCount int64, elapsed time.Duration) float64 {
 	seconds := elapsed.Seconds()
 	if bytesCount <= 0 || seconds <= 0 {
 		return 0
 	}
 	return float64(bytesCount) * 8 / seconds / 1000 / 1000
-}
-
-type timedUploadReader struct {
-	deadline   time.Time
-	start      time.Time
-	data       []byte
-	limit      int64
-	written    int64
-	lastSample time.Time
-	sample     speedSampleFunc
-}
-
-func newTimedUploadReader(duration time.Duration, limit int, sample speedSampleFunc) *timedUploadReader {
-	now := time.Now()
-	return &timedUploadReader{
-		deadline:   now.Add(duration),
-		start:      now,
-		data:       make([]byte, 32*1024),
-		limit:      int64(limit),
-		lastSample: now,
-		sample:     sample,
-	}
-}
-
-func (r *timedUploadReader) Read(p []byte) (int, error) {
-	if time.Now().After(r.deadline) || r.written >= r.limit {
-		return 0, io.EOF
-	}
-	if remain := r.limit - r.written; int64(len(p)) > remain {
-		p = p[:remain]
-	}
-	n := copy(p, r.data)
-	r.written += int64(n)
-	if r.sample != nil && time.Since(r.lastSample) >= speedProgressInterval {
-		r.sample(mbpsFromBytes(r.written, time.Since(r.start)))
-		r.lastSample = time.Now()
-	}
-	return n, nil
-}
-
-func (r *timedUploadReader) BytesWritten() int64 {
-	if r == nil {
-		return 0
-	}
-	return r.written
 }
 
 func buildDelayConfig(node Node, port int) map[string]interface{} {

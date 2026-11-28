@@ -3,12 +3,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/windows"
 )
@@ -80,7 +82,9 @@ func gracefulStopSingBox(pid int) error {
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(exe, sendCtrlBreakArgPrefix+strconv.Itoa(pid))
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, exe, sendCtrlBreakArgPrefix+strconv.Itoa(pid))
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
 		CreationFlags: windows.CREATE_NO_WINDOW,

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 type portProcess struct {
@@ -81,11 +84,17 @@ func findTCPPortsProcessesNative(ports []int) (map[int][]portProcess, error) {
 
 	result := make(map[int][]portProcess)
 	// 2 = AF_INET (IPv4), 23 = AF_INET6 (IPv6)
+	var firstErr error
+	succeeded := 0
 	for _, family := range []uint32{2, 23} {
 		table, err := getExtendedTcpTableNative(family)
 		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
 			continue
 		}
+		succeeded++
 		for port, pids := range table {
 			if !targetPorts[port] {
 				continue
@@ -104,37 +113,59 @@ func findTCPPortsProcessesNative(ports []int) (map[int][]portProcess, error) {
 			}
 		}
 	}
+	if succeeded == 0 && firstErr != nil {
+		return nil, firstErr
+	}
 	return result, nil
 }
 
+var (
+	portIphlpapiDLL               = windows.NewLazySystemDLL("iphlpapi.dll")
+	procPortGetExtendedTcpTable   = portIphlpapiDLL.NewProc("GetExtendedTcpTable")
+	portKernel32DLL               = windows.NewLazySystemDLL("kernel32.dll")
+	procPortOpenProcess           = portKernel32DLL.NewProc("OpenProcess")
+	procPortQueryFullImageNameW   = portKernel32DLL.NewProc("QueryFullProcessImageNameW")
+	procPortGetExitCodeProcess    = portKernel32DLL.NewProc("GetExitCodeProcess")
+	procPortCloseHandle           = portKernel32DLL.NewProc("CloseHandle")
+)
+
 func getExtendedTcpTableNative(family uint32) (map[int][]int, error) {
-	iphlpapi := syscall.NewLazyDLL("iphlpapi.dll")
-	procGetExtendedTcpTable := iphlpapi.NewProc("GetExtendedTcpTable")
-
-	var size uint32 = 0
-	ret, _, _ := procGetExtendedTcpTable.Call(
-		0,
-		uintptr(unsafe.Pointer(&size)),
-		0,
-		uintptr(family),
-		uintptr(3), // TCP_TABLE_OWNER_PID_LISTENER
-		0,
-	)
-	if size == 0 {
-		return nil, syscall.Errno(ret)
+	const errorInsufficientBuffer = 122
+	var buf []byte
+	for attempt := 0; attempt < 3; attempt++ {
+		var size uint32
+		ret, _, _ := procPortGetExtendedTcpTable.Call(
+			0,
+			uintptr(unsafe.Pointer(&size)),
+			0,
+			uintptr(family),
+			uintptr(3), // TCP_TABLE_OWNER_PID_LISTENER
+			0,
+		)
+		if size < 4 {
+			if ret == 0 {
+				return map[int][]int{}, nil
+			}
+			return nil, syscall.Errno(ret)
+		}
+		buf = make([]byte, size)
+		ret, _, _ = procPortGetExtendedTcpTable.Call(
+			uintptr(unsafe.Pointer(&buf[0])),
+			uintptr(unsafe.Pointer(&size)),
+			0,
+			uintptr(family),
+			uintptr(3),
+			0,
+		)
+		if ret == 0 {
+			break
+		}
+		if ret != errorInsufficientBuffer || attempt == 2 {
+			return nil, syscall.Errno(ret)
+		}
 	}
-
-	buf := make([]byte, size)
-	ret, _, _ = procGetExtendedTcpTable.Call(
-		uintptr(unsafe.Pointer(&buf[0])),
-		uintptr(unsafe.Pointer(&size)),
-		0,
-		uintptr(family),
-		uintptr(3),
-		0,
-	)
-	if ret != 0 {
-		return nil, syscall.Errno(ret)
+	if len(buf) < 4 {
+		return map[int][]int{}, nil
 	}
 
 	numEntries := binary.LittleEndian.Uint32(buf[0:4])
@@ -188,10 +219,9 @@ func getProcessInfoByPIDNative(pid int) (name string, exePath string) {
 	if pid <= 0 {
 		return "", ""
 	}
-	kernel32 := syscall.NewLazyDLL("kernel32.dll")
-	procOpenProcess := kernel32.NewProc("OpenProcess")
-	procQueryFullProcessImageNameW := kernel32.NewProc("QueryFullProcessImageNameW")
-	procCloseHandle := kernel32.NewProc("CloseHandle")
+	procOpenProcess := procPortOpenProcess
+	procQueryFullProcessImageNameW := procPortQueryFullImageNameW
+	procCloseHandle := procPortCloseHandle
 
 	const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
@@ -351,40 +381,40 @@ func isWindowsProcessRunning(pid int) bool {
 	if runtime.GOOS != "windows" || pid <= 0 {
 		return false
 	}
-	kernel32 := syscall.NewLazyDLL("kernel32.dll")
-	procOpenProcess := kernel32.NewProc("OpenProcess")
-	procGetExitCodeProcess := kernel32.NewProc("GetExitCodeProcess")
-	procCloseHandle := kernel32.NewProc("CloseHandle")
-
 	const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 	const STILL_ACTIVE = 259
 
-	hProcess, _, _ := procOpenProcess.Call(uintptr(PROCESS_QUERY_LIMITED_INFORMATION), 0, uintptr(pid))
+	hProcess, _, callErr := procPortOpenProcess.Call(uintptr(PROCESS_QUERY_LIMITED_INFORMATION), 0, uintptr(pid))
 	if hProcess != 0 {
-		defer procCloseHandle.Call(hProcess)
+		defer procPortCloseHandle.Call(hProcess)
 		var exitCode uint32
-		ret, _, _ := procGetExitCodeProcess.Call(hProcess, uintptr(unsafe.Pointer(&exitCode)))
+		ret, _, _ := procPortGetExitCodeProcess.Call(hProcess, uintptr(unsafe.Pointer(&exitCode)))
 		if ret != 0 {
 			return exitCode == STILL_ACTIVE
 		}
-	}
-
-	tasklistPath := filepath.Join(os.Getenv("SystemRoot"), "System32", "tasklist.exe")
-	if _, err := os.Stat(tasklistPath); err != nil {
-		tasklistPath = "tasklist"
-	}
-	out, err := runCommandOutput(tasklistPath, "/FI", "PID eq "+strconv.Itoa(pid), "/NH")
-	if err != nil {
+	} else if errors.Is(callErr, windows.ERROR_INVALID_PARAMETER) {
+		return false
+	} else if errors.Is(callErr, windows.ERROR_ACCESS_DENIED) {
 		return true
 	}
-	text := strings.TrimSpace(out)
-	if text == "" {
+
+	tasklistPath := systemBinaryPath("tasklist.exe")
+	out, err := runCommandOutput(tasklistPath, "/FI", "PID eq "+strconv.Itoa(pid), "/FO", "CSV", "/NH")
+	if err != nil {
 		return false
 	}
-	if strings.Contains(strings.ToLower(text), "no tasks") || strings.Contains(text, "没有运行") || strings.Contains(text, "信息:") {
-		return false
+	pidStr := strconv.Itoa(pid)
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.HasPrefix(line, `"`) {
+			continue
+		}
+		fields := strings.Split(line, `","`)
+		if len(fields) >= 2 && strings.Trim(fields[1], `"`) == pidStr {
+			return true
+		}
 	}
-	return strings.Contains(text, strconv.Itoa(pid))
+	return false
 }
 
 func waitTCPPortFreeStrict(host string, port int, timeout time.Duration) bool {

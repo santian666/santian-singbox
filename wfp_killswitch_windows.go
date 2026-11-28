@@ -432,8 +432,8 @@ func parseWFPV4AddrMask(cidr string) (wfpV4AddrAndMask, error) {
 	if err != nil {
 		return wfpV4AddrAndMask{}, fmt.Errorf("无效 IPv4 CIDR %q: %w", cidr, err)
 	}
-	addr := prefix.Addr().Unmap()
-	if !addr.Is4() {
+	addr := prefix.Addr()
+	if !addr.Is4() || addr.Is4In6() {
 		return wfpV4AddrAndMask{}, fmt.Errorf("期望 IPv4 CIDR，实际为 %q", cidr)
 	}
 	bits := prefix.Bits()
@@ -893,13 +893,6 @@ func disableWFPKillSwitch(logger *Logger) error {
 
 	backend := activeWFPBackend
 	engine := wfpKS.engine
-	wfpKS.active = false
-	wfpKS.engine = 0
-	wfpKS.sublayerKey = windows.GUID{}
-	wfpKS.corePath = ""
-	wfpKS.appPath = ""
-	wfpKS.filterCount = 0
-
 	if backend != nil && engine != 0 {
 		if err := backend.EngineClose(engine); err != nil {
 			if logger != nil {
@@ -908,6 +901,12 @@ func disableWFPKillSwitch(logger *Logger) error {
 			return err
 		}
 	}
+	wfpKS.active = false
+	wfpKS.engine = 0
+	wfpKS.sublayerKey = windows.GUID{}
+	wfpKS.corePath = ""
+	wfpKS.appPath = ""
+	wfpKS.filterCount = 0
 	if logger != nil {
 		logger.Info("【WFP 内核防泄露】已释放动态内存防护会话，系统网络恢复正常直连。")
 	}

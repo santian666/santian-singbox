@@ -56,7 +56,7 @@ func (a *App) ExportBackup() (path string, err error) {
 	if !strings.HasSuffix(strings.ToLower(path), ".json") {
 		path += ".santian-backup.json"
 	}
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := os.WriteFile(path, data, 0600); err != nil {
 		return "", err
 	}
 	a.logger.Info("已导出配置备份：%s", path)
@@ -140,6 +140,38 @@ func parseNodeBackup(data []byte) (NodeBackupFile, error) {
 	}
 	if err := validateExternalProxyEndpoints(backup.ExternalProxyEndpoints); err != nil {
 		return NodeBackupFile{}, fmt.Errorf("备份文件的外部代理入口无效：%w", err)
+	}
+	// 严格校验并清洗外部备份中的 GroupID / NodeID，防止 XSS 与路径穿越
+	groupIDRemap := make(map[string]string, len(backup.Groups))
+	for i := range backup.Groups {
+		rawID := strings.TrimSpace(backup.Groups[i].ID)
+		if rawID == "" {
+			rawID = fmt.Sprintf("grp-%d", i)
+		}
+		safeID := sanitizeEntityID("grp", rawID)
+		groupIDRemap[backup.Groups[i].ID] = safeID
+		groupIDRemap[rawID] = safeID
+		backup.Groups[i].ID = safeID
+	}
+	nodeIDRemap := make(map[string]string, len(backup.Nodes))
+	nodeIDSeen := make(map[string]bool, len(backup.Nodes))
+	for i := range backup.Nodes {
+		rawID := backup.Nodes[i].ID
+		safeID := sanitizeEntityID("node", rawID)
+		if nodeIDSeen[safeID] {
+			safeID = sanitizeEntityID("node", fmt.Sprintf("%s#%d", rawID, i))
+		}
+		nodeIDSeen[safeID] = true
+		nodeIDRemap[rawID] = safeID
+		backup.Nodes[i].ID = safeID
+		if mapped, ok := groupIDRemap[backup.Nodes[i].GroupID]; ok {
+			backup.Nodes[i].GroupID = mapped
+		}
+	}
+	if mapped, ok := nodeIDRemap[backup.SelectedID]; ok {
+		backup.SelectedID = mapped
+	} else if backup.SelectedID != "" && !isSafeEntityID(backup.SelectedID) {
+		backup.SelectedID = ""
 	}
 	return backup, nil
 }

@@ -5,6 +5,8 @@ import (
 	"strings"
 )
 
+// requiredRuntimeBins lists external companion binaries expected under <appRoot>/bin/.
+// (Historically named embeddedBinNames; binaries are shipped alongside the executable rather than via go:embed.)
 var embeddedBinNames = []string{
 	"sing-box.exe",
 	"nexttrace.exe",

@@ -104,16 +104,3 @@ func validateAppProxyTarget(target AppProxyTarget) (AppProxyTarget, error) {
 	target.Name = appProxyTargetName(target.Type, target.Path)
 	return target, nil
 }
-
-func sortStrings(items []string) []string {
-	for i := 1; i < len(items); i++ {
-		value := items[i]
-		j := i - 1
-		for j >= 0 && strings.ToLower(items[j]) > strings.ToLower(value) {
-			items[j+1] = items[j]
-			j--
-		}
-		items[j+1] = value
-	}
-	return items
-}
