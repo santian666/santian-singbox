@@ -291,7 +291,7 @@ func TestTikTokIsNotBlockedInProxyModes(t *testing.T) {
 				if rule["rule_set"] == "loyalsoldier-reject" {
 					t.Fatalf("%s 不应引用 TikTok 所在的 reject 黑名单规则集：%v", item.name, rule)
 				}
-				if rule["outbound"] == "block" && !isTunStabilityBlockRule(rule) && !isLocalMetadataBlockRule(rule) {
+				if (rule["outbound"] == "block" || rule["action"] == "reject") && !isTunStabilityBlockRule(rule) && !isLocalMetadataBlockRule(rule) {
 					t.Fatalf("%s 不应包含普通网站拉黑规则：%v", item.name, rule)
 				}
 			}
@@ -1163,7 +1163,7 @@ func TestGlobalModeAllowsOnlyTunStabilityBlockRules(t *testing.T) {
 	rules := route["rules"].([]map[string]interface{})
 	hasTunBlock := false
 	for _, rule := range rules {
-		if rule["outbound"] != "block" {
+		if rule["outbound"] != "block" && rule["action"] != "reject" {
 			continue
 		}
 		if isTunStabilityBlockRule(rule) {
@@ -3273,7 +3273,7 @@ func hasTunStabilityBlockRule(config map[string]interface{}) bool {
 	route, _ := config["route"].(map[string]interface{})
 	rules, _ := route["rules"].([]map[string]interface{})
 	for _, rule := range rules {
-		if rule["outbound"] != "block" || rule["port"] == nil {
+		if (rule["outbound"] != "block" && rule["action"] != "reject") || rule["port"] == nil {
 			continue
 		}
 		inbounds, _ := rule["inbound"].([]string)

@@ -10,7 +10,7 @@ func TestSTUNPortsBlockedInTunStabilityRules(t *testing.T) {
 	var stunBlocked bool
 	expectedPorts := []int{3478, 3479, 5349, 19302, 19305}
 	for _, rule := range rules {
-		if rule["outbound"] == "block" && rule["network"] == "udp" {
+		if (rule["action"] == "reject" || rule["outbound"] == "block") && rule["network"] == "udp" {
 			ports, ok := rule["port"].([]int)
 			if !ok {
 				continue

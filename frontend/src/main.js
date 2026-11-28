@@ -2437,7 +2437,7 @@ var ia = ln((an, sn) => {
     c("coreVersion").textContent = (appVer ? `客户端 v${appVer} · ` : ``) + `内核 ${e.coreVersion || "内核未知"}`;
     c("coreVersion").title = `客户端软件版本: v${appVer || "未知"} | sing-box 内核版本: ${e.coreVersion || "未知"}`;
     (updateTrafficMonitor(e),
-      On(e.nodes || [], e.selectedId),
+      On(e.nodes || [], e.selectedId, e),
       _n(e.rulePresets || []),
       t &&
         ((c("mixedPort").value = s.settings.mixedPort || 20808),
@@ -2566,11 +2566,18 @@ var ia = ln((an, sn) => {
       (c("trafficDownload").textContent = `下载 ${r}`),
       i && (i.title = `实时流量：上传 ${a} / 下载 ${r}`));
   }
-  function On(e, t) {
+  function On(e, t, state = null) {
     const n = e.find((i) => i.id === t),
       a = (n == null ? void 0 : n.name) || "未选择",
-      r = c("currentNode");
-    ((r.querySelector("strong").textContent = a), (r.title = "当前节点：" + a), r.classList.toggle("empty", !n));
+      r = c("currentNode"),
+      exitIp = String((state == null ? void 0 : state.exitIp) || "").trim(),
+      exitCountry = String((state == null ? void 0 : state.exitCountry) || "").trim(),
+      exitMismatch = String((state == null ? void 0 : state.exitMismatch) || "").trim(),
+      exitTag = exitIp ? ` (${exitIp}${exitCountry ? " " + exitCountry : ""})` : "";
+    r.querySelector("strong").textContent = a + exitTag;
+    r.title = exitMismatch ? `当前节点：${a} | ${exitMismatch}` : `当前节点：${a}${exitTag}`;
+    r.classList.toggle("empty", !n);
+    r.classList.toggle("mismatch", Boolean(exitMismatch));
   }
   function Zn(e = {}, t = e.configMode || {}) {
     var o;
@@ -2911,7 +2918,7 @@ var ia = ln((an, sn) => {
             const targetId = x.select;
             if (!s.lastState) return;
             const prevCommitted = s.committedSelectedId || s.lastState.selectedId || "";
-            if ((s.lastState.selectedId || "") === targetId && s.committedSelectedId === targetId) return;
+            if (!s.lastState.running && (s.lastState.selectedId || "") === targetId && s.committedSelectedId === targetId) return;
             const reqSeq = (s.selectNodeReqSeq = (s.selectNodeReqSeq || 0) + 1);
             s.selectingNodeId = targetId;
             s.lastState.selectedId = targetId;

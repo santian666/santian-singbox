@@ -809,6 +809,69 @@ func (m *SingBoxManager) CachedRuntimeInfo() (ConfigMode, bool, bool) {
 	return m.cachedConfigMode, m.cachedTunActive, true
 }
 
+func (m *SingBoxManager) ensureCacheDBSelectedTag(selectedTag string) {
+	if m == nil || strings.TrimSpace(m.cachePath) == "" || strings.TrimSpace(selectedTag) == "" {
+		return
+	}
+	markerPath := filepath.Join(filepath.Dir(m.cachePath), "cache-selected.tag")
+	prevBytes, err := os.ReadFile(markerPath)
+	prevTag := strings.TrimSpace(string(prevBytes))
+	if err != nil || prevTag != selectedTag {
+		if _, statErr := os.Stat(m.cachePath); statErr == nil {
+			if rmErr := os.Remove(m.cachePath); rmErr == nil && m.logger != nil {
+				m.logger.Info("检测到目标节点变更或旧版缓存（%q -> %q），已清理旧 cache.db 防止选区覆盖", prevTag, selectedTag)
+			}
+		}
+	}
+	_ = os.MkdirAll(filepath.Dir(markerPath), 0755)
+	_ = atomicWriteFile(markerPath, []byte(selectedTag), 0644)
+}
+
+func (m *SingBoxManager) SyncSelectedDefault(selectedTag string) {
+	if m == nil || strings.TrimSpace(m.config) == "" || strings.TrimSpace(selectedTag) == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ensureCacheDBSelectedTag(selectedTag)
+	data, err := os.ReadFile(m.config)
+	if err != nil {
+		return
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return
+	}
+	outbounds, ok := cfg["outbounds"].([]interface{})
+	if !ok {
+		return
+	}
+	updated := false
+	for _, ob := range outbounds {
+		obMap, ok := ob.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if obMap["type"] == "selector" && obMap["tag"] == "proxy" {
+			if obMap["default"] != selectedTag {
+				obMap["default"] = selectedTag
+				updated = true
+			}
+			break
+		}
+	}
+	if !updated {
+		return
+	}
+	newData, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := atomicWriteFile(m.config, newData, 0644); err == nil {
+		m.lastVerifiedConfigHash = m.computeConfigVerificationHash(newData)
+	}
+}
+
 func (m *SingBoxManager) FlushDNS() error {
 	req, err := http.NewRequest(http.MethodPost, "http://"+clashAPIAddress+"/dns/flush", nil)
 	if err != nil {
@@ -1324,6 +1387,7 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 	if effectiveTun(state.Settings) && runtime.GOOS == "windows" {
 		ensureCleanTunBeforeStart(m.logger)
 	}
+	m.ensureCacheDBSelectedTag(nodeOutboundTag(node))
 
 	cmd := exec.Command(m.corePath, "run", "-c", m.config)
 	cmd.Dir = m.rootDir
@@ -1386,6 +1450,12 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 		if err != nil {
 			_ = m.stopLocked(false, true, true)
 			return fmt.Errorf("代理映射端口 %d 未能监听：%w", port, err)
+		}
+	}
+	if selectedTag := nodeOutboundTag(node); selectedTag != "" {
+		if err := m.SelectOutboundVerified(selectedTag); err != nil {
+			_ = m.stopLocked(false, true, true)
+			return fmt.Errorf("启动同步所选节点失败：%w", err)
 		}
 	}
 	if err := m.ValidateRuntimeSettings(state.Settings); err != nil {
@@ -2415,7 +2485,7 @@ func isTunStabilityBlockRule(rule map[string]interface{}) bool {
 }
 
 func isLocalMetadataBlockRule(rule map[string]interface{}) bool {
-	if rule["outbound"] != "block" {
+	if rule["action"] != "reject" && rule["outbound"] != "block" {
 		return false
 	}
 	return stringSlicesEqual(configStringValues(rule["ip_cidr"]), localMetadataIPCIDRs)
@@ -3279,10 +3349,9 @@ func buildRouteRulesForSelected(settings Settings, nodes []Node, selected Node, 
 		rules = append(rules, buildTunStabilityRouteRules()...)
 		rules = append(rules,
 			map[string]interface{}{
-				"inbound":  []string{"tun-in"},
-				"port":     []int{853},
-				"action":   "route",
-				"outbound": "block",
+				"inbound": []string{"tun-in"},
+				"port":    []int{853},
+				"action":  "reject",
 			},
 			map[string]interface{}{
 				"inbound": []string{"tun-in"},
@@ -3515,9 +3584,8 @@ func isConfigFakeDNSEnabled(config map[string]interface{}) bool {
 
 func buildLocalMetadataBlockRouteRule() map[string]interface{} {
 	return map[string]interface{}{
-		"ip_cidr":  append([]string(nil), localMetadataIPCIDRs...),
-		"action":   "route",
-		"outbound": "block",
+		"ip_cidr": append([]string(nil), localMetadataIPCIDRs...),
+		"action":  "reject",
 	}
 }
 
@@ -3536,29 +3604,25 @@ func buildTunStabilityRouteRules() []map[string]interface{} {
 			"outbound":     "direct",
 		},
 		{
-			"inbound":  []string{"tun-in"},
-			"network":  "udp",
-			"port":     []int{135, 137, 138, 139, 443, 1900, 3478, 3479, 5349, 5353, 19302, 19303, 19304, 19305, 19306, 19307, 19308, 19309},
-			"action":   "route",
-			"outbound": "block",
+			"inbound": []string{"tun-in"},
+			"network": "udp",
+			"port":    []int{135, 137, 138, 139, 443, 1900, 3478, 3479, 5349, 5353, 19302, 19303, 19304, 19305, 19306, 19307, 19308, 19309},
+			"action":  "reject",
 		},
 		{
 			"inbound":  []string{"tun-in"},
 			"protocol": "stun",
-			"action":   "route",
-			"outbound": "block",
+			"action":   "reject",
 		},
 		{
-			"inbound":  []string{"tun-in"},
-			"ip_cidr":  append([]string(nil), tunBlockIPCIDRs...),
-			"action":   "route",
-			"outbound": "block",
+			"inbound": []string{"tun-in"},
+			"ip_cidr": append([]string(nil), tunBlockIPCIDRs...),
+			"action":  "reject",
 		},
 		{
 			"inbound":        []string{"tun-in"},
 			"source_ip_cidr": append([]string(nil), tunBlockIPCIDRs...),
-			"action":         "route",
-			"outbound":       "block",
+			"action":         "reject",
 		},
 	}
 }

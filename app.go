@@ -101,6 +101,10 @@ type App struct {
 	directDNSChecker            *directDNSHealthChecker
 	batchTestMu                 sync.Mutex
 	currentBatchJob             *batchTestJobRunner
+	exitInfoMu                  sync.Mutex
+	exitIP                      string
+	exitCountry                 string
+	exitMismatch                string
 }
 
 type proxyEntrySnapshot struct {
@@ -593,6 +597,7 @@ func (a *App) stopProxyForUser() error {
 	a.cleanupProxyResiduals(cleanupTun)
 	a.resetTrafficTracking()
 	a.clearNetworkHealth()
+	a.clearExitInfo()
 	return result
 }
 
@@ -672,6 +677,7 @@ func (a *App) State() (result RuntimeState) {
 		appReleaseNotes = a.appUpdater.lastInfo.ReleaseNotes
 	}
 	healthStatus, healthTitle, healthMessage, healthSeq := a.currentNetworkHealth()
+	exitIP, exitCountry, exitMismatch := a.currentExitInfo()
 	return RuntimeState{
 		Running:              a.manager != nil && a.manager.Running(),
 		AppVersion:           AppVersion,
@@ -699,6 +705,9 @@ func (a *App) State() (result RuntimeState) {
 		NetworkHealthTitle:   healthTitle,
 		NetworkHealthMessage: healthMessage,
 		NetworkFaultSeq:      healthSeq,
+		ExitIP:               exitIP,
+		ExitCountry:          exitCountry,
+		ExitMismatch:         exitMismatch,
 	}
 }
 
@@ -1665,8 +1674,10 @@ func (a *App) selectNodeLocked(id string) error {
 	}
 	a.markTunConnectivityHealthy(state.Settings)
 	a.clearNetworkHealth()
+	a.manager.SyncSelectedDefault(selectedTag)
 	a.refreshEnvironmentOnSwitch(reloaded || effectiveTun(state.Settings) || state.Settings.FakeDNS)
-	a.logger.Info("节点切换已确认：%s", selectedNodeLogName(state.Nodes, id))
+	a.verifyActiveExitIPAsync(id, node, state.Settings.MixedPort)
+	a.logger.Info("节点切换已确认：%s (%s)", selectedNodeLogName(state.Nodes, id), selectedTag)
 	a.emitState()
 	return nil
 }
@@ -3698,6 +3709,9 @@ func (a *App) startLocked() error {
 	a.clearNetworkHealth()
 	a.initTrafficBaseline(state.SelectedID, state.Nodes)
 	a.refreshEnvironmentOnSwitch(effectiveTun(state.Settings) || state.Settings.FakeDNS)
+	if node, ok := findSelectedNode(state.Nodes, state.SelectedID); ok {
+		a.verifyActiveExitIPAsync(state.SelectedID, node, state.Settings.MixedPort)
+	}
 	a.emitState()
 	safeGo(a.logger, "代理开启后检查更新", a.onProxyStarted)
 	return nil
@@ -4378,6 +4392,71 @@ func (a *App) currentNetworkHealth() (string, string, string, int64) {
 
 func (a *App) clearNetworkHealth() {
 	a.setNetworkHealth("", "", "", false)
+}
+
+func (a *App) currentExitInfo() (string, string, string) {
+	if a == nil {
+		return "", "", ""
+	}
+	a.exitInfoMu.Lock()
+	defer a.exitInfoMu.Unlock()
+	return a.exitIP, a.exitCountry, a.exitMismatch
+}
+
+func (a *App) clearExitInfo() {
+	if a == nil {
+		return
+	}
+	a.exitInfoMu.Lock()
+	changed := a.exitIP != "" || a.exitCountry != "" || a.exitMismatch != ""
+	a.exitIP = ""
+	a.exitCountry = ""
+	a.exitMismatch = ""
+	a.exitInfoMu.Unlock()
+	if changed {
+		a.emitState()
+	}
+}
+
+func (a *App) verifyActiveExitIPAsync(nodeID string, node Node, mixedPort int) {
+	if a == nil || a.manager == nil || mixedPort <= 0 {
+		return
+	}
+	a.clearExitInfo()
+	ctx, cancelProbe := a.registerProbeContext()
+	safeGo(a.logger, "核验真实出口IP", func() {
+		defer cancelProbe()
+		if ctx.Err() != nil || !a.manager.Running() {
+			return
+		}
+		client, err := localMixedProxyHTTPClient(mixedPort, 5*time.Second)
+		if err != nil || ctx.Err() != nil {
+			return
+		}
+		ip, country, err := testOutboundInfo(client)
+		if err != nil || ctx.Err() != nil || strings.TrimSpace(ip) == "" {
+			return
+		}
+		if a.store != nil && a.store.Snapshot().SelectedID != nodeID {
+			return
+		}
+		expected := detectNodeRegion(node)
+		mismatch := ""
+		if expected != "" && country != "" && !strings.EqualFold(expected, country) {
+			mismatch = fmt.Sprintf("节点标称 %s，实际落地 %s (%s)", expected, country, ip)
+			if a.logger != nil {
+				a.logger.Info("【出口核验】节点 [%s (%s)] 标称地区 %s，实际出口：%s (%s)", node.Name, nodeOutboundTag(node), expected, ip, country)
+			}
+		} else if a.logger != nil {
+			a.logger.Info("【出口核验】节点 [%s (%s)] 实际出口：%s (%s)", node.Name, nodeOutboundTag(node), ip, country)
+		}
+		a.exitInfoMu.Lock()
+		a.exitIP = ip
+		a.exitCountry = country
+		a.exitMismatch = mismatch
+		a.exitInfoMu.Unlock()
+		a.emitState()
+	})
 }
 
 func (a *App) setNetworkHealth(status, title, message string, triggerAlert bool) {

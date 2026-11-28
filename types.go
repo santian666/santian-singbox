@@ -126,6 +126,9 @@ type RuntimeState struct {
 	NetworkHealthTitle   string       `json:"networkHealthTitle,omitempty"`
 	NetworkHealthMessage string       `json:"networkHealthMessage,omitempty"`
 	NetworkFaultSeq      int64        `json:"networkFaultSeq,omitempty"`
+	ExitIP               string       `json:"exitIp,omitempty"`
+	ExitCountry          string       `json:"exitCountry,omitempty"`
+	ExitMismatch         string       `json:"exitMismatch,omitempty"`
 }
 
 type RulePreset struct {

@@ -538,3 +538,69 @@ func TestMultiStreamSpeedtestExcludesHandshakeLatency(t *testing.T) {
 	}
 	t.Logf("multi-stream localhost speedtest (with 250ms TTFB): download=%.2f Mbps, upload=%.2f Mbps", dlMbps, ulMbps)
 }
+
+func TestEnsureCacheDBSelectedTagAndSyncSelectedDefault(t *testing.T) {
+	dir := t.TempDir()
+	cachePath := filepath.Join(dir, "cache.db")
+	configPath := filepath.Join(dir, "sing-box.json")
+	if err := os.WriteFile(cachePath, []byte("stale-bbolt-cache"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	m := &SingBoxManager{cachePath: cachePath, config: configPath}
+
+	// First run / upgrade without marker should remove stale cache.db and write marker.
+	m.ensureCacheDBSelectedTag("node-sg-1")
+	if _, err := os.Stat(cachePath); !os.IsNotExist(err) {
+		t.Fatalf("expected stale cache.db to be removed on upgrade/mismatch, got err=%v", err)
+	}
+
+	// Recreate cache.db and verify same tag preserves it.
+	if err := os.WriteFile(cachePath, []byte("fresh-fakeip-cache"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	m.ensureCacheDBSelectedTag("node-sg-1")
+	if _, err := os.Stat(cachePath); err != nil {
+		t.Fatalf("expected cache.db to be preserved when selected tag matches, got err=%v", err)
+	}
+
+	// Changing target tag offline must remove cache.db so old selection cannot override default.
+	m.ensureCacheDBSelectedTag("node-jp-2")
+	if _, err := os.Stat(cachePath); !os.IsNotExist(err) {
+		t.Fatalf("expected cache.db to be removed when target tag changes, got err=%v", err)
+	}
+
+	// SyncSelectedDefault updates proxy selector default in sing-box.json.
+	cfg := map[string]interface{}{
+		"outbounds": []interface{}{
+			map[string]interface{}{"type": "selector", "tag": "proxy", "default": "node-sg-1"},
+		},
+	}
+	raw, _ := json.MarshalIndent(cfg, "", "  ")
+	if err := os.WriteFile(configPath, raw, 0644); err != nil {
+		t.Fatal(err)
+	}
+	m.SyncSelectedDefault("node-jp-2")
+	updatedRaw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var updatedCfg map[string]interface{}
+	if err := json.Unmarshal(updatedRaw, &updatedCfg); err != nil {
+		t.Fatal(err)
+	}
+	obs := updatedCfg["outbounds"].([]interface{})
+	if got := obs[0].(map[string]interface{})["default"]; got != "node-jp-2" {
+		t.Fatalf("expected proxy default to sync to node-jp-2, got %v", got)
+	}
+}
+
+func TestTunBlockRulesUseActionReject(t *testing.T) {
+	if got := buildLocalMetadataBlockRouteRule()["action"]; got != "reject" {
+		t.Fatalf("expected local metadata rule action=reject, got %v", got)
+	}
+	for _, rule := range buildTunStabilityRouteRules() {
+		if rule["outbound"] == "block" {
+			t.Fatalf("TUN stability rule must use action=reject instead of outbound=block: %+v", rule)
+		}
+	}
+}

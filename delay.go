@@ -902,6 +902,25 @@ func buildNativeProxyClientWithUpstreamTimeout(node Node, upstreamPort int, time
 	}
 }
 
+func localMixedProxyHTTPClient(mixedPort int, timeout time.Duration) (*http.Client, error) {
+	if mixedPort <= 0 {
+		return nil, errors.New("本地代理端口无效")
+	}
+	proxyURL, err := url.Parse("http://127.0.0.1:" + strconv.Itoa(mixedPort))
+	if err != nil {
+		return nil, err
+	}
+	return &http.Client{
+		Timeout: timeout,
+		Transport: &http.Transport{
+			Proxy:                 http.ProxyURL(proxyURL),
+			DisableKeepAlives:     true,
+			TLSHandshakeTimeout:   timeout,
+			ResponseHeaderTimeout: timeout,
+		},
+	}, nil
+}
+
 func isSOCKS5Node(node Node) bool {
 	proxyType := strings.ToLower(firstNonEmpty(stringFromAny(node.Outbound["type"]), node.Type))
 	return proxyType == "socks" || proxyType == "socks5"

@@ -67,7 +67,7 @@ func TestTunStabilityRouteRulesBlocksBroadcastMulticastLoopbackLinkLocal(t *test
 	rules := buildTunStabilityRouteRules()
 	var blockedIPs []string
 	for _, rule := range rules {
-		if rule["outbound"] == "block" && rule["inbound"] != nil {
+		if (rule["action"] == "reject" || rule["outbound"] == "block") && rule["inbound"] != nil {
 			inbounds := configStringValues(rule["inbound"])
 			if stringSliceContains(inbounds, "tun-in") {
 				blockedIPs = append(blockedIPs, configStringValues(rule["ip_cidr"])...)

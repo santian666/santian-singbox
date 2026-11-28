@@ -124,7 +124,7 @@ func TestTunBlocksQUICPort443(t *testing.T) {
 	rules, _ := route["rules"].([]map[string]interface{})
 	foundQUICBlock := false
 	for _, rule := range rules {
-		if rule["outbound"] != "block" {
+		if rule["action"] != "reject" && rule["outbound"] != "block" {
 			continue
 		}
 		inbounds := configStringValues(rule["inbound"])
