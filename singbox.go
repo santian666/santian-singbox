@@ -91,6 +91,14 @@ var domesticDoHBypassDomains = []string{
 	"doh.pub",
 	"sm2.doh.pub",
 	"dns.pub",
+	"doh.360.cn",
+}
+
+var domesticDoHBypassIPCIDRs = []string{
+	"223.5.5.5/32",
+	"223.6.6.6/32",
+	"1.12.12.12/32",
+	"120.53.53.53/32",
 }
 
 var tunBlockIPCIDRs = []string{
@@ -809,6 +817,15 @@ func (m *SingBoxManager) CachedRuntimeInfo() (ConfigMode, bool, bool) {
 	return m.cachedConfigMode, m.cachedTunActive, true
 }
 
+func (m *SingBoxManager) writeCacheSelectedTag(selectedTag string) {
+	if m == nil || strings.TrimSpace(m.cachePath) == "" || strings.TrimSpace(selectedTag) == "" {
+		return
+	}
+	markerPath := filepath.Join(filepath.Dir(m.cachePath), "cache-selected.tag")
+	_ = os.MkdirAll(filepath.Dir(markerPath), 0755)
+	_ = atomicWriteFile(markerPath, []byte(selectedTag), 0644)
+}
+
 func (m *SingBoxManager) ensureCacheDBSelectedTag(selectedTag string) {
 	if m == nil || strings.TrimSpace(m.cachePath) == "" || strings.TrimSpace(selectedTag) == "" {
 		return
@@ -823,8 +840,7 @@ func (m *SingBoxManager) ensureCacheDBSelectedTag(selectedTag string) {
 			}
 		}
 	}
-	_ = os.MkdirAll(filepath.Dir(markerPath), 0755)
-	_ = atomicWriteFile(markerPath, []byte(selectedTag), 0644)
+	m.writeCacheSelectedTag(selectedTag)
 }
 
 func (m *SingBoxManager) SyncSelectedDefault(selectedTag string) {
@@ -833,7 +849,7 @@ func (m *SingBoxManager) SyncSelectedDefault(selectedTag string) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.ensureCacheDBSelectedTag(selectedTag)
+	m.writeCacheSelectedTag(selectedTag)
 	data, err := os.ReadFile(m.config)
 	if err != nil {
 		return
@@ -1426,6 +1442,13 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 		}
 		return fmt.Errorf("sing-box 未能监听本地代理端口 %d，请检查端口是否被占用、节点配置是否可用或内核初始化是否超时：%w", state.Settings.MixedPort, err)
 	}
+	if err := waitPortOrProcessExit("127.0.0.1", clashAPIPort, startupPortTimeout, done); err != nil {
+		reason := m.stopLocked(false, true, true)
+		if reason != nil {
+			return fmt.Errorf("sing-box 启动后已退出：%w", reason)
+		}
+		return fmt.Errorf("sing-box 未能监听内核控制端口 %d：%w", clashAPIPort, err)
+	}
 	if effectiveTun(state.Settings) && runtime.GOOS == "windows" {
 		if err := waitTunReadyOrProcessExit(20*time.Second, done); err != nil {
 			reason := m.stopLocked(false, true, true)
@@ -1453,7 +1476,7 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 		}
 	}
 	if selectedTag := nodeOutboundTag(node); selectedTag != "" {
-		if err := m.SelectOutboundVerified(selectedTag); err != nil {
+		if err := m.SelectOutboundReliable(selectedTag); err != nil {
 			_ = m.stopLocked(false, true, true)
 			return fmt.Errorf("启动同步所选节点失败：%w", err)
 		}
@@ -2235,7 +2258,7 @@ func buildSingBoxConfig(state PersistState, selected Node, cachePath string, inc
 			"level":     coreLogLevel(settings),
 			"timestamp": true,
 		},
-		"dns":       buildDNSConfig(settings, final, dnsPlan, includeRemoteRuleSets, state.Nodes),
+		"dns":       buildDNSConfigForSelected(settings, final, dnsPlan, includeRemoteRuleSets, state.Nodes, selected),
 		"inbounds":  inbounds,
 		"outbounds": outbounds,
 		"route":     route,
@@ -3358,6 +3381,12 @@ func buildRouteRulesForSelected(settings Settings, nodes []Node, selected Node, 
 				"domain":  append([]string(nil), domesticDoHBypassDomains...),
 				"action":  "reject",
 			},
+			map[string]interface{}{
+				"inbound": []string{"tun-in"},
+				"ip_cidr": append([]string(nil), domesticDoHBypassIPCIDRs...),
+				"port":    []int{443},
+				"action":  "reject",
+			},
 		)
 		if !nodeSupportsIPv6(selected) {
 			rules = append(rules, map[string]interface{}{
@@ -3921,6 +3950,10 @@ func probeBestRemoteDNS(candidates []dnsProbeCandidate) (dnsProbeCandidate, int6
 }
 
 func buildDNSConfig(settings Settings, final string, dnsPlan autoDNSPlan, includeRemoteRuleSets bool, nodes []Node) map[string]interface{} {
+	return buildDNSConfigForSelected(settings, final, dnsPlan, includeRemoteRuleSets, nodes, Node{})
+}
+
+func buildDNSConfigForSelected(settings Settings, final string, dnsPlan autoDNSPlan, includeRemoteRuleSets bool, nodes []Node, selected Node) map[string]interface{} {
 	dnsPlan = normalizeAutoDNSPlan(dnsPlan)
 	dnsFinal := "remote"
 	if !includeRemoteRuleSets {
@@ -3969,6 +4002,15 @@ func buildDNSConfig(settings Settings, final string, dnsPlan autoDNSPlan, includ
 		}
 	}
 
+	if effectiveTun(settings) && !nodeSupportsIPv6(selected) {
+		dnsRules = append(dnsRules, map[string]interface{}{
+			"inbound":    []string{"tun-in"},
+			"query_type": []string{"AAAA"},
+			"action":     "predefined",
+			"rcode":      "NOERROR",
+		})
+	}
+
 	directDNSServer := "local"
 	if effectiveTun(settings) {
 		directDNSServer = "direct-dns"
@@ -3984,10 +4026,9 @@ func buildDNSConfig(settings Settings, final string, dnsPlan autoDNSPlan, includ
 
 	if nodeDomains := extractNodeServerDomains(nodes); len(nodeDomains) > 0 {
 		dnsRules = append(dnsRules, map[string]interface{}{
-			"domain":        nodeDomains,
-			"domain_suffix": nodeDomains,
-			"action":        "route",
-			"server":        "direct-dns",
+			"domain": nodeDomains,
+			"action": "route",
+			"server": "direct-dns",
 		})
 	}
 
@@ -4573,10 +4614,14 @@ func wireGuardEndpointFromOutbound(outbound map[string]interface{}) map[string]i
 		return nil
 	}
 	tag := stringFromAny(outbound["tag"])
+	addresses := stringListFromAny(outbound["local_address"])
+	if len(addresses) == 0 {
+		addresses = stringListFromAny(outbound["address"])
+	}
 	endpoint := map[string]interface{}{
 		"type":        "wireguard",
 		"tag":         tag,
-		"address":     stringListFromAny(outbound["local_address"]),
+		"address":     addresses,
 		"private_key": stringFromAny(outbound["private_key"]),
 		"peers": []map[string]interface{}{
 			{
@@ -4668,9 +4713,11 @@ func nodeSupportsIPv6(node Node) bool {
 	}
 	typ := strings.ToLower(strings.TrimSpace(stringFromAny(node.Outbound["type"])))
 	if typ == "wireguard" {
-		for _, item := range stringListFromAny(node.Outbound["address"]) {
-			if strings.Contains(item, ":") {
-				return true
+		for _, field := range []string{"local_address", "address"} {
+			for _, item := range stringListFromAny(node.Outbound[field]) {
+				if strings.Contains(item, ":") {
+					return true
+				}
 			}
 		}
 	}
@@ -4691,10 +4738,17 @@ func applyOutboundStealthDefaults(outbound map[string]interface{}) map[string]in
 	if !ok || tls == nil || !boolFromAny(tls["enabled"]) {
 		return outbound
 	}
-	if _, hasUTLS := tls["utls"]; !hasUTLS {
+	utlsRaw, hasUTLS := tls["utls"]
+	if !hasUTLS || utlsRaw == nil {
 		tls["utls"] = map[string]interface{}{
 			"enabled":     true,
 			"fingerprint": "chrome",
+		}
+		return outbound
+	}
+	if utlsMap, ok := utlsRaw.(map[string]interface{}); ok && boolFromAny(utlsMap["enabled"]) {
+		if strings.TrimSpace(stringFromAny(utlsMap["fingerprint"])) == "" {
+			utlsMap["fingerprint"] = "chrome"
 		}
 	}
 	return outbound

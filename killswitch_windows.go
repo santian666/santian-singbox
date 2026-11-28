@@ -246,9 +246,17 @@ func enableKillSwitch(root string, logger *Logger, corePath string, appPath stri
 
 	killSwitchActive = true
 	if logger != nil {
+		if stateOut, stateErr := runFirewallCommand("cmd", "/c", "netsh advfirewall show allprofiles state"); stateErr == nil && isAnyFirewallProfileOff(stateOut) {
+			logger.Warn("【防泄露保护警告】检测到 Windows 防火墙存在已关闭的配置档（State OFF），Kill Switch 出站阻断可能不会生效，建议在系统设置中开启 Windows 防火墙！")
+		}
 		logger.Info("【防泄露保护 (Kill Switch)】已激活：除代理核心与局域网外，所有直连出站已被防火墙安全阻断！")
 	}
 	return nil
+}
+
+func isAnyFirewallProfileOff(output string) bool {
+	re := regexp.MustCompile(`(?im)^\s*(?:State|状态)\s+(?:OFF|关闭)\s*$`)
+	return re.MatchString(output)
 }
 
 func disableKillSwitch(root string, logger *Logger) error {

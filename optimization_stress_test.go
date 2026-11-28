@@ -569,7 +569,10 @@ func TestEnsureCacheDBSelectedTagAndSyncSelectedDefault(t *testing.T) {
 		t.Fatalf("expected cache.db to be removed when target tag changes, got err=%v", err)
 	}
 
-	// SyncSelectedDefault updates proxy selector default in sing-box.json.
+	// SyncSelectedDefault updates proxy selector default in sing-box.json without deleting active cache.db.
+	if err := os.WriteFile(cachePath, []byte("running-bbolt-cache"), 0644); err != nil {
+		t.Fatal(err)
+	}
 	cfg := map[string]interface{}{
 		"outbounds": []interface{}{
 			map[string]interface{}{"type": "selector", "tag": "proxy", "default": "node-sg-1"},
@@ -580,6 +583,9 @@ func TestEnsureCacheDBSelectedTagAndSyncSelectedDefault(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.SyncSelectedDefault("node-jp-2")
+	if _, err := os.Stat(cachePath); err != nil {
+		t.Fatalf("SyncSelectedDefault must not remove running cache.db, got err=%v", err)
+	}
 	updatedRaw, err := os.ReadFile(configPath)
 	if err != nil {
 		t.Fatal(err)
@@ -591,6 +597,178 @@ func TestEnsureCacheDBSelectedTagAndSyncSelectedDefault(t *testing.T) {
 	obs := updatedCfg["outbounds"].([]interface{})
 	if got := obs[0].(map[string]interface{})["default"]; got != "node-jp-2" {
 		t.Fatalf("expected proxy default to sync to node-jp-2, got %v", got)
+	}
+}
+
+func TestCanonicalRegionCodeAndIndependentExitProbeContext(t *testing.T) {
+	if got := detectNodeRegion(Node{Name: "SG-85.149.212.77-新加坡"}); got != "SG" {
+		t.Fatalf("expected SG, got %q", got)
+	}
+	if got := canonicalRegionCode("新加坡"); got != "SG" {
+		t.Fatalf("expected 新加坡 -> SG, got %q", got)
+	}
+	if got := canonicalRegionCode("英国"); got != "GB" || detectNodeRegion(Node{Name: "UK-London-01"}) != "GB" {
+		t.Fatalf("expected 英国 and UK-London-01 -> GB, got %q / %q", got, detectNodeRegion(Node{Name: "UK-London-01"}))
+	}
+	if canonicalRegionCode("澳大利亚") != "AU" || canonicalRegionCode("澳大利亚") == detectNodeRegion(Node{Name: "SG-新加坡"}) {
+		t.Fatalf("expected AU != SG")
+	}
+
+	app := &App{}
+	exitCtx, exitCancel := app.registerExitProbeContext()
+	defer exitCancel()
+	healthCtx, healthCancel := app.registerProbeContext()
+	defer healthCancel()
+
+	// Health probe registration must NOT cancel an active exit IP probe.
+	if exitCtx.Err() != nil {
+		t.Fatalf("registerProbeContext must not cancel exit probe context: %v", exitCtx.Err())
+	}
+	// Preempting background checks must cancel BOTH health and exit probes.
+	app.preemptBackgroundChecks()
+	if healthCtx.Err() == nil || exitCtx.Err() == nil {
+		t.Fatalf("preemptBackgroundChecks must cancel both probes: health=%v exit=%v", healthCtx.Err(), exitCtx.Err())
+	}
+}
+
+func TestProxyLayerSixHardeningFixes(t *testing.T) {
+	// 1. TUN + non-IPv6 node adds predefined NOERROR AAAA rule & blocks domestic DoH IPs on port 443.
+	wgIPv6 := Node{
+		ID:      "wg-v6",
+		Name:    "WG-IPv6",
+		Type:    "wireguard",
+		Address: "198.51.100.9:51820",
+		Outbound: map[string]interface{}{
+			"type":            "wireguard",
+			"server":          "198.51.100.9",
+			"server_port":     51820,
+			"local_address":   []string{"10.0.0.2/32", "fd00::2/128"},
+			"private_key":     "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+			"peer_public_key": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+		},
+	}
+	vlessNode := Node{
+		ID:      "vless-1",
+		Name:    "SG-VLESS",
+		Type:    "vless",
+		Address: "edge.example.com:443",
+		Outbound: map[string]interface{}{
+			"type":        "vless",
+			"server":      "edge.example.com",
+			"server_port": 443,
+			"uuid":        "11111111-1111-1111-1111-111111111111",
+			"tls": map[string]interface{}{
+				"enabled":     true,
+				"server_name": "edge.example.com",
+				"utls": map[string]interface{}{
+					"enabled":     true,
+					"fingerprint": "",
+				},
+			},
+		},
+	}
+	plainSocks := Node{
+		ID:      "socks-1",
+		Name:    "US-Socks",
+		Type:    "socks",
+		Address: "198.51.100.10:1080",
+		Outbound: map[string]interface{}{
+			"type":        "socks",
+			"server":      "198.51.100.10",
+			"server_port": 1080,
+		},
+	}
+	state := PersistState{
+		SelectedID: vlessNode.ID,
+		Nodes:      []Node{vlessNode, plainSocks, wgIPv6},
+		Settings: Settings{
+			Mode:              "rule",
+			Tun:               true,
+			ProxyMap:          true,
+			ProxyMapStartPort: 52001,
+			ProxyMapDetour:    true,
+			MixedPort:         20808,
+			RuleSource:        ruleSourceBuiltin,
+		},
+	}
+
+	cfg, err := BuildSingBoxConfig(state, vlessNode, "")
+	if err != nil {
+		t.Fatalf("BuildSingBoxConfig failed: %v", err)
+	}
+	dnsMap := cfg["dns"].(map[string]interface{})
+	dnsRules := dnsMap["rules"].([]map[string]interface{})
+	foundAAAANoError := false
+	for _, r := range dnsRules {
+		if r["action"] == "predefined" && r["rcode"] == "NOERROR" && stringSliceContains(configStringValues(r["query_type"]), "AAAA") {
+			foundAAAANoError = true
+		}
+		if r["server"] == "direct-dns" && stringSliceContains(configStringValues(r["domain"]), "edge.example.com") {
+			if _, hasSuffix := r["domain_suffix"]; hasSuffix {
+				t.Fatalf("node server DNS rule must not use domain_suffix: %+v", r)
+			}
+		}
+	}
+	if !foundAAAANoError {
+		t.Fatal("expected predefined NOERROR AAAA DNS rule in TUN mode for non-IPv6 node")
+	}
+
+	// Domestic DoH IP:443 reject rule in route.rules.
+	routeRules := cfg["route"].(map[string]interface{})["rules"].([]map[string]interface{})
+	foundDoHIPReject := false
+	for _, r := range routeRules {
+		if r["action"] == "reject" && stringSliceContains(configStringValues(r["ip_cidr"]), "223.5.5.5/32") {
+			foundDoHIPReject = true
+		}
+	}
+	if !foundDoHIPReject {
+		t.Fatal("expected TUN route rule rejecting domestic DoH IP 223.5.5.5/32 on port 443")
+	}
+
+	// uTLS empty fingerprint filled with "chrome".
+	obs := cfg["outbounds"].([]map[string]interface{})
+	for _, ob := range obs {
+		if ob["tag"] == nodeOutboundTag(vlessNode) {
+			utls := ob["tls"].(map[string]interface{})["utls"].(map[string]interface{})
+			if utls["fingerprint"] != "chrome" {
+				t.Fatalf("expected empty uTLS fingerprint to default to chrome, got %v", utls["fingerprint"])
+			}
+		}
+	}
+
+	// WireGuard local_address IPv6 detection & endpoint fallback.
+	if !nodeSupportsIPv6(wgIPv6) {
+		t.Fatal("expected WireGuard node with IPv6 local_address to report nodeSupportsIPv6=true")
+	}
+	epFromAddr := wireGuardEndpointFromOutbound(map[string]interface{}{
+		"type":            "wireguard",
+		"tag":             "wg-new",
+		"address":         []string{"10.0.0.3/32"},
+		"private_key":     "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+		"peer_public_key": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+		"server":          "198.51.100.9",
+		"server_port":     51820,
+	})
+	if len(stringListFromAny(epFromAddr["address"])) != 1 {
+		t.Fatalf("expected wireGuardEndpointFromOutbound to fall back to address field, got %+v", epFromAddr)
+	}
+
+	// Self-loop guard: ProxyMap node matching selected main node must not detour through proxy,
+	// and switching to/from a mapped node with ProxyMapDetour enabled must trigger reload.
+	cfgPlainSelected, err := BuildSingBoxConfig(state, plainSocks, "")
+	if err != nil {
+		t.Fatalf("BuildSingBoxConfig with plain selected failed: %v", err)
+	}
+	for _, ob := range cfgPlainSelected["outbounds"].([]map[string]interface{}) {
+		if ob["tag"] == proxyMapOutboundTag(1) && ob["detour"] != nil {
+			t.Fatalf("ProxyMap node matching selected main proxy must not self-loop detour: %+v", ob)
+		}
+	}
+	if !needsRuntimeReloadForNodeSwitch(state, vlessNode, plainSocks) {
+		t.Fatal("switching main node to a mapped node with ProxyMapDetour must trigger reload to prevent self-loop")
+	}
+	if !needsRuntimeReloadForNodeSwitch(state, vlessNode, wgIPv6) {
+		t.Fatal("switching between non-IPv6 and IPv6 node under TUN must trigger reload")
 	}
 }
 

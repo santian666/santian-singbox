@@ -1121,15 +1121,28 @@ func buildLocalSOCKS5Client(port int, timeout time.Duration) (*http.Client, erro
 }
 
 func testOutboundInfo(client *http.Client) (string, string, error) {
-	ip, country, err := testCloudflareTraceGeo(client)
+	return testOutboundInfoContext(context.Background(), client)
+}
+
+func testOutboundInfoContext(ctx context.Context, client *http.Client) (string, string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ip, country, err := testCloudflareTraceGeoContext(ctx, client)
 	if err == nil && country != "" {
 		return ip, country, nil
 	}
-	ip, country, err = testOutboundGeo(client)
+	if ctx.Err() != nil {
+		return "", "", ctx.Err()
+	}
+	ip, country, err = testOutboundGeoContext(ctx, client)
 	if err == nil {
 		return ip, country, nil
 	}
-	ip, err = testOutboundIP(client)
+	if ctx.Err() != nil {
+		return "", "", ctx.Err()
+	}
+	ip, err = testOutboundIPContext(ctx, client)
 	if err != nil {
 		return "", "", err
 	}
@@ -1137,7 +1150,11 @@ func testOutboundInfo(client *http.Client) (string, string, error) {
 }
 
 func testCloudflareTraceGeo(client *http.Client) (string, string, error) {
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://cp.cloudflare.com/cdn-cgi/trace", nil)
+	return testCloudflareTraceGeoContext(context.Background(), client)
+}
+
+func testCloudflareTraceGeoContext(ctx context.Context, client *http.Client) (string, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://cp.cloudflare.com/cdn-cgi/trace", nil)
 	if err != nil {
 		return "", "", err
 	}
@@ -1183,6 +1200,10 @@ func traceCountryName(colo string, loc string) string {
 }
 
 func testOutboundGeo(client *http.Client) (string, string, error) {
+	return testOutboundGeoContext(context.Background(), client)
+}
+
+func testOutboundGeoContext(ctx context.Context, client *http.Client) (string, string, error) {
 	services := []struct {
 		endpoint string
 		decode   func(io.Reader) (geoResponse, error)
@@ -1193,7 +1214,10 @@ func testOutboundGeo(client *http.Client) (string, string, error) {
 	}
 	var lastErr error
 	for _, service := range services {
-		data, err := requestGeo(client, service.endpoint, service.decode)
+		if ctx.Err() != nil {
+			return "", "", ctx.Err()
+		}
+		data, err := requestGeoContext(ctx, client, service.endpoint, service.decode)
 		if err != nil {
 			lastErr = err
 			continue
@@ -1213,7 +1237,11 @@ func testOutboundGeo(client *http.Client) (string, string, error) {
 }
 
 func requestGeo(client *http.Client, endpoint string, decode func(io.Reader) (geoResponse, error)) (geoResponse, error) {
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, endpoint, nil)
+	return requestGeoContext(context.Background(), client, endpoint, decode)
+}
+
+func requestGeoContext(ctx context.Context, client *http.Client, endpoint string, decode func(io.Reader) (geoResponse, error)) (geoResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return geoResponse{}, err
 	}
@@ -1327,7 +1355,11 @@ func geoCountryName(code string, name string) string {
 }
 
 func testOutboundIP(client *http.Client) (string, error) {
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://api.ipify.org", nil)
+	return testOutboundIPContext(context.Background(), client)
+}
+
+func testOutboundIPContext(ctx context.Context, client *http.Client) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.ipify.org", nil)
 	if err != nil {
 		return "", err
 	}
@@ -1381,6 +1413,9 @@ type multiStreamSpeedMeter struct {
 	duration    time.Duration
 	maxBytes    int64
 	startOnce   sync.Once
+	closeOnce   sync.Once
+	timerMu     sync.Mutex
+	timer       *time.Timer
 	startNano   int64
 	lastNano    int64
 	totalBytes  int64
@@ -1398,6 +1433,23 @@ func newMultiStreamSpeedMeter(duration time.Duration, maxBytes int64, sample spe
 	}
 }
 
+func (m *multiStreamSpeedMeter) closeDeadline() {
+	m.closeOnce.Do(func() {
+		close(m.deadlineCh)
+	})
+}
+
+func (m *multiStreamSpeedMeter) stop() {
+	m.timerMu.Lock()
+	t := m.timer
+	m.timer = nil
+	m.timerMu.Unlock()
+	if t != nil {
+		t.Stop()
+	}
+	m.closeDeadline()
+}
+
 func (m *multiStreamSpeedMeter) record(n int64) {
 	if n <= 0 {
 		return
@@ -1406,9 +1458,10 @@ func (m *multiStreamSpeedMeter) record(n int64) {
 	nowNano := now.UnixNano()
 	m.startOnce.Do(func() {
 		atomic.StoreInt64(&m.startNano, nowNano)
-		time.AfterFunc(m.duration, func() {
-			close(m.deadlineCh)
-		})
+		t := time.AfterFunc(m.duration, m.closeDeadline)
+		m.timerMu.Lock()
+		m.timer = t
+		m.timerMu.Unlock()
 	})
 	atomic.StoreInt64(&m.lastNano, nowNano)
 	total := atomic.AddInt64(&m.totalBytes, n)
@@ -1417,12 +1470,27 @@ func (m *multiStreamSpeedMeter) record(n int64) {
 		atomic.AddInt64(&m.warmupBytes, n)
 	}
 	if m.maxBytes > 0 && total >= m.maxBytes {
-		select {
-		case <-m.deadlineCh:
-		default:
-			// Use startOnce-style safety via recover? No, better use sync.Once for stop.
-		}
+		m.closeDeadline()
 	}
+}
+
+func cloneSpeedTestWorkerClient(base *http.Client) (*http.Client, func()) {
+	if base == nil {
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		return &http.Client{Transport: tr}, tr.CloseIdleConnections
+	}
+	cloned := *base
+	if tr, ok := base.Transport.(*http.Transport); ok && tr != nil {
+		workerTr := tr.Clone()
+		cloned.Transport = workerTr
+		return &cloned, workerTr.CloseIdleConnections
+	}
+	if base.Transport == nil {
+		workerTr := http.DefaultTransport.(*http.Transport).Clone()
+		cloned.Transport = workerTr
+		return &cloned, workerTr.CloseIdleConnections
+	}
+	return &cloned, func() {}
 }
 
 func (m *multiStreamSpeedMeter) currentMbps() float64 {
@@ -1449,6 +1517,7 @@ func measureMultiStreamDownload(client *http.Client, target string, duration tim
 	defer overallCancel()
 
 	meter := newMultiStreamSpeedMeter(duration, totalLimit, sample)
+	defer meter.stop()
 	var stopOnce sync.Once
 	stopTransfer := func() {
 		stopOnce.Do(func() {
@@ -1489,6 +1558,8 @@ func measureMultiStreamDownload(client *http.Client, target string, duration tim
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			workerClient, cleanup := cloneSpeedTestWorkerClient(client)
+			defer cleanup()
 			buf := make([]byte, 64*1024)
 			for {
 				if overallCtx.Err() != nil {
@@ -1507,7 +1578,7 @@ func measureMultiStreamDownload(client *http.Client, target string, duration tim
 					errMu.Unlock()
 					return
 				}
-				resp, err := client.Do(req)
+				resp, err := workerClient.Do(req)
 				if err != nil {
 					errMu.Lock()
 					if firstErr == nil && overallCtx.Err() == nil {
@@ -1564,6 +1635,7 @@ func measureMultiStreamUpload(client *http.Client, target string, duration time.
 	payload := make([]byte, chunkSize)
 
 	meter := newMultiStreamSpeedMeter(duration, totalLimit, sample)
+	defer meter.stop()
 	var stopOnce sync.Once
 	stopTransfer := func() {
 		stopOnce.Do(func() {
@@ -1602,6 +1674,8 @@ func measureMultiStreamUpload(client *http.Client, target string, duration time.
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			workerClient, cleanup := cloneSpeedTestWorkerClient(client)
+			defer cleanup()
 			for {
 				if overallCtx.Err() != nil {
 					return
@@ -1622,7 +1696,7 @@ func measureMultiStreamUpload(client *http.Client, target string, duration time.
 				}
 				req.Header.Set("Content-Type", "application/octet-stream")
 				req.ContentLength = int64(len(payload))
-				resp, err := client.Do(req)
+				resp, err := workerClient.Do(req)
 				if err != nil {
 					errMu.Lock()
 					if firstErr == nil && overallCtx.Err() == nil {

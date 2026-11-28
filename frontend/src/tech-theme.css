@@ -1403,3 +1403,31 @@ body[data-theme="dark"] .fault-alert-note {
   font-size: 11.5px !important;
   border-radius: 6px !important;
 }
+
+body[data-theme="dark"] .current-node-exit {
+  color: #c4b5fd;
+  background: rgba(168, 85, 247, 0.16);
+  border-color: rgba(168, 85, 247, 0.34);
+}
+
+.current-node.mismatch {
+  border-color: rgba(239, 68, 68, 0.58) !important;
+  background: rgba(254, 242, 242, 0.96) !important;
+}
+
+.current-node.mismatch .current-node-exit {
+  color: #b91c1c !important;
+  background: rgba(239, 68, 68, 0.14) !important;
+  border-color: rgba(239, 68, 68, 0.42) !important;
+}
+
+body[data-theme="dark"] .current-node.mismatch {
+  border-color: rgba(248, 113, 113, 0.58) !important;
+  background: rgba(46, 16, 26, 0.92) !important;
+}
+
+body[data-theme="dark"] .current-node.mismatch .current-node-exit {
+  color: #fca5a5 !important;
+  background: rgba(239, 68, 68, 0.22) !important;
+  border-color: rgba(248, 113, 113, 0.45) !important;
+}

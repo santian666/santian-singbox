@@ -105,6 +105,8 @@ type App struct {
 	exitIP                      string
 	exitCountry                 string
 	exitMismatch                string
+	exitProbeCancel             context.CancelFunc
+	exitProbeGen                uint64
 }
 
 type proxyEntrySnapshot struct {
@@ -382,7 +384,6 @@ func (a *App) cleanupAllProxyEffects(reason string) {
 		a.stopResumeHealthChecks()
 		a.stopRunningToolsForExit()
 		a.cancelBatchTestJob()
-		_ = disableKillSwitch(a.root, a.logger)
 		a.proxyOpMu.Lock()
 		defer a.proxyOpMu.Unlock()
 		a.persistTraffic()
@@ -399,6 +400,7 @@ func (a *App) cleanupAllProxyEffects(reason string) {
 				a.logger.Error("%s：强制清理残留 sing-box 失败：%v", reason, err)
 			}
 		}
+		a.disableAllKillSwitches()
 		if preserveSettings {
 			if a.logger != nil {
 				a.logger.Info("管理员 TUN 交接：旧实例已停止，保留待启动的 TUN 设置")
@@ -590,7 +592,7 @@ func (a *App) stopProxyForUser() error {
 			}
 		}
 	}
-	_ = disableKillSwitch(a.root, a.logger)
+	a.disableAllKillSwitches()
 	if err := a.disableStoredProxyEntrances("停止代理"); err != nil {
 		result = errors.Join(result, fmt.Errorf("保存代理关闭状态失败：%w", err))
 	}
@@ -1642,8 +1644,9 @@ func (a *App) selectNodeLocked(id string) error {
 	}
 
 	trafficSnap, hasTraffic := a.recordTrafficInMemory()
+	prevNode, _ := findSelectedNode(state.Nodes, state.SelectedID)
 	reloaded := false
-	if !a.manager.RuntimeHasOutbound(selectedTag) {
+	if !a.manager.RuntimeHasOutbound(selectedTag) || needsRuntimeReloadForNodeSwitch(state, prevNode, node) {
 		reloaded = true
 		if err := a.reloadRuntimeForSelectedNode(state, id, selectedTag); err != nil {
 			a.logger.Error("节点切换失败，继续使用原节点：%v", err)
@@ -1682,6 +1685,22 @@ func (a *App) selectNodeLocked(id string) error {
 	return nil
 }
 
+func needsRuntimeReloadForNodeSwitch(state PersistState, prevNode, nextNode Node) bool {
+	settings := state.Settings
+	normalizeSettings(&settings)
+	if effectiveTun(settings) && nodeSupportsIPv6(prevNode) != nodeSupportsIPv6(nextNode) {
+		return true
+	}
+	if settings.ProxyMap && settings.ProxyMapDetour {
+		for _, mapped := range proxyMapNodesForSettings(state.Nodes, settings) {
+			if mapped.ID == prevNode.ID || mapped.ID == nextNode.ID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (a *App) reloadRuntimeForSelectedNode(previous PersistState, id string, selectedTag string) error {
 	next := previous
 	next.SelectedID = id
@@ -1699,6 +1718,7 @@ func (a *App) reloadRuntimeForSelectedNode(previous PersistState, id string, sel
 			)
 			return fmt.Errorf("%s：%v；恢复原节点代理失败：%w", stepDesc, cause, restoreErr)
 		}
+		a.syncAlwaysOnWFPKillSwitch(previous.Settings)
 		_ = disableKillSwitch(a.root, a.logger)
 		return fmt.Errorf("%s，已恢复原节点代理：%w", stepDesc, cause)
 	}
@@ -1714,6 +1734,7 @@ func (a *App) reloadRuntimeForSelectedNode(previous PersistState, id string, sel
 	if err := a.store.SelectNode(id); err != nil {
 		return rollback("保存所选节点失败", err)
 	}
+	a.syncAlwaysOnWFPKillSwitch(next.Settings)
 	_ = disableKillSwitch(a.root, a.logger)
 	return nil
 }
@@ -2686,9 +2707,10 @@ func (a *App) SaveSettings(settings Settings) (err error) {
 			if err := a.manager.StopWithoutSystemProxyCleanup(); err != nil {
 				a.logger.Error("关闭入口后停止代理失败：%v", err)
 			}
-			_ = disableKillSwitch(a.root, a.logger)
+			a.disableAllKillSwitches()
 			a.resetTrafficTracking()
 			a.clearNetworkHealth()
+			a.clearExitInfo()
 			a.logger.Info("代理入口已全部关闭，代理已停止")
 			a.emitState()
 			return nil
@@ -2759,10 +2781,16 @@ func (a *App) SaveSettings(settings Settings) (err error) {
 			}
 			a.logger.Info("运行中设置已保存并通过 Clash API 生效：模式=%s，系统代理=%v", settings.Mode, settings.SystemProxy)
 		}
+		a.syncAlwaysOnWFPKillSwitch(settings)
 		_ = disableKillSwitch(a.root, a.logger)
 		a.markTunConnectivityHealthy(settings)
 		a.clearNetworkHealth()
 		a.refreshEnvironmentOnSwitch(restartNeeded || current.Mode != settings.Mode || effectiveTun(settings) || settings.FakeDNS)
+		if restartNeeded {
+			if node, ok := findSelectedNode(state.Nodes, state.SelectedID); ok {
+				a.verifyActiveExitIPAsync(state.SelectedID, node, settings.MixedPort)
+			}
+		}
 		a.emitState()
 		return nil
 	}
@@ -2789,20 +2817,26 @@ func (a *App) SaveSettings(settings Settings) (err error) {
 			a.logger.Error("启动失败：%v", err)
 			return a.rollbackSettingsAfterApplyFailure(previousState, err)
 		}
+		a.syncAlwaysOnWFPKillSwitch(state.Settings)
 		if err := a.manager.Start(state); err != nil {
 			a.logger.Error("启动失败：%v", err)
 			return a.rollbackSettingsAfterApplyFailure(previousState, err)
 		}
+		a.syncAlwaysOnWFPKillSwitch(state.Settings)
 		_ = disableKillSwitch(a.root, a.logger)
 		a.markTunConnectivityHealthy(state.Settings)
 		a.clearNetworkHealth()
 		a.initTrafficBaseline(state.SelectedID, state.Nodes)
 		a.refreshEnvironmentOnSwitch(effectiveTun(state.Settings) || state.Settings.FakeDNS)
+		if node, ok := findSelectedNode(state.Nodes, state.SelectedID); ok {
+			a.verifyActiveExitIPAsync(state.SelectedID, node, state.Settings.MixedPort)
+		}
 		a.logger.Info("代理入口已开启，代理已自动启动")
 		safeGo(a.logger, "代理开启后检查更新", a.onProxyStarted)
 	} else {
-		_ = disableKillSwitch(a.root, a.logger)
+		a.disableAllKillSwitches()
 		a.clearNetworkHealth()
+		a.clearExitInfo()
 	}
 	a.emitState()
 	return nil
@@ -2876,7 +2910,7 @@ func (a *App) restoreProxyState(previous PersistState) error {
 				return fmt.Errorf("停止失败代理失败：%w", err)
 			}
 		}
-		_ = disableKillSwitch(a.root, a.logger)
+		a.disableAllKillSwitches()
 		a.resetTrafficTracking()
 		a.markTunConnectivityHealthy(previous.Settings)
 		a.clearNetworkHealth()
@@ -2888,6 +2922,7 @@ func (a *App) restoreProxyState(previous PersistState) error {
 	if !stateHasSelectedNode(previous) {
 		return errors.New("切换前选择的节点不存在")
 	}
+	a.syncAlwaysOnWFPKillSwitch(previous.Settings)
 	var err error
 	if a.manager.Running() {
 		err = a.manager.Restart(previous, runtime.GOOS == "windows")
@@ -2902,6 +2937,7 @@ func (a *App) restoreProxyState(previous PersistState) error {
 		a.setNetworkHealth("core_down", "代理回滚失败（防漏保护生效中）", fmt.Sprintf("恢复切换前代理失败：%v。真实网络已被锁定防漏，请检查节点或重启内核。", err), true)
 		return fmt.Errorf("恢复切换前代理失败：%w", err)
 	}
+	a.syncAlwaysOnWFPKillSwitch(previous.Settings)
 	_ = disableKillSwitch(a.root, a.logger)
 	a.initTrafficBaseline(previous.SelectedID, previous.Nodes)
 	a.markTunConnectivityHealthy(previous.Settings)
@@ -3079,7 +3115,9 @@ func (a *App) applyRuntimeSelectedNode(state PersistState, reason string) error 
 		}
 	}
 	a.initTrafficBaseline(state.SelectedID, state.Nodes)
-	a.logger.Info("%s：已快速切换到节点：%s", reason, node.Name)
+	a.manager.SyncSelectedDefault(selectedTag)
+	a.verifyActiveExitIPAsync(state.SelectedID, node, state.Settings.MixedPort)
+	a.logger.Info("%s：已快速切换到节点：%s (%s)", reason, node.Name, selectedTag)
 	return nil
 }
 
@@ -3697,6 +3735,7 @@ func (a *App) startLocked() error {
 		a.setNetworkHealth("core_down", "代理端口被占用（防漏保护生效中）", fmt.Sprintf("启动失败：%v。已保持防漏保护，请释放端口后重试。", err), true)
 		return err
 	}
+	a.syncAlwaysOnWFPKillSwitch(state.Settings)
 	if err := a.manager.Start(state); err != nil {
 		a.logger.Error("启动失败：%v", err)
 		a.enableTunKillSwitchIfConfigured(state.Settings)
@@ -3704,6 +3743,7 @@ func (a *App) startLocked() error {
 		a.setNetworkHealth("core_down", "代理内核启动失败（防漏保护生效中）", fmt.Sprintf("sing-box 启动失败：%v。已保持断网防漏锁定，请切换节点或检查配置后重试。", err), true)
 		return err
 	}
+	a.syncAlwaysOnWFPKillSwitch(state.Settings)
 	_ = disableKillSwitch(a.root, a.logger)
 	a.markTunConnectivityHealthy(state.Settings)
 	a.clearNetworkHealth()
@@ -3958,6 +3998,34 @@ func (a *App) ensureProxyHealth(reason string) {
 		}
 	}
 
+	if selectedNode, ok := findSelectedNode(state.Nodes, state.SelectedID); ok {
+		if wantTag := nodeOutboundTag(selectedNode); wantTag != "" {
+			if actualTag, curErr := a.manager.CurrentOutbound(); curErr == nil && actualTag != "" && actualTag != wantTag && a.proxyOpMu.TryLock() {
+				latest := a.store.Snapshot()
+				normalizeSettings(&latest.Settings)
+				if a.manager.Running() && shouldRunProxy(latest.Settings) {
+					if latestNode, latestOK := findSelectedNode(latest.Nodes, latest.SelectedID); latestOK {
+						latestTag := nodeOutboundTag(latestNode)
+						if latestTag != "" && actualTag != latestTag {
+							if syncErr := a.manager.SelectOutboundReliable(latestTag); syncErr == nil {
+								a.manager.SyncSelectedDefault(latestTag)
+								if a.logger != nil {
+									a.logger.Info("【自检纠偏】检测到内核出站为 %s，已自动纠正回当前节点 %s (%s)", actualTag, selectedNodeLogName(latest.Nodes, latest.SelectedID), latestTag)
+								}
+								a.refreshEnvironmentOnSwitch(false)
+								a.verifyActiveExitIPAsync(latest.SelectedID, latestNode, latest.Settings.MixedPort)
+							}
+						}
+					}
+				}
+				a.proxyOpMu.Unlock()
+			}
+		}
+	}
+	if ctx.Err() != nil {
+		return
+	}
+
 	delayMS, probeErr := a.manager.testNodeDelayViaClashAPIContext(ctx, "proxy", "", 3500*time.Millisecond)
 	if ctx.Err() != nil {
 		return
@@ -4030,35 +4098,57 @@ func checkLocalPhysicalConnectivity() bool {
 	return ok
 }
 
-func detectNodeRegion(node Node) string {
-	if country := strings.TrimSpace(node.Country); country != "" {
-		return country
+func canonicalRegionCode(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
 	}
-	name := strings.ToUpper(node.Name)
+	upper := strings.ToUpper(s)
+	if upper == "UK" {
+		return "GB"
+	}
+	if _, ok := countryNames[upper]; ok {
+		return upper
+	}
+	for code, zhName := range countryNames {
+		if zhName != "" && (s == zhName || strings.Contains(s, zhName)) {
+			if code == "UK" {
+				return "GB"
+			}
+			return code
+		}
+	}
 	switch {
-	case strings.Contains(name, "香港") || strings.Contains(name, "HK") || strings.Contains(name, "HONG KONG"):
+	case strings.Contains(upper, "香港") || strings.Contains(upper, "HK") || strings.Contains(upper, "HONG KONG"):
 		return "HK"
-	case strings.Contains(name, "日本") || strings.Contains(name, "JP") || strings.Contains(name, "JAPAN") || strings.Contains(name, "东京") || strings.Contains(name, "大阪"):
+	case strings.Contains(upper, "日本") || strings.Contains(upper, "JP") || strings.Contains(upper, "JAPAN") || strings.Contains(upper, "东京") || strings.Contains(upper, "大阪"):
 		return "JP"
-	case strings.Contains(name, "美国") || strings.Contains(name, "US") || strings.Contains(name, "USA") || strings.Contains(name, "UNITED STATES") || strings.Contains(name, "洛杉矶") || strings.Contains(name, "圣何塞") || strings.Contains(name, "西雅图") || strings.Contains(name, "纽约"):
+	case strings.Contains(upper, "美国") || strings.Contains(upper, "US") || strings.Contains(upper, "USA") || strings.Contains(upper, "UNITED STATES") || strings.Contains(upper, "洛杉矶") || strings.Contains(upper, "圣何塞") || strings.Contains(upper, "西雅图") || strings.Contains(upper, "纽约"):
 		return "US"
-	case strings.Contains(name, "新加坡") || strings.Contains(name, "SG") || strings.Contains(name, "SINGAPORE") || strings.Contains(name, "狮城"):
+	case strings.Contains(upper, "新加坡") || strings.Contains(upper, "SG") || strings.Contains(upper, "SINGAPORE") || strings.Contains(upper, "狮城"):
 		return "SG"
-	case strings.Contains(name, "台湾") || strings.Contains(name, "TW") || strings.Contains(name, "TAIWAN") || strings.Contains(name, "台北"):
+	case strings.Contains(upper, "台湾") || strings.Contains(upper, "TW") || strings.Contains(upper, "TAIWAN") || strings.Contains(upper, "台北"):
 		return "TW"
-	case strings.Contains(name, "韩国") || strings.Contains(name, "KR") || strings.Contains(name, "KOREA") || strings.Contains(name, "首尔"):
+	case strings.Contains(upper, "韩国") || strings.Contains(upper, "KR") || strings.Contains(upper, "KOREA") || strings.Contains(upper, "首尔"):
 		return "KR"
-	case strings.Contains(name, "英国") || strings.Contains(name, "UK") || strings.Contains(name, "GB") || strings.Contains(name, "LONDON") || strings.Contains(name, "伦敦"):
-		return "UK"
-	case strings.Contains(name, "德国") || strings.Contains(name, "DE") || strings.Contains(name, "GERMANY") || strings.Contains(name, "法兰克福"):
+	case strings.Contains(upper, "英国") || strings.Contains(upper, "UK") || strings.Contains(upper, "GB") || strings.Contains(upper, "UNITED KINGDOM") || strings.Contains(upper, "LONDON") || strings.Contains(upper, "伦敦"):
+		return "GB"
+	case strings.Contains(upper, "德国") || strings.Contains(upper, "DE") || strings.Contains(upper, "GERMANY") || strings.Contains(upper, "法兰克福"):
 		return "DE"
-	case strings.Contains(name, "加拿大") || strings.Contains(name, "CA") || strings.Contains(name, "CANADA"):
+	case strings.Contains(upper, "加拿大") || strings.Contains(upper, "CA") || strings.Contains(upper, "CANADA"):
 		return "CA"
-	case strings.Contains(name, "澳大利亚") || strings.Contains(name, "澳洲") || strings.Contains(name, "AU") || strings.Contains(name, "AUSTRALIA") || strings.Contains(name, "悉尼"):
+	case strings.Contains(upper, "澳大利亚") || strings.Contains(upper, "澳洲") || strings.Contains(upper, "AU") || strings.Contains(upper, "AUSTRALIA") || strings.Contains(upper, "悉尼") || strings.Contains(upper, "墨尔本"):
 		return "AU"
 	default:
 		return ""
 	}
+}
+
+func detectNodeRegion(node Node) string {
+	if code := canonicalRegionCode(node.Country); code != "" {
+		return code
+	}
+	return canonicalRegionCode(node.Name)
 }
 
 func filterAndRankCandidatesForAutoFailover(nodes []Node, groups []NodeGroup, currentID string) ([]Node, string, string, error) {
@@ -4331,6 +4421,7 @@ func (a *App) Restart() (err error) {
 		a.logger.Error("自检重启代理失败：%v", err)
 		return err
 	}
+	a.syncAlwaysOnWFPKillSwitch(settings)
 	_ = disableKillSwitch(a.root, a.logger)
 	a.setCircuitBreakerActive(false, "")
 	a.clearNetworkHealth()
@@ -4351,6 +4442,7 @@ func (a *App) preemptBackgroundChecks() {
 	if cancel != nil {
 		cancel()
 	}
+	a.cancelExitProbe()
 }
 
 func (a *App) registerProbeContext() (context.Context, func()) {
@@ -4403,16 +4495,64 @@ func (a *App) currentExitInfo() (string, string, string) {
 	return a.exitIP, a.exitCountry, a.exitMismatch
 }
 
+func (a *App) cancelExitProbe() {
+	if a == nil {
+		return
+	}
+	a.exitInfoMu.Lock()
+	cancel := a.exitProbeCancel
+	a.exitProbeCancel = nil
+	a.exitProbeGen++
+	a.exitInfoMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (a *App) registerExitProbeContext() (context.Context, func()) {
+	parent := context.Background()
+	if a != nil && a.ctx != nil {
+		parent = a.ctx
+	}
+	ctx, cancel := context.WithCancel(parent)
+	if a == nil {
+		return ctx, cancel
+	}
+	a.exitInfoMu.Lock()
+	prev := a.exitProbeCancel
+	a.exitProbeCancel = cancel
+	a.exitProbeGen++
+	gen := a.exitProbeGen
+	a.exitInfoMu.Unlock()
+	if prev != nil {
+		prev()
+	}
+	return ctx, func() {
+		cancel()
+		a.exitInfoMu.Lock()
+		if a.exitProbeGen == gen {
+			a.exitProbeCancel = nil
+		}
+		a.exitInfoMu.Unlock()
+	}
+}
+
 func (a *App) clearExitInfo() {
 	if a == nil {
 		return
 	}
 	a.exitInfoMu.Lock()
+	cancel := a.exitProbeCancel
+	a.exitProbeCancel = nil
+	a.exitProbeGen++
 	changed := a.exitIP != "" || a.exitCountry != "" || a.exitMismatch != ""
 	a.exitIP = ""
 	a.exitCountry = ""
 	a.exitMismatch = ""
 	a.exitInfoMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	if changed {
 		a.emitState()
 	}
@@ -4423,7 +4563,7 @@ func (a *App) verifyActiveExitIPAsync(nodeID string, node Node, mixedPort int) {
 		return
 	}
 	a.clearExitInfo()
-	ctx, cancelProbe := a.registerProbeContext()
+	ctx, cancelProbe := a.registerExitProbeContext()
 	safeGo(a.logger, "核验真实出口IP", func() {
 		defer cancelProbe()
 		if ctx.Err() != nil || !a.manager.Running() {
@@ -4433,19 +4573,22 @@ func (a *App) verifyActiveExitIPAsync(nodeID string, node Node, mixedPort int) {
 		if err != nil || ctx.Err() != nil {
 			return
 		}
-		ip, country, err := testOutboundInfo(client)
+		ip, country, err := testOutboundInfoContext(ctx, client)
 		if err != nil || ctx.Err() != nil || strings.TrimSpace(ip) == "" {
 			return
 		}
 		if a.store != nil && a.store.Snapshot().SelectedID != nodeID {
 			return
 		}
-		expected := detectNodeRegion(node)
+		expectedCode := detectNodeRegion(node)
+		actualCode := canonicalRegionCode(country)
 		mismatch := ""
-		if expected != "" && country != "" && !strings.EqualFold(expected, country) {
-			mismatch = fmt.Sprintf("节点标称 %s，实际落地 %s (%s)", expected, country, ip)
+		if expectedCode != "" && actualCode != "" && expectedCode != actualCode {
+			expectedLabel := firstNonEmpty(countryNames[expectedCode], expectedCode)
+			actualLabel := firstNonEmpty(country, countryNames[actualCode], actualCode)
+			mismatch = fmt.Sprintf("节点标称 %s(%s)，实际落地 %s(%s) (%s)", expectedLabel, expectedCode, actualLabel, actualCode, ip)
 			if a.logger != nil {
-				a.logger.Info("【出口核验】节点 [%s (%s)] 标称地区 %s，实际出口：%s (%s)", node.Name, nodeOutboundTag(node), expected, ip, country)
+				a.logger.Info("【出口核验】节点 [%s (%s)] 地区不一致：标称 %s(%s)，实际出口 %s (%s/%s)", node.Name, nodeOutboundTag(node), expectedLabel, expectedCode, ip, actualLabel, actualCode)
 			}
 		} else if a.logger != nil {
 			a.logger.Info("【出口核验】节点 [%s (%s)] 实际出口：%s (%s)", node.Name, nodeOutboundTag(node), ip, country)
@@ -4571,6 +4714,7 @@ func (a *App) handleUnexpectedCoreExit(exitErr error) {
 		return
 	}
 	a.enableTunKillSwitchIfConfigured(state.Settings)
+	a.clearExitInfo()
 	detail := "进程意外中止"
 	if exitErr != nil {
 		detail = exitErr.Error()
@@ -4583,13 +4727,49 @@ func (a *App) handleUnexpectedCoreExit(exitErr error) {
 	)
 }
 
+func (a *App) syncAlwaysOnWFPKillSwitch(settings Settings) bool {
+	if a == nil || runtime.GOOS != "windows" {
+		return false
+	}
+	normalizeSettings(&settings)
+	if !shouldUseAlwaysOnWFPKillSwitch(settings) || !checkAdminPrivileges() {
+		_ = disableWFPKillSwitch(a.logger)
+		return false
+	}
+	corePath := ""
+	if a.manager != nil {
+		corePath = a.manager.corePath
+	}
+	exePath, _ := os.Executable()
+	if err := enableWFPKillSwitch(a.logger, corePath, exePath); err != nil {
+		if a.logger != nil {
+			a.logger.Warn("【WFP 内核防泄露】启动失败，已自动回退到 Windows 防火墙应急断网保护：%v", err)
+		}
+		return false
+	}
+	return true
+}
+
+func (a *App) disableAllKillSwitches() {
+	if a == nil {
+		return
+	}
+	_ = disableWFPKillSwitch(a.logger)
+	_ = disableKillSwitch(a.root, a.logger)
+}
+
 func (a *App) enableTunKillSwitchIfConfigured(settings Settings) {
 	if a == nil || runtime.GOOS != "windows" {
 		return
 	}
 	normalizeSettings(&settings)
-	if !effectiveTun(settings) || !settings.CircuitBreaker || strings.TrimSpace(a.root) == "" || !hasAdminPrivileges() {
+	if !effectiveTun(settings) || !settings.CircuitBreaker || strings.TrimSpace(a.root) == "" || !checkAdminPrivileges() {
 		return
+	}
+	if settings.Tun {
+		if a.syncAlwaysOnWFPKillSwitch(settings) {
+			return
+		}
 	}
 	corePath := ""
 	if a.manager != nil {

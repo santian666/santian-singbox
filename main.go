@@ -35,6 +35,9 @@ func main() {
 	if handled, exitCode := runProxyWatchdogFromArgs(); handled {
 		os.Exit(exitCode)
 	}
+	if handled, exitCode := runBootProxyCleanupFromArgs(); handled {
+		os.Exit(exitCode)
+	}
 	if hasArg(quitExistingArg) {
 		if err := signalExistingInstanceToQuit(); err != nil {
 			println("Quit signal failed:", err.Error())

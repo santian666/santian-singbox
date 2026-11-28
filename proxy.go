@@ -61,6 +61,7 @@ func EnableSystemProxy(port int) error {
 	if issue != "" {
 		return fmt.Errorf("系统代理写入后未生效：%s，请检查是否被其他代理软件覆盖", issue)
 	}
+	_ = registerSystemProxyBootCleanup(port)
 	return nil
 }
 
@@ -97,6 +98,7 @@ func DisableSystemProxy() error {
 	if issue := systemProxyDisabledIssue(settings, connection); issue != "" {
 		return fmt.Errorf("系统代理关闭后仍有残留：%s，请检查是否被其他代理软件接管", issue)
 	}
+	_ = unregisterSystemProxyBootCleanup()
 	return nil
 }
 

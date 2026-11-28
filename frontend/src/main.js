@@ -1528,6 +1528,7 @@ var ia = ln((an, sn) => {
         <div id="currentNode" class="current-node" title="当前节点：未选择">
           <span>当前节点</span>
           <strong>未选择</strong>
+          <em id="currentNodeExit" class="current-node-exit hidden"></em>
         </div>
       </div>
     </header>
@@ -2570,13 +2571,20 @@ var ia = ln((an, sn) => {
     const n = e.find((i) => i.id === t),
       a = (n == null ? void 0 : n.name) || "未选择",
       r = c("currentNode"),
-      exitIp = String((state == null ? void 0 : state.exitIp) || "").trim(),
-      exitCountry = String((state == null ? void 0 : state.exitCountry) || "").trim(),
-      exitMismatch = String((state == null ? void 0 : state.exitMismatch) || "").trim(),
-      exitTag = exitIp ? ` (${exitIp}${exitCountry ? " " + exitCountry : ""})` : "";
-    r.querySelector("strong").textContent = a + exitTag;
-    r.title = exitMismatch ? `当前节点：${a} | ${exitMismatch}` : `当前节点：${a}${exitTag}`;
+      exitEl = c("currentNodeExit"),
+      running = Boolean(state == null ? void 0 : state.running),
+      exitIp = running ? String((state == null ? void 0 : state.exitIp) || "").trim() : "",
+      exitCountry = running ? String((state == null ? void 0 : state.exitCountry) || "").trim() : "",
+      exitMismatch = running ? String((state == null ? void 0 : state.exitMismatch) || "").trim() : "",
+      exitLabel = exitIp ? `${exitIp}${exitCountry ? " " + exitCountry : ""}` : "";
+    r.querySelector("strong").textContent = a;
+    if (exitEl) {
+      exitEl.textContent = exitLabel;
+      exitEl.classList.toggle("hidden", !exitLabel);
+    }
+    r.title = exitMismatch ? `当前节点：${a} | ⚠ ${exitMismatch}` : exitLabel ? `当前节点：${a} | 实际出口：${exitLabel}` : `当前节点：${a}`;
     r.classList.toggle("empty", !n);
+    r.classList.toggle("has-exit", Boolean(exitLabel));
     r.classList.toggle("mismatch", Boolean(exitMismatch));
   }
   function Zn(e = {}, t = e.configMode || {}) {

@@ -78,7 +78,7 @@ func (a *App) RunNetworkTool(tool string) (result NetworkToolResult, err error) 
 		return a.runNetworkToolCommand("TCP/IP 协议栈重置", "netsh int ip reset", "TCP/IP 协议栈已重置，部分系统需要重启后完全生效。"), nil
 	case "cleanup_tun_residual":
 		summary := cleanupTunInterfaceWithSummary(a.logger)
-		_ = disableKillSwitch(a.root, a.logger)
+		a.disableAllKillSwitches()
 		var output string
 		if summary != "" {
 			output = fmt.Sprintf("已成功清理 TUN 残留设备与路由：\n✔ %s\n请重新开启 TUN 验证是否恢复正常。", summary)
@@ -177,7 +177,7 @@ func (a *App) flushDnsTool() NetworkToolResult {
 
 func (a *App) clearProxySettings() NetworkToolResult {
 	var steps []string
-	_ = disableKillSwitch(a.root, a.logger)
+	a.disableAllKillSwitches()
 	if err := DisableSystemProxy(); err != nil {
 		steps = append(steps, fmt.Sprintf("⚠ 关闭 Windows 系统代理失败：%v", err))
 	} else {
@@ -212,7 +212,7 @@ func (a *App) clearProxySettings() NetworkToolResult {
 
 func (a *App) repairProxyResidual() NetworkToolResult {
 	var steps []string
-	_ = disableKillSwitch(a.root, a.logger)
+	a.disableAllKillSwitches()
 	if err := DisableSystemProxy(); err != nil {
 		steps = append(steps, fmt.Sprintf("⚠ 清理系统代理失败：%v", err))
 	} else {
