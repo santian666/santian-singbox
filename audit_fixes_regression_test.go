@@ -12,10 +12,12 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -754,5 +756,134 @@ func TestNormalizeSettingsPortBounds(t *testing.T) {
 	}
 	if s.ProxyMapStartPort < 1 || s.ProxyMapStartPort > 65535 {
 		t.Fatalf("ProxyMapStartPort out of bounds after normalize: %d", s.ProxyMapStartPort)
+	}
+}
+
+func TestSingBoxManagerClashSecretDoesNotDeadlockUnderManagerLock(t *testing.T) {
+	mgr := NewSingBoxManager(t.TempDir(), "", "", "", nil)
+
+	// Simulate startLocked / HealthCheck / TrafficSnapshot holding m.mu while reading Clash API auth secret.
+	done := make(chan string, 1)
+	go func() {
+		mgr.mu.Lock()
+		defer mgr.mu.Unlock()
+		secret := mgr.clashSecret()
+		req, _ := http.NewRequest(http.MethodGet, "http://127.0.0.1:20990/configs", nil)
+		mgr.applyClashAuth(req)
+		done <- req.Header.Get("Authorization") + "|" + secret
+	}()
+
+	select {
+	case got := <-done:
+		parts := strings.SplitN(got, "|", 2)
+		if len(parts) != 2 || len(parts[1]) != 64 || parts[0] != "Bearer "+parts[1] {
+			t.Fatalf("unexpected clash auth header/secret: %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("DEADLOCK: clashSecret()/applyClashAuth() blocked while SingBoxManager.mu was held!")
+	}
+}
+
+func TestSingBoxManagerRealStartHealthCheckAndStopNoDeadlock(t *testing.T) {
+	realCore := filepath.Join(".", "bin", "sing-box.exe")
+	if !fileExists(realCore) {
+		t.Skip("bin/sing-box.exe not present")
+	}
+
+	pickFreePort := func() int {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		port := ln.Addr().(*net.TCPAddr).Port
+		_ = ln.Close()
+		return port
+	}
+
+	mixedPort := pickFreePort()
+	testClashPort := pickFreePort()
+	for testClashPort == mixedPort {
+		testClashPort = pickFreePort()
+	}
+
+	origPort := clashAPIPort
+	origAddr := clashAPIAddress
+	clashAPIPort = testClashPort
+	clashAPIAddress = net.JoinHostPort("127.0.0.1", strconv.Itoa(testClashPort))
+	t.Cleanup(func() {
+		clashAPIPort = origPort
+		clashAPIAddress = origAddr
+	})
+
+	tmpDir := t.TempDir()
+	cfgPath := filepath.Join(tmpDir, "data", "sing-box.json")
+	cachePath := filepath.Join(tmpDir, "data", "cache.db")
+	logger := NewLogger(filepath.Join(tmpDir, "test.log"))
+	defer logger.Close()
+
+	mgr := NewSingBoxManager(tmpDir, realCore, cfgPath, cachePath, logger)
+	node := Node{
+		ID:      "node-e2e-1",
+		Name:    "E2E-Test",
+		Type:    "socks",
+		Address: "203.0.113.10",
+		Port:    1080,
+		Outbound: map[string]interface{}{
+			"type":        "socks",
+			"server":      "203.0.113.10",
+			"server_port": 1080,
+		},
+	}
+	settings := defaultSettings()
+	settings.Mode = "global"
+	settings.RuleSource = ruleSourceBuiltin
+	settings.SystemProxy = false
+	settings.Tun = false
+	settings.MixedPort = mixedPort
+
+	state := PersistState{
+		SelectedID: node.ID,
+		Nodes:      []Node{node},
+		Settings:   settings,
+	}
+
+	if err := mgr.Start(state); err != nil {
+		t.Fatalf("real SingBoxManager.Start failed: %v", err)
+	}
+	defer func() {
+		_ = mgr.Stop()
+	}()
+
+	if err := mgr.HealthCheck(settings); err != nil {
+		t.Fatalf("real SingBoxManager.HealthCheck failed (Clash API Bearer auth?): %v", err)
+	}
+	if _, err := mgr.TrafficSnapshot(); err != nil {
+		t.Fatalf("real SingBoxManager.TrafficSnapshot failed: %v", err)
+	}
+	if _, err := mgr.FetchConnections(); err != nil {
+		t.Fatalf("real SingBoxManager.FetchConnections failed: %v", err)
+	}
+	if err := mgr.SetMode("rule"); err != nil {
+		t.Fatalf("real SingBoxManager.SetMode failed: %v", err)
+	}
+	if err := mgr.CloseConnections(); err != nil {
+		t.Fatalf("real SingBoxManager.CloseConnections failed: %v", err)
+	}
+	cur, err := mgr.CurrentOutbound()
+	if err != nil || cur != nodeOutboundTag(node) {
+		t.Fatalf("CurrentOutbound = (%q, %v), want %q", cur, err, nodeOutboundTag(node))
+	}
+	// Verify unauthorized request without Bearer token is actually rejected by sing-box!
+	unauthClient := &http.Client{Timeout: 2 * time.Second}
+	resp, err := unauthClient.Get("http://" + clashAPIAddress + "/configs")
+	if err != nil {
+		t.Fatalf("unexpected transport error probing clash API: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected unauthenticated Clash API request to return 401, got %d", resp.StatusCode)
+	}
+	if err := mgr.Stop(); err != nil {
+		t.Fatalf("real SingBoxManager.Stop failed: %v", err)
 	}
 }

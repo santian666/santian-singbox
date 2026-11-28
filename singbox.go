@@ -36,8 +36,6 @@ const (
 	ruleSourceV2rayN       = "v2rayn"
 	ruleSourceSagerNet     = "sagernet"
 	ruleSourceMetaCube     = "metacubex"
-	clashAPIAddress        = "127.0.0.1:20990"
-	clashAPIPort           = 20990
 	tunInterfaceName       = "SanTian"
 	defaultProxyMapPort    = 52001
 	startupPortTimeout     = 30 * time.Second
@@ -46,6 +44,11 @@ const (
 	coreCandidateTimeout   = 20 * time.Second
 	configCheckTimeout     = 15 * time.Second
 	commandOutputTimeout   = 30 * time.Second
+)
+
+var (
+	clashAPIAddress = "127.0.0.1:20990"
+	clashAPIPort    = 20990
 )
 
 const (
@@ -263,6 +266,7 @@ type SingBoxManager struct {
 	proxyMapStartPort      int
 	proxyMapPortCount      int
 	runtimeOutboundTags    map[string]struct{}
+	clashSecretMu          sync.Mutex
 	clashAPISecret         string
 	missingFakeIPLogCount  int
 	lastMissingFakeIPLogAt time.Time
@@ -290,8 +294,8 @@ func (m *SingBoxManager) clashSecret() string {
 	if m == nil {
 		return ""
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.clashSecretMu.Lock()
+	defer m.clashSecretMu.Unlock()
 	if m.clashAPISecret == "" {
 		m.clashAPISecret = newRandomClashSecret()
 	}
