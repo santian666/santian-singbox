@@ -427,6 +427,15 @@ func (c *directDNSHealthChecker) SetForceReselect() {
 	c.forceReselect = true
 }
 
+func (c *directDNSHealthChecker) HasForceReselect() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.forceReselect
+}
+
 func (c *directDNSHealthChecker) LastFingerprint() networkFingerprint {
 	c.mu.Lock()
 	defer c.mu.Unlock()

@@ -111,17 +111,26 @@ func TestAppProxyRouteRuleMatchesAppAndDirectory(t *testing.T) {
 			{Type: "app", Path: `C:\Program Files\AdsPower\AdsPower.exe`, Enabled: true},
 		},
 	}
-	rule := appProxyRouteRule(settings)
-	if rule == nil {
-		t.Fatal("应生成应用代理规则")
+	rules := appProxyRouteRules(settings)
+	if len(rules) != 2 {
+		t.Fatalf("专用安装目录应用应生成 2 条独立路由规则（避免 sing-box 单规则 AND 语义），实际=%d", len(rules))
 	}
-	paths, ok := rule["process_path"].([]string)
-	if !ok || len(paths) == 0 {
-		t.Fatal("应包含进程绝对路径")
+	var hasPaths, hasRegex bool
+	for _, rule := range rules {
+		_, pOK := rule["process_path"].([]string)
+		_, rOK := rule["process_path_regex"].([]string)
+		if pOK && rOK {
+			t.Fatalf("单条路由规则不得同时包含 process_path 和 process_path_regex（否则 sing-box 按 AND 匹配导致失效）：%#v", rule)
+		}
+		if pOK {
+			hasPaths = true
+		}
+		if rOK {
+			hasRegex = true
+		}
 	}
-	regexes, ok := rule["process_path_regex"].([]string)
-	if !ok || len(regexes) == 0 {
-		t.Fatal("应包含目录正则以自动覆盖子进程与内核进程")
+	if !hasPaths || !hasRegex {
+		t.Fatalf("应分别包含进程绝对路径规则和目录正则规则：hasPaths=%v hasRegex=%v", hasPaths, hasRegex)
 	}
 
 	portableSettings := Settings{
@@ -130,15 +139,15 @@ func TestAppProxyRouteRuleMatchesAppAndDirectory(t *testing.T) {
 			{Type: "app", Path: `C:\Users\test\Downloads\tool.exe`, Enabled: true},
 		},
 	}
-	portableRule := appProxyRouteRule(portableSettings)
-	if portableRule == nil {
-		t.Fatal("应生成便携应用代理规则")
+	portableRules := appProxyRouteRules(portableSettings)
+	if len(portableRules) != 1 {
+		t.Fatalf("便携应用应仅生成 1 条精确路径规则，实际=%d", len(portableRules))
 	}
-	if _, ok := portableRule["process_path"].([]string); !ok {
+	if _, ok := portableRules[0]["process_path"].([]string); !ok {
 		t.Fatal("便携应用应包含 process_path")
 	}
-	if _, hasRegex := portableRule["process_path_regex"]; hasRegex {
-		t.Fatalf("位于 Downloads 等共享目录的应用不得生成整目录正则：%v", portableRule["process_path_regex"])
+	if _, hasRegex := portableRules[0]["process_path_regex"]; hasRegex {
+		t.Fatalf("位于 Downloads 等共享目录的应用不得生成整目录正则：%v", portableRules[0]["process_path_regex"])
 	}
 }
 

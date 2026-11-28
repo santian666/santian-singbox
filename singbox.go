@@ -244,6 +244,7 @@ func appProxyOnlyTun(settings Settings) bool {
 
 type SingBoxManager struct {
 	mu                     sync.Mutex
+	stateMu                sync.RWMutex
 	rootDir                string
 	corePath               string
 	cachePath              string
@@ -266,6 +267,7 @@ type SingBoxManager struct {
 	proxyMapStartPort      int
 	proxyMapPortCount      int
 	runtimeOutboundTags    map[string]struct{}
+	repairedRemovedTags    []string
 	clashSecretMu          sync.Mutex
 	clashAPISecret         string
 	missingFakeIPLogCount  int
@@ -352,8 +354,11 @@ func (m *SingBoxManager) getSOCKS5TestProxyPort() int {
 }
 
 func (m *SingBoxManager) Running() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	if m == nil {
+		return false
+	}
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
 	return m.cmd != nil && m.cmd.Process != nil
 }
 
@@ -361,8 +366,8 @@ func (m *SingBoxManager) RunningDirectDNS() string {
 	if m == nil {
 		return ""
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
 	return m.runningDirectDNS
 }
 
@@ -370,8 +375,8 @@ func (m *SingBoxManager) CurrentPID() int {
 	if m == nil {
 		return 0
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
 	if m.cmd != nil && m.cmd.Process != nil {
 		return m.cmd.Process.Pid
 	}
@@ -618,7 +623,7 @@ func (m *SingBoxManager) SetMode(mode string) error {
 	applyErr := doClashAPIFast(req)
 	confirmErr := confirmModeSelection(wanted, m.currentMode, 1200*time.Millisecond, 80*time.Millisecond)
 	if confirmErr == nil {
-		m.mu.Lock()
+		m.stateMu.Lock()
 		if m.hasCachedConfigMode {
 			if cached, ok := m.cachedConfigModes[wanted]; ok {
 				m.cachedConfigMode = cached
@@ -626,7 +631,7 @@ func (m *SingBoxManager) SetMode(mode string) error {
 				m.cachedConfigMode.Mode = wanted
 			}
 		}
-		m.mu.Unlock()
+		m.stateMu.Unlock()
 		return nil
 	}
 	if applyErr != nil {
@@ -854,8 +859,8 @@ func (m *SingBoxManager) CachedRuntimeInfo() (ConfigMode, bool, bool) {
 	if m == nil {
 		return ConfigMode{}, false, false
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
 	if !m.hasCachedConfigMode {
 		return ConfigMode{}, false, false
 	}
@@ -928,7 +933,7 @@ func (m *SingBoxManager) SyncSelectedDefault(selectedTag string) {
 	if err != nil {
 		return
 	}
-	if err := atomicWriteFile(m.config, newData, 0644); err == nil {
+	if err := atomicWriteFile(m.config, newData, 0600); err == nil {
 		m.lastVerifiedConfigHash = m.computeConfigVerificationHash(newData)
 	}
 }
@@ -1397,6 +1402,7 @@ func (m *SingBoxManager) startWithTunRetryLocked(state PersistState) error {
 
 func (m *SingBoxManager) startLocked(state PersistState) error {
 	normalizeSettings(&state.Settings)
+	m.repairedRemovedTags = nil
 	if m.cmd != nil && m.cmd.Process != nil {
 		return errors.New("sing-box 已在运行")
 	}
@@ -1504,7 +1510,9 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 	}
 	cancel := make(chan struct{})
 	done := make(chan error, 1)
+	m.stateMu.Lock()
 	m.cmd = cmd
+	m.stateMu.Unlock()
 	m.processJob = processJob
 	m.cancel = cancel
 	m.done = done
@@ -1580,10 +1588,15 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 		m.logger.Info("系统代理已开启：127.0.0.1:%d", state.Settings.MixedPort)
 	}
 	m.tunActive = effectiveTun(state.Settings)
-	m.runtimeOutboundTags = runtimeOutboundTagSet(state.Nodes)
-	m.runningDirectDNS = dnsPlan.Direct.Server
+	runtimeTags := runtimeOutboundTagSet(state.Nodes)
+	for _, removedTag := range m.repairedRemovedTags {
+		delete(runtimeTags, removedTag)
+	}
+	m.runtimeOutboundTags = runtimeTags
 	modeRule := configModeFromConfigDetails(config, "rule", state.Settings.ExternalProxyEndpoints, appProxyActive(state.Settings))
 	modeGlobal := configModeFromConfigDetails(config, "global", state.Settings.ExternalProxyEndpoints, appProxyActive(state.Settings))
+	m.stateMu.Lock()
+	m.runningDirectDNS = dnsPlan.Direct.Server
 	m.cachedConfigModes = map[string]ConfigMode{"rule": modeRule, "global": modeGlobal}
 	if clashMode(state.Settings.Mode) == "global" {
 		m.cachedConfigMode = modeGlobal
@@ -1592,6 +1605,7 @@ func (m *SingBoxManager) startLocked(state PersistState) error {
 	}
 	m.cachedTunActive = hasTunInbound(config)
 	m.hasCachedConfigMode = true
+	m.stateMu.Unlock()
 	m.logger.Info("sing-box 已启动，本地混合代理端口：%d", state.Settings.MixedPort)
 	return nil
 }
@@ -1615,11 +1629,28 @@ func (m *SingBoxManager) Restart(state PersistState, cleanupTun bool) error {
 	if effectiveTun(state.Settings) {
 		cleanupTun = true
 	}
-	if err := m.stopLocked(false, cleanupTun, cleanupTun); err != nil {
+	prevProxyMapStart := m.proxyMapStartPort
+	prevProxyMapCount := m.proxyMapPortCount
+	nextProxyMapCount := 0
+	if state.Settings.ProxyMap {
+		nextProxyMapCount = len(proxyMapNodesForSettings(state.Nodes, state.Settings))
+	}
+	waitProcessGone := cleanupTun || prevProxyMapCount > 0 || nextProxyMapCount > 0
+	if err := m.stopLocked(false, cleanupTun, waitProcessGone); err != nil {
 		return err
 	}
 	waitTCPPortFree("127.0.0.1", state.Settings.MixedPort, 3*time.Second)
 	waitTCPPortFree("127.0.0.1", clashAPIPort, 3*time.Second)
+	if prevProxyMapStart > 0 && prevProxyMapCount > 0 {
+		for _, port := range sequentialPorts(prevProxyMapStart, prevProxyMapCount) {
+			waitTCPPortFree("127.0.0.1", port, 2*time.Second)
+		}
+	}
+	if state.Settings.ProxyMap && nextProxyMapCount > 0 {
+		for _, port := range sequentialPorts(state.Settings.ProxyMapStartPort, nextProxyMapCount) {
+			waitTCPPortFree("127.0.0.1", port, 2*time.Second)
+		}
+	}
 	return m.startWithTunRetryLocked(state)
 }
 
@@ -1763,7 +1794,9 @@ func (m *SingBoxManager) stopLocked(disableSystemProxy bool, cleanupTun bool, wa
 	m.proxyMapPortCount = 0
 	m.runtimeOutboundTags = nil
 	m.tunActive = false
+	m.stateMu.Lock()
 	m.runningDirectDNS = ""
+	m.stateMu.Unlock()
 	if m.cancel != nil {
 		defer close(m.cancel)
 		m.cancel = nil
@@ -1783,13 +1816,15 @@ func (m *SingBoxManager) stopLocked(disableSystemProxy bool, cleanupTun bool, wa
 	cmd := m.cmd
 	processJob := m.processJob
 	done := m.done
+	m.stateMu.Lock()
 	m.cmd = nil
-	m.processJob = 0
-	m.done = nil
 	m.hasCachedConfigMode = false
 	m.cachedConfigMode = ConfigMode{}
 	m.cachedConfigModes = nil
 	m.cachedTunActive = false
+	m.stateMu.Unlock()
+	m.processJob = 0
+	m.done = nil
 	m.traffic = trafficCache{}
 	var err error
 	gracefullyExited := false
@@ -1959,6 +1994,35 @@ func (m *SingBoxManager) tryAutoRepairOutboundConfig(initialErr error, selected 
 				routeMap["rules"] = filtered
 			}
 		}
+		if dnsMap, ok := cfg["dns"].(map[string]interface{}); ok {
+			removedDNSTags := map[string]bool{}
+			if servers, ok := dnsMap["servers"].([]interface{}); ok {
+				filteredServers := make([]interface{}, 0, len(servers))
+				for _, srv := range servers {
+					if srvMap, ok := srv.(map[string]interface{}); ok && stringFromAny(srvMap["detour"]) == badTag {
+						if srvTag := stringFromAny(srvMap["tag"]); srvTag != "" {
+							removedDNSTags[srvTag] = true
+						}
+						continue
+					}
+					filteredServers = append(filteredServers, srv)
+				}
+				dnsMap["servers"] = filteredServers
+			}
+			if len(removedDNSTags) > 0 {
+				if dnsRules, ok := dnsMap["rules"].([]interface{}); ok {
+					filteredDNSRules := make([]interface{}, 0, len(dnsRules))
+					for _, r := range dnsRules {
+						if rMap, ok := r.(map[string]interface{}); ok && removedDNSTags[stringFromAny(rMap["server"])] {
+							continue
+						}
+						filteredDNSRules = append(filteredDNSRules, r)
+					}
+					dnsMap["rules"] = filteredDNSRules
+				}
+			}
+		}
+		m.repairedRemovedTags = append(m.repairedRemovedTags, badTag)
 		if m.runtimeOutboundTags != nil {
 			delete(m.runtimeOutboundTags, badTag)
 		}
@@ -2124,16 +2188,19 @@ func (m *SingBoxManager) watchExit(cmd *exec.Cmd, done chan<- error) {
 	processJob := uintptr(0)
 	onUnexpectedExit := m.onUnexpectedExit
 	if m.cmd == cmd {
+		m.stateMu.Lock()
 		m.cmd = nil
+		m.runningDirectDNS = ""
+		m.hasCachedConfigMode = false
+		m.cachedConfigMode = ConfigMode{}
+		m.cachedConfigModes = nil
+		m.cachedTunActive = false
+		m.stateMu.Unlock()
 		processJob = m.processJob
 		m.processJob = 0
 		m.done = nil
 		m.proxyMapStartPort = 0
 		m.proxyMapPortCount = 0
-		m.hasCachedConfigMode = false
-		m.cachedConfigMode = ConfigMode{}
-		m.cachedConfigModes = nil
-		m.cachedTunActive = false
 	}
 	m.mu.Unlock()
 	closeKillOnCloseJob(processJob)
@@ -2491,24 +2558,32 @@ func hasTunInbound(config map[string]interface{}) bool {
 }
 
 func hasAppProxyRouteRule(config map[string]interface{}, settings Settings) bool {
-	expected := appProxyRouteRule(settings)
-	if expected == nil {
+	expectedRules := appProxyRouteRules(settings)
+	if len(expectedRules) == 0 {
 		return false
 	}
-	expectedPaths := configStringValues(expected["process_path"])
-	expectedPatterns := configStringValues(expected["process_path_regex"])
 	route, ok := config["route"].(map[string]interface{})
 	if !ok {
 		return false
 	}
-	for _, rule := range configRules(route["rules"]) {
-		if rule["action"] == "route" && rule["outbound"] == "proxy" &&
-			stringSlicesEqual(configStringValues(rule["process_path"]), expectedPaths) &&
-			stringSlicesEqual(configStringValues(rule["process_path_regex"]), expectedPatterns) {
-			return true
+	actualRules := configRules(route["rules"])
+	for _, expected := range expectedRules {
+		expectedPaths := configStringValues(expected["process_path"])
+		expectedPatterns := configStringValues(expected["process_path_regex"])
+		matched := false
+		for _, rule := range actualRules {
+			if rule["action"] == "route" && rule["outbound"] == "proxy" &&
+				stringSlicesEqual(configStringValues(rule["process_path"]), expectedPaths) &&
+				stringSlicesEqual(configStringValues(rule["process_path_regex"]), expectedPatterns) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 func hasGlobalModeBlockRule(config map[string]interface{}) bool {
@@ -3394,8 +3469,8 @@ func buildRouteRulesForSelected(settings Settings, nodes []Node, selected Node, 
 		}
 	}
 	if settings.AppProxy {
-		if appRule := appProxyRouteRule(settings); len(appRule) > 0 {
-			rules = append(rules, appRule)
+		if appRules := appProxyRouteRules(settings); len(appRules) > 0 {
+			rules = append(rules, appRules...)
 		}
 		if appProxyOnlyTun(settings) {
 			rules = append(rules, map[string]interface{}{
@@ -3686,7 +3761,11 @@ func tunBypassProcessNames() []string {
 	return names
 }
 
-func appProxyRouteRule(settings Settings) map[string]interface{} {
+// appProxyRouteRules returns separate route rules for exact process_path and process_path_regex.
+// sing-box evaluates multiple matchers inside a single route rule as logical AND, so mixing
+// process_path and process_path_regex in the same rule would prevent either folder or child-process
+// targets from matching.
+func appProxyRouteRules(settings Settings) []map[string]interface{} {
 	paths := make([]string, 0, len(settings.AppProxyTargets))
 	folderRegex := make([]string, 0)
 	seen := map[string]bool{}
@@ -3734,17 +3813,22 @@ func appProxyRouteRule(settings Settings) map[string]interface{} {
 	if len(paths) == 0 && len(folderRegex) == 0 {
 		return nil
 	}
-	rule := map[string]interface{}{
-		"action":   "route",
-		"outbound": "proxy",
-	}
+	result := make([]map[string]interface{}, 0, 2)
 	if len(paths) > 0 {
-		rule["process_path"] = paths
+		result = append(result, map[string]interface{}{
+			"action":       "route",
+			"outbound":     "proxy",
+			"process_path": paths,
+		})
 	}
 	if len(folderRegex) > 0 {
-		rule["process_path_regex"] = folderRegex
+		result = append(result, map[string]interface{}{
+			"action":             "route",
+			"outbound":           "proxy",
+			"process_path_regex": folderRegex,
+		})
 	}
-	return rule
+	return result
 }
 
 func isDedicatedAppInstallDir(dir string) bool {

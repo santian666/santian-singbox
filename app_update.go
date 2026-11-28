@@ -699,7 +699,11 @@ func performAtomicInPlaceUpdate(appRoot, extractedAppDir, exePath string) error 
 }
 
 func launchNewAppProcess(exePath, appRoot string) error {
-	cmd := exec.Command(exePath, adminRestartArg)
+	args := []string{adminRestartArg}
+	if pid := os.Getpid(); pid > 0 {
+		args = append(args, waitParentPIDArgPrefix+strconv.Itoa(pid))
+	}
+	cmd := exec.Command(exePath, args...)
 	cmd.Dir = appRoot
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP,
@@ -867,7 +871,8 @@ func (a *App) ApplyAppUpdate() (result *AppUpdateInfo, err error) {
 		return nil, fmt.Errorf("原子更新失败：%w", err)
 	}
 
-	// 3. 直接通过系统标准 API 启动新程序
+	// 3. 释放单实例互斥锁并通过 --wait-pid 拉起新版本程序，确保普通权限下热更新也能正常重启
+	releaseSingleInstanceLock()
 	if err := launchNewAppProcess(exePath, a.root); err != nil {
 		return nil, fmt.Errorf("启动新版本程序失败：%w", err)
 	}

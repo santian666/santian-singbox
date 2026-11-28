@@ -887,3 +887,277 @@ func TestSingBoxManagerRealStartHealthCheckAndStopNoDeadlock(t *testing.T) {
 		t.Fatalf("real SingBoxManager.Stop failed: %v", err)
 	}
 }
+
+func TestAppProxyMixedAppAndFolderUsesSeparateRulesAndPassesSingBoxCheck(t *testing.T) {
+	node := Node{
+		ID:      "node-appproxy-1",
+		Name:    "AppProxyNode",
+		Type:    "socks",
+		Address: "203.0.113.10",
+		Port:    1080,
+		Outbound: map[string]interface{}{
+			"type":        "socks",
+			"server":      "203.0.113.10",
+			"server_port": 1080,
+		},
+	}
+	settings := defaultSettings()
+	settings.Mode = "rule"
+	settings.RuleSource = ruleSourceBuiltin
+	settings.SystemProxy = false
+	settings.Tun = true
+	settings.AppProxy = true
+	settings.AppProxyTargets = []AppProxyTarget{
+		{ID: "t1", Type: "app", Path: `C:\Users\Alice\Desktop\tool.exe`, Enabled: true},
+		{ID: "t2", Type: "folder", Path: `D:\Games`, Enabled: true},
+		{ID: "t3", Type: "app", Path: `C:\Program Files\AdsPower\AdsPower.exe`, Enabled: true},
+	}
+
+	tmpDir := t.TempDir()
+	cfg, err := BuildSingBoxConfig(PersistState{
+		SelectedID: node.ID,
+		Nodes:      []Node{node},
+		Settings:   settings,
+	}, node, filepath.Join(tmpDir, "cache.db"))
+	if err != nil {
+		t.Fatalf("BuildSingBoxConfig failed: %v", err)
+	}
+	if !hasAppProxyRouteRule(cfg, settings) {
+		t.Fatal("hasAppProxyRouteRule returned false for valid multi-rule AppProxy config")
+	}
+
+	route := cfg["route"].(map[string]interface{})
+	rules := configRules(route["rules"])
+	foundPathRule := false
+	foundRegexRule := false
+	for _, r := range rules {
+		if r["action"] != "route" || r["outbound"] != "proxy" {
+			continue
+		}
+		p := configStringValues(r["process_path"])
+		rx := configStringValues(r["process_path_regex"])
+		if len(p) > 0 && len(rx) > 0 {
+			t.Fatalf("route rule MUST NOT combine process_path and process_path_regex (sing-box ANDs them): %#v", r)
+		}
+		if len(p) > 0 {
+			foundPathRule = true
+		}
+		if len(rx) > 0 {
+			foundRegexRule = true
+		}
+	}
+	if !foundPathRule || !foundRegexRule {
+		t.Fatalf("expected separate process_path and process_path_regex rules: path=%v regex=%v", foundPathRule, foundRegexRule)
+	}
+
+	realCore := filepath.Join(".", "bin", "sing-box.exe")
+	if fileExists(realCore) {
+		cfgPath := filepath.Join(tmpDir, "sing-box-appproxy.json")
+		raw, err := json.MarshalIndent(cfg, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(cfgPath, raw, 0600); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(realCore, "check", "-c", cfgPath)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("real sing-box check rejected split AppProxy config: %v\n%s", err, string(out))
+		}
+	}
+}
+
+func TestSingBoxManagerStatusReadsDoNotBlockOnLifecycleLock(t *testing.T) {
+	mgr := NewSingBoxManager(t.TempDir(), "", "", "", nil)
+	mgr.stateMu.Lock()
+	mgr.runningDirectDNS = "192.168.1.1"
+	mgr.hasCachedConfigMode = true
+	mgr.cachedConfigMode = ConfigMode{Mode: "rule"}
+	mgr.cachedTunActive = true
+	mgr.stateMu.Unlock()
+
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = mgr.Running()
+		_ = mgr.CurrentPID()
+		if dns := mgr.RunningDirectDNS(); dns != "192.168.1.1" {
+			t.Errorf("RunningDirectDNS = %q, want 192.168.1.1", dns)
+		}
+		mode, tun, ok := mgr.CachedRuntimeInfo()
+		if !ok || !tun || mode.Mode != "rule" {
+			t.Errorf("CachedRuntimeInfo = (%+v, %v, %v)", mode, tun, ok)
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("SingBoxManager read-only status methods blocked while lifecycle m.mu was held")
+	}
+}
+
+func TestEnsureProxyHealthDoesNotEnableKillSwitchWhenProxyOpHeld(t *testing.T) {
+	defer resetFirewallMocks()
+	origBackend := activeWFPBackend
+	defer func() {
+		wfpKS.mu.Lock()
+		wfpKS.active = false
+		wfpKS.engine = 0
+		wfpKS.mu.Unlock()
+		activeWFPBackend = origBackend
+	}()
+
+	checkAdminPrivileges = func() bool { return true }
+	mockWFP := &fakeWFPBackend{}
+	activeWFPBackend = mockWFP
+	runFirewallCommand = func(name string, args ...string) (string, error) {
+		return "No rules match", errors.New("not found")
+	}
+
+	tmpDir := t.TempDir()
+	store, err := NewStore(filepath.Join(tmpDir, "state.dat"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	node := Node{ID: "node-1", GroupID: defaultGroupID, Name: "N1", Type: "socks", Address: "203.0.113.10", Port: 1080}
+	if err := store.ReplaceGroupsAndNodes(store.Snapshot().Groups, []Node{node}, node.ID); err != nil {
+		t.Fatal(err)
+	}
+	settings := store.Snapshot().Settings
+	settings.Tun = true
+	settings.CircuitBreaker = true
+	if err := store.UpdateSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+
+	app := &App{
+		root:    tmpDir,
+		store:   store,
+		manager: NewSingBoxManager(tmpDir, `C:\mock\sing-box.exe`, "", "", nil),
+		logger:  NewLogger(filepath.Join(tmpDir, "test.log")),
+	}
+	defer app.logger.Close()
+
+	// Hold proxyOpMu to simulate active Restart/Stop in progress.
+	app.proxyOpMu.Lock()
+	app.ensureProxyHealth("定时自检")
+	app.proxyOpMu.Unlock()
+
+	if isWFPKillSwitchActive() || mockWFP.openCalls != 0 {
+		t.Fatalf("ensureProxyHealth must NOT enable WFP Kill Switch while proxyOpMu is held (openCalls=%d)", mockWFP.openCalls)
+	}
+	status, _, _, _ := app.currentNetworkHealth()
+	if status == "core_down" {
+		t.Fatal("ensureProxyHealth must NOT set core_down alert while proxyOpMu is held")
+	}
+}
+
+func TestTryAutoRepairOutboundConfigCleansProxyMapDNSDetourAndTracksRemovedTags(t *testing.T) {
+	realCore := filepath.Join(".", "bin", "sing-box.exe")
+	if !fileExists(realCore) {
+		t.Skip("bin/sing-box.exe not present")
+	}
+
+	goodNode := Node{
+		ID:      "node-pm-good",
+		GroupID: defaultGroupID,
+		Name:    "GoodPM",
+		Type:    "socks",
+		Address: "203.0.113.10",
+		Port:    1080,
+		Outbound: map[string]interface{}{
+			"type":        "socks",
+			"server":      "203.0.113.10",
+			"server_port": 1080,
+		},
+	}
+	badNode := Node{
+		ID:      "node-pm-bad",
+		GroupID: defaultGroupID,
+		Name:    "BadPM",
+		Type:    "vless",
+		Address: "203.0.113.11",
+		Port:    443,
+		Outbound: map[string]interface{}{
+			"type":        "vless",
+			"server":      "203.0.113.11",
+			"server_port": 443,
+			"uuid":        "11111111-1111-1111-1111-111111111111",
+			"tls": map[string]interface{}{
+				"enabled":     true,
+				"server_name": "example.com",
+			},
+		},
+	}
+
+	settings := defaultSettings()
+	settings.Mode = "rule"
+	settings.RuleSource = ruleSourceBuiltin
+	settings.SystemProxy = false
+	settings.Tun = false
+	settings.ProxyMap = true
+	settings.ProxyMapGroupID = defaultGroupID
+	settings.ProxyMapGroupIDs = []string{defaultGroupID}
+
+	tmpDir := t.TempDir()
+	cfg, err := BuildSingBoxConfig(PersistState{
+		SelectedID: goodNode.ID,
+		Nodes:      []Node{goodNode, badNode},
+		Settings:   settings,
+	}, goodNode, filepath.Join(tmpDir, "cache.db"))
+	if err != nil {
+		t.Fatalf("BuildSingBoxConfig failed: %v", err)
+	}
+
+	// Corrupt the proxy-map outbound for badNode ("proxy-map-out-1") with an invalid ECH PEM.
+	corrupted := false
+	badPMTag := proxyMapOutboundTag(1)
+	for _, ob := range cfg["outbounds"].([]map[string]interface{}) {
+		if ob["tag"] == badPMTag {
+			ob["tls"].(map[string]interface{})["ech"] = map[string]interface{}{
+				"enabled": true,
+				"config":  []string{"-----BEGIN CERTIFICATE-----", "broken", "-----END CERTIFICATE-----"},
+			}
+			corrupted = true
+			break
+		}
+	}
+	if !corrupted {
+		t.Fatalf("failed to find %s in generated outbounds", badPMTag)
+	}
+
+	cfgPath := filepath.Join(tmpDir, "sing-box-pm-repair.json")
+	raw, _ := json.MarshalIndent(cfg, "", "  ")
+	if err := os.WriteFile(cfgPath, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	absCore, _ := filepath.Abs(realCore)
+	mgr := NewSingBoxManager(tmpDir, absCore, cfgPath, filepath.Join(tmpDir, "cache.db"), nil)
+	checkErr := mgr.checkConfig()
+	if checkErr == nil {
+		t.Fatal("expected initial checkConfig to fail on corrupted ProxyMap outbound")
+	}
+
+	repaired, repairErr := mgr.tryAutoRepairOutboundConfig(checkErr, goodNode)
+	if !repaired || repairErr != nil {
+		t.Fatalf("tryAutoRepairOutboundConfig failed to repair ProxyMap outbound + DNS detour: repaired=%v err=%v", repaired, repairErr)
+	}
+	if err := mgr.checkConfig(); err != nil {
+		t.Fatalf("repaired ProxyMap config failed checkConfig: %v", err)
+	}
+	foundTracked := false
+	for _, tag := range mgr.repairedRemovedTags {
+		if tag == badPMTag {
+			foundTracked = true
+			break
+		}
+	}
+	if !foundTracked {
+		t.Fatalf("expected repairedRemovedTags to include %q, got %v", badPMTag, mgr.repairedRemovedTags)
+	}
+}

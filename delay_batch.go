@@ -412,11 +412,12 @@ func waitDelayTestPortsContext(parent context.Context, host string, ports []int,
 		}()
 	}
 	go func() {
+	sendLoop:
 		for _, port := range ports {
 			select {
 			case jobs <- port:
 			case <-ctx.Done():
-				break
+				break sendLoop
 			}
 		}
 		close(jobs)

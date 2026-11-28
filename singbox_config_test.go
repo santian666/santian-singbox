@@ -723,21 +723,33 @@ func TestBuildSingBoxConfigAppProxyRules(t *testing.T) {
 		t.Fatal("应用接管应自动开启 TUN 入站")
 	}
 	route := config["route"].(map[string]interface{})
-	var found map[string]interface{}
+	var foundPath map[string]interface{}
+	var foundRegex map[string]interface{}
 	for _, rule := range route["rules"].([]map[string]interface{}) {
-		if rule["outbound"] == "proxy" && rule["process_path"] != nil {
-			found = rule
-			break
+		if rule["outbound"] != "proxy" {
+			continue
+		}
+		if rule["process_path"] != nil && rule["process_path_regex"] != nil {
+			t.Fatalf("应用接管规则不得在同一条规则中混用 process_path 与 process_path_regex（sing-box 会按 AND 匹配）：%v", rule)
+		}
+		if rule["process_path"] != nil {
+			foundPath = rule
+		}
+		if rule["process_path_regex"] != nil {
+			foundRegex = rule
 		}
 	}
-	if found == nil {
+	if foundPath == nil {
 		t.Fatalf("应生成进程路径代理规则：%v", route["rules"])
 	}
-	paths := found["process_path"].([]string)
+	if foundRegex == nil {
+		t.Fatalf("应生成目录正则代理规则：%v", route["rules"])
+	}
+	paths := foundPath["process_path"].([]string)
 	if len(paths) != 1 || !stringSliceContainsFold(paths, `C:\Tools\App\App.exe`) {
 		t.Fatalf("进程路径规则只能使用已保存的应用路径：%v", paths)
 	}
-	patterns := found["process_path_regex"].([]string)
+	patterns := foundRegex["process_path_regex"].([]string)
 	if len(patterns) == 0 || !strings.Contains(strings.ToLower(patterns[0]), strings.ToLower(regexp.QuoteMeta(`C:\Games\Game\`))) {
 		t.Fatalf("文件夹规则应生成目录正则：%v", patterns)
 	}

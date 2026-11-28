@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"runtime"
 	"sync"
 
@@ -26,7 +27,7 @@ func acquireSingleInstanceLock() (bool, error) {
 	handle, err := windows.CreateMutex(sa, true, name)
 	runtime.KeepAlive(sd)
 	runtime.KeepAlive(sa)
-	if err == windows.ERROR_ALREADY_EXISTS {
+	if errors.Is(err, windows.ERROR_ALREADY_EXISTS) || errors.Is(err, windows.ERROR_ACCESS_DENIED) {
 		if handle != 0 {
 			_ = windows.CloseHandle(handle)
 		}

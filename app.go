@@ -385,8 +385,13 @@ func (a *App) cleanupAllProxyEffects(reason string) {
 		a.stopResumeHealthChecks()
 		a.stopRunningToolsForExit()
 		a.cancelBatchTestJob()
-		a.proxyOpMu.Lock()
-		defer a.proxyOpMu.Unlock()
+		a.preemptBackgroundChecks()
+		locked := a.lockProxyOperation(6 * time.Second)
+		if locked {
+			defer a.proxyOpMu.Unlock()
+		} else if a.logger != nil {
+			a.logger.Warn("%s：等待代理操作锁超时，强制执行内核终止与防漏/系统代理清理", reason)
+		}
 		a.persistTraffic()
 		if a.manager != nil {
 			if a.manager.Running() {
@@ -394,11 +399,17 @@ func (a *App) cleanupAllProxyEffects(reason string) {
 					a.logger.Error("%s：关闭现有代理连接失败，继续终止内核：%v", reason, err)
 				}
 			}
-			if err := a.manager.Stop(); err != nil && a.logger != nil {
-				a.logger.Error("%s：停止 sing-box 失败：%v", reason, err)
-			}
-			if err := a.manager.CleanupStale(); err != nil && a.logger != nil {
-				a.logger.Error("%s：强制清理残留 sing-box 失败：%v", reason, err)
+			if locked {
+				if err := a.manager.Stop(); err != nil && a.logger != nil {
+					a.logger.Error("%s：停止 sing-box 失败：%v", reason, err)
+				}
+				if err := a.manager.CleanupStale(); err != nil && a.logger != nil {
+					a.logger.Error("%s：强制清理残留 sing-box 失败：%v", reason, err)
+				}
+			} else if pid := a.manager.CurrentPID(); pid > 0 {
+				if proc, err := os.FindProcess(pid); err == nil {
+					_ = proc.Kill()
+				}
 			}
 		}
 		a.disableAllKillSwitches()
@@ -2677,11 +2688,11 @@ func (a *App) SaveSettings(settings Settings) (err error) {
 				return err
 			}
 			a.persistTraffic()
+			var sysProxyErr error
 			if runtime.GOOS == "windows" && current.SystemProxy {
 				if err := DisableSystemProxy(); err != nil {
 					a.logger.Error("关闭系统代理失败：%v", err)
-					a.emitState()
-					return err
+					sysProxyErr = err
 				}
 			}
 			if err := a.manager.StopWithoutSystemProxyCleanup(); err != nil {
@@ -2693,7 +2704,7 @@ func (a *App) SaveSettings(settings Settings) (err error) {
 			a.clearExitInfo()
 			a.logger.Info("代理入口已全部关闭，代理已停止")
 			a.emitState()
-			return nil
+			return sysProxyErr
 		}
 		if err := a.store.UpdateSettings(settings); err != nil {
 			return err
@@ -3542,7 +3553,7 @@ func (a *App) prepareStartupPorts(state PersistState) error {
 	}
 	if settings.ProxyMap {
 		mappedNodes := proxyMapNodesForSettings(state.Nodes, settings)
-		if err := validateProxyMapPorts(settings, len(mappedNodes)); err != nil {
+		if err := validateProxyMapSettings(settings, len(mappedNodes)); err != nil {
 			return err
 		}
 		for index := range mappedNodes {
@@ -3705,6 +3716,14 @@ func (a *App) ensureProxyHealth(reason string) {
 	state := a.store.Snapshot()
 	normalizeSettings(&state.Settings)
 	if !shouldRunProxy(state.Settings) || !stateHasSelectedNode(state) {
+		if !a.isQuitting() && a.proxyOpMu.TryLock() {
+			latest := a.store.Snapshot()
+			normalizeSettings(&latest.Settings)
+			if !shouldRunProxy(latest.Settings) && !a.manager.Running() {
+				a.disableAllKillSwitches()
+			}
+			a.proxyOpMu.Unlock()
+		}
 		a.clearNetworkHealth()
 		return
 	}
@@ -3712,13 +3731,22 @@ func (a *App) ensureProxyHealth(reason string) {
 		return
 	}
 	if !a.manager.Running() {
-		a.enableTunKillSwitchIfConfigured(state.Settings)
-		a.setNetworkHealth(
-			"core_down",
-			"代理内核未运行（防漏保护生效中）",
-			fmt.Sprintf("%s：代理入口处于开启状态，但 sing-box 内核已停止。为防止真实网络暴露，已保持防漏锁定，请点击「立即重启内核」或切换节点恢复。", reason),
-			true,
-		)
+		if !a.proxyOpMu.TryLock() {
+			return
+		}
+		latest := a.store.Snapshot()
+		normalizeSettings(&latest.Settings)
+		shouldAlert := !a.isQuitting() && shouldRunProxy(latest.Settings) && stateHasSelectedNode(latest) && !a.manager.Running()
+		if shouldAlert {
+			a.enableTunKillSwitchIfConfigured(latest.Settings)
+			a.setNetworkHealth(
+				"core_down",
+				"代理内核未运行（防漏保护生效中）",
+				fmt.Sprintf("%s：代理入口处于开启状态，但 sing-box 内核已停止。为防止真实网络暴露，已保持防漏锁定，请点击「立即重启内核」或切换节点恢复。", reason),
+				true,
+			)
+		}
+		a.proxyOpMu.Unlock()
 		return
 	}
 
@@ -3764,13 +3792,24 @@ func (a *App) ensureProxyHealth(reason string) {
 			}
 		}
 		if !tunOK {
-			a.enableTunKillSwitchIfConfigured(state.Settings)
-			a.setNetworkHealth(
-				"core_down",
-				"TUN 虚拟网卡接管中断（防漏保护生效中）",
-				fmt.Sprintf("检测到 TUN 未保持接管状态（%s）。已保持防漏保护，请点击「立即重启内核」恢复。", tunReadyMessage(lastCode)),
-				true,
-			)
+			if ctx.Err() != nil || a.isQuitting() {
+				return
+			}
+			if !a.proxyOpMu.TryLock() {
+				return
+			}
+			latest := a.store.Snapshot()
+			normalizeSettings(&latest.Settings)
+			if !a.isQuitting() && shouldRunProxy(latest.Settings) && effectiveTun(latest.Settings) && a.manager.Running() {
+				a.enableTunKillSwitchIfConfigured(latest.Settings)
+				a.setNetworkHealth(
+					"core_down",
+					"TUN 虚拟网卡接管中断（防漏保护生效中）",
+					fmt.Sprintf("检测到 TUN 未保持接管状态（%s）。已保持防漏保护，请点击「立即重启内核」恢复。", tunReadyMessage(lastCode)),
+					true,
+				)
+			}
+			a.proxyOpMu.Unlock()
 			return
 		}
 	}
@@ -3801,6 +3840,11 @@ func (a *App) ensureProxyHealth(reason string) {
 	}
 	if ctx.Err() != nil {
 		return
+	}
+	if a.getDirectDNSChecker().HasForceReselect() {
+		if a.ensureDirectDNSHealth() {
+			return
+		}
 	}
 
 	delayMS, probeErr := a.manager.testNodeDelayViaClashAPIContext(ctx, "proxy", "", 3500*time.Millisecond)
@@ -3841,6 +3885,11 @@ func (a *App) ensureProxyHealth(reason string) {
 			"检测到电脑本地 Wi-Fi / 有线宽带无法连通外网 DNS（223.5.5.5 / 119.29.29.29 无响应），非代理软件故障。防漏保护仍生效，请检查本机网络连接。",
 			true,
 		)
+		return
+	}
+
+	// 本机物理网络连通但代理连续不可达时，优先检测是否因切换 Wi-Fi / 休眠唤醒导致直连 DNS 失效并自动切换恢复
+	if a.ensureDirectDNSHealth() {
 		return
 	}
 
@@ -4735,12 +4784,12 @@ func (a *App) getDirectDNSChecker() *directDNSHealthChecker {
 	return a.directDNSChecker
 }
 
-func (a *App) ensureDirectDNSHealth() {
+func (a *App) ensureDirectDNSHealth() bool {
 	if a == nil || a.manager == nil || !a.manager.Running() {
-		return
+		return false
 	}
 	checker := a.getDirectDNSChecker()
-	checker.CheckHealth()
+	return checker.CheckHealth()
 }
 
 func (a *App) restartForDirectDNS() error {

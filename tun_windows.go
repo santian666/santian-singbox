@@ -298,7 +298,7 @@ func waitTunReadyOrProcessExit(timeout time.Duration, done <-chan error) error {
 			time.Sleep(wait)
 		}
 	}
-	return fmt.Errorf(tunReadyMessage(last))
+	return errors.New(tunReadyMessage(last))
 }
 
 func tunReadyPollInterval(remaining time.Duration) time.Duration {

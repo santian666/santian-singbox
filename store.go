@@ -110,12 +110,12 @@ func (s *Store) load() error {
 		s.state.Settings.FaultPopupOnHidden = true
 	}
 	normalizeSettings(&s.state.Settings)
-	s.normalizeLocked()
-	s.loadSelectionLocked()
+	nodeIDRemap := s.normalizeLocked()
+	s.loadSelectionLocked(nodeIDRemap)
 	return nil
 }
 
-func (s *Store) loadSelectionLocked() {
+func (s *Store) loadSelectionLocked(nodeIDRemap map[string]string) {
 	data, err := os.ReadFile(s.selectionPath)
 	if err != nil {
 		return
@@ -128,6 +128,9 @@ func (s *Store) loadSelectionLocked() {
 	if selectedID == "" {
 		s.state.SelectedID = ""
 		return
+	}
+	if mapped, ok := nodeIDRemap[selectedID]; ok {
+		selectedID = mapped
 	}
 	for _, node := range s.state.Nodes {
 		if node.ID == selectedID {
@@ -719,7 +722,7 @@ func cloneState(state PersistState) PersistState {
 	}
 }
 
-func (s *Store) normalizeLocked() {
+func (s *Store) normalizeLocked() map[string]string {
 	if len(s.state.Groups) == 0 {
 		s.state.Groups = defaultGroups()
 	}
@@ -780,6 +783,7 @@ func (s *Store) normalizeLocked() {
 
 	selectedExists := false
 	nodeIDSeen := map[string]bool{}
+	nodeIDRemap := map[string]string{}
 	for i := range s.state.Nodes {
 		rawNodeID := s.state.Nodes[i].ID
 		safeNodeID := sanitizeEntityID("node", rawNodeID)
@@ -788,6 +792,7 @@ func (s *Store) normalizeLocked() {
 		}
 		nodeIDSeen[safeNodeID] = true
 		if rawNodeID != safeNodeID {
+			nodeIDRemap[rawNodeID] = safeNodeID
 			if s.state.SelectedID == rawNodeID {
 				s.state.SelectedID = safeNodeID
 			}
@@ -807,6 +812,7 @@ func (s *Store) normalizeLocked() {
 	if !selectedExists {
 		s.state.SelectedID = ""
 	}
+	return nodeIDRemap
 }
 
 func settingsKeyExists(data []byte, key string) bool {
